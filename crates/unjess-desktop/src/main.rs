@@ -925,8 +925,9 @@ impl UnjessDesktopApp {
         }
 
         egui::SidePanel::left("left_navigation_sidebar")
-            .exact_width(235.0)
-            .resizable(false)
+            .default_width(235.0)
+            .width_range(160.0..=500.0)
+            .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG_SIDEBAR)
@@ -1566,8 +1567,9 @@ impl UnjessDesktopApp {
         }
 
         egui::SidePanel::right("right_changes_inspector")
-            .exact_width(290.0)
-            .resizable(false)
+            .default_width(290.0)
+            .width_range(200.0..=700.0)
+            .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG_SIDEBAR)
