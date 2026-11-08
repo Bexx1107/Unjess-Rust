@@ -15,6 +15,7 @@ use icons::{
 };
 use markdown::render_markdown;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unjess_core::{
@@ -22,6 +23,15 @@ use unjess_core::{
     McpServerConfig, ModelInfo, ScheduledTask, SchedulerManager, Settings, SkillInfo,
     SkillsManager, Workspace,
 };
+
+/// An attached screenshot or image in the desktop composer.
+#[derive(Debug, Clone)]
+pub struct AttachedImage {
+    pub path: PathBuf,
+    pub filename: String,
+    pub width: u32,
+    pub height: u32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainTab {
@@ -73,6 +83,7 @@ pub struct UnjessDesktopApp {
 
     // Chat & Composer state
     pub prompt_input: String,
+    pub attached_images: Vec<AttachedImage>,
     pub renaming_conv_id: Option<String>,
     pub rename_conv_buf: String,
     pub renaming_ws_id: Option<String>,
@@ -200,6 +211,7 @@ impl UnjessDesktopApp {
             show_left_sidebar: true,
             show_right_sidebar: true,
             prompt_input: String::new(),
+            attached_images: Vec::new(),
             renaming_conv_id: None,
             rename_conv_buf: String::new(),
             renaming_ws_id: None,
@@ -311,6 +323,112 @@ impl UnjessDesktopApp {
             ("/schedules", "/schedules", "Open the Background Schedules & Cron Manager", false),
             ("/undo", "/undo", "Undo last turn and revert file modifications", false),
         ]
+    }
+
+    /// Extracts an image from the system clipboard (e.g. from Windows Snipping Tool `Win+Shift+S`),
+    /// writes it as a PNG file in `<workspace>/.unjess/attachments/` (or `~/.unjess/attachments/`),
+    /// and returns an `AttachedImage` descriptor.
+    ///
+    /// If `force_image` is false, it only extracts if the clipboard does not contain non-empty text,
+    /// so normal text paste into `TextEdit` is never intercepted or disrupted.
+    pub fn try_paste_clipboard_image(target_dir: &Path, force_image: bool) -> Option<AttachedImage> {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+
+        if !force_image {
+            if let Ok(text) = clipboard.get_text() {
+                if !text.is_empty() {
+                    return None;
+                }
+            }
+        }
+
+        let img_data = clipboard.get_image().ok()?;
+        if img_data.width == 0 || img_data.height == 0 {
+            return None;
+        }
+
+        let attach_dir = if target_dir.exists() && target_dir.is_dir() {
+            target_dir.join(".unjess").join("attachments")
+        } else {
+            unjess_core::Settings::config_dir().join("attachments")
+        };
+        let _ = std::fs::create_dir_all(&attach_dir);
+
+        let now = chrono::Utc::now();
+        let filename = format!(
+            "screenshot_{}_{:03}.png",
+            now.format("%Y%m%d_%H%M%S"),
+            now.timestamp_subsec_millis()
+        );
+        let out_path = attach_dir.join(&filename);
+
+        let width = img_data.width as u32;
+        let height = img_data.height as u32;
+        let rgba_bytes = img_data.bytes.into_owned();
+
+        let img = image::RgbaImage::from_raw(width, height, rgba_bytes)?;
+        img.save(&out_path).ok()?;
+
+        Some(AttachedImage {
+            path: out_path,
+            filename,
+            width,
+            height,
+        })
+    }
+
+    /// Submits the prompt currently in the composer together with any attached screenshots.
+    pub fn submit_current_composer_prompt(&mut self) {
+        let clean = self.prompt_input.trim().to_string();
+        if clean.is_empty() && self.attached_images.is_empty() {
+            return;
+        }
+
+        // If the user typed a partial `/cmd` without spaces, resolve it to the highlighted slash command
+        if clean.starts_with('/') && !clean.contains(' ') {
+            let cmd_token = clean.to_lowercase();
+            let matching: Vec<_> = Self::gui_slash_commands()
+                .into_iter()
+                .filter(|(c, _, _, _)| {
+                    cmd_token == "/"
+                        || c.starts_with(&cmd_token)
+                        || c.contains(cmd_token.trim_start_matches('/'))
+                })
+                .collect();
+            if let Some(&(sel_cmd, _, _, takes_args)) =
+                matching.get(self.slash_selected_idx).or_else(|| matching.first())
+            {
+                if takes_args && clean != sel_cmd {
+                    self.prompt_input = format!("{} ", sel_cmd);
+                    return;
+                } else {
+                    self.prompt_input.clear();
+                    self.dispatch_composer_input(sel_cmd.to_string());
+                    return;
+                }
+            }
+        }
+
+        let mut final_prompt = if clean.is_empty() {
+            "Please inspect the attached screenshot/image.".to_string()
+        } else {
+            clean
+        };
+
+        if !self.attached_images.is_empty() {
+            for att in &self.attached_images {
+                final_prompt.push_str(&format!(
+                    "\n\n[Attached Screenshot: `{}` ({}×{})]",
+                    att.path.display(),
+                    att.width,
+                    att.height
+                ));
+            }
+            self.attached_images.clear();
+        }
+
+        self.prompt_input.clear();
+        self.dispatch_composer_input(final_prompt);
     }
 
     pub fn dispatch_composer_input(&mut self, raw: String) {
@@ -2935,6 +3053,59 @@ impl UnjessDesktopApp {
                             i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
                         });
 
+                        // Intercept Ctrl+V / Cmd+V paste for clipboard screenshot images
+                        let paste_image_detected = ui.input(|i| {
+                            i.modifiers.command && i.key_pressed(egui::Key::V)
+                        });
+                        if paste_image_detected {
+                            let ws_path = self.hm.active_workspace_path();
+                            if let Some(att) = Self::try_paste_clipboard_image(&ws_path, false) {
+                                let toast = format!(
+                                    "Attached screenshot `{}` ({}×{})",
+                                    att.filename, att.width, att.height
+                                );
+                                self.attached_images.push(att);
+                                self.status_toast = Some((toast, Instant::now()));
+                            }
+                        }
+
+                        // Attached screenshots and images chips bar
+                        if !self.attached_images.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                                let mut remove_idx = None;
+                                for (idx, att) in self.attached_images.iter().enumerate() {
+                                    egui::Frame::new()
+                                        .fill(theme::BG_CARD_HOVER)
+                                        .stroke(Stroke::new(1.0, theme::BORDER_CARD))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(Margin::symmetric(8, 4))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new("📷").size(12.0));
+                                                let label_text = if att.width > 0 && att.height > 0 {
+                                                    format!("{} ({}×{})", att.filename, att.width, att.height)
+                                                } else {
+                                                    att.filename.clone()
+                                                };
+                                                ui.label(
+                                                    RichText::new(label_text)
+                                                        .size(11.5)
+                                                        .color(theme::TEXT_PRIMARY),
+                                                );
+                                                if ui.add(egui::Button::new(RichText::new("✕").size(10.0)).frame(false)).clicked() {
+                                                    remove_idx = Some(idx);
+                                                }
+                                            });
+                                        });
+                                }
+                                if let Some(idx) = remove_idx {
+                                    self.attached_images.remove(idx);
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
+
                         // Scrollable bounded multiline prompt input so typing long prompts expands UPWARD (up to 135px) while keeping the bottom toolbar pinned!
                         let mut submitted_via_enter = false;
                         ScrollArea::vertical()
@@ -2960,37 +3131,7 @@ impl UnjessDesktopApp {
                             });
 
                         if submitted_via_enter {
-                            let clean = self.prompt_input.trim().to_string();
-                            if !clean.is_empty() {
-                                // If the user typed a partial `/cmd` without spaces, resolve it to the highlighted slash command
-                                if clean.starts_with('/') && !clean.contains(' ') {
-                                    let cmd_token = clean.to_lowercase();
-                                    let matching: Vec<_> = Self::gui_slash_commands()
-                                        .into_iter()
-                                        .filter(|(c, _, _, _)| {
-                                            cmd_token == "/"
-                                                || c.starts_with(&cmd_token)
-                                                || c.contains(cmd_token.trim_start_matches('/'))
-                                        })
-                                        .collect();
-                                    if let Some(&(sel_cmd, _, _, takes_args)) =
-                                        matching.get(self.slash_selected_idx).or_else(|| matching.first())
-                                    {
-                                        if takes_args && clean != sel_cmd {
-                                            self.prompt_input = format!("{} ", sel_cmd);
-                                        } else {
-                                            self.prompt_input.clear();
-                                            self.dispatch_composer_input(sel_cmd.to_string());
-                                        }
-                                    } else {
-                                        self.prompt_input.clear();
-                                        self.dispatch_composer_input(clean);
-                                    }
-                                } else {
-                                    self.prompt_input.clear();
-                                    self.dispatch_composer_input(clean);
-                                }
-                            }
+                            self.submit_current_composer_prompt();
                         }
 
                         ui.add_space(6.0);
@@ -2998,10 +3139,40 @@ impl UnjessDesktopApp {
                         // Bottom Composer Toolbar Row
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            if icon_btn(ui, Icon::Paperclip, false, "Attach File Path").clicked() {
+                            if icon_btn(ui, Icon::Paperclip, false, "Attach File Path or Image").clicked() {
                                 if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                    self.prompt_input
-                                        .push_str(&format!(" `{}` ", path.to_string_lossy()));
+                                    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                    if ["png", "jpg", "jpeg", "webp", "bmp", "ico"].contains(&ext.as_str()) {
+                                        let (width, height) = image::image_dimensions(&path).unwrap_or((0, 0));
+                                        let filename = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "image.png".to_string());
+                                        let toast = format!("Attached image `{}` ({}×{})", filename, width, height);
+                                        self.attached_images.push(AttachedImage {
+                                            path,
+                                            filename,
+                                            width,
+                                            height,
+                                        });
+                                        self.status_toast = Some((toast, Instant::now()));
+                                    } else {
+                                        self.prompt_input
+                                            .push_str(&format!(" `{}` ", path.to_string_lossy()));
+                                    }
+                                }
+                            }
+                            if icon_btn(ui, Icon::Image, false, "Paste Screenshot from Clipboard (Ctrl+V)").clicked() {
+                                let ws_path = self.hm.active_workspace_path();
+                                if let Some(att) = Self::try_paste_clipboard_image(&ws_path, true) {
+                                    let toast = format!(
+                                        "Attached screenshot `{}` ({}×{})",
+                                        att.filename, att.width, att.height
+                                    );
+                                    self.attached_images.push(att);
+                                    self.status_toast = Some((toast, Instant::now()));
+                                } else {
+                                    self.status_toast = Some((
+                                        "Clipboard does not contain an image or screenshot".to_string(),
+                                        Instant::now(),
+                                    ));
                                 }
                             }
                             if icon_btn(ui, Icon::FileCode, false, "Browse Workspace Files")
@@ -3077,11 +3248,7 @@ impl UnjessDesktopApp {
                                             theme::TEXT_DARK_ON_WHITE,
                                         );
                                         if send_resp.clicked() {
-                                            let clean = self.prompt_input.trim().to_string();
-                                            if !clean.is_empty() {
-                                                self.prompt_input.clear();
-                                                self.dispatch_composer_input(clean);
-                                            }
+                                            self.submit_current_composer_prompt();
                                         }
                                     }
 

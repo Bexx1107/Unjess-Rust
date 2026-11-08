@@ -84,8 +84,14 @@ try {
     $cliHash = (Get-FileHash -Path (Join-Path $distDir "unjess-cli.exe") -Algorithm SHA256).Hash.ToLower()
     $setupHash = (Get-FileHash -Path (Join-Path $distDir "Unjess-Setup.exe") -Algorithm SHA256).Hash.ToLower()
 
+    $cargoToml = Get-Content (Join-Path $RepoRoot "Cargo.toml") -Raw
+    $appVer = "4.0.2"
+    if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+        $appVer = $matches[1]
+    }
+
     $manifest = [ordered]@{
-        version      = "4.0.1"
+        version      = $appVer
         edition      = "native-rust"
         architecture = "windows-x86_64"
         port         = 9758

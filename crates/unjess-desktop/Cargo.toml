@@ -12,7 +12,7 @@ unjess-core = { path = "../unjess-core" }
 eframe = "0.31"
 rfd = "0.15"
 arboard = "3.7"
-image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "ico"] }
 chrono = "0.4"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }

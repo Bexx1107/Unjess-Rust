@@ -51,6 +51,7 @@ pub enum Icon {
     Key,
     Eye,
     EyeOff,
+    Image,
     Download,
     Play,
     Refresh,
@@ -345,6 +346,15 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::EyeOff => {
             paint_icon(painter, rect, Icon::Eye, color);
             painter.line_segment([pt(-0.78, -0.68), pt(0.78, 0.68)], stroke);
+        }
+        Icon::Image => {
+            let box_r = Rect::from_min_max(pt(-0.8, -0.65), pt(0.8, 0.65));
+            painter.rect_stroke(box_r, CornerRadius::same(2), stroke, StrokeKind::Inside);
+            painter.circle_filled(pt(-0.35, -0.2), 1.5, color);
+            painter.line_segment([pt(-0.7, 0.45), pt(-0.15, -0.1)], stroke);
+            painter.line_segment([pt(-0.15, -0.1), pt(0.3, 0.45)], stroke);
+            painter.line_segment([pt(0.15, 0.2), pt(0.45, -0.15)], stroke);
+            painter.line_segment([pt(0.45, -0.15), pt(0.75, 0.45)], stroke);
         }
         Icon::Download => {
             painter.line_segment([pt(0.0, -0.78), pt(0.0, 0.35)], stroke);
