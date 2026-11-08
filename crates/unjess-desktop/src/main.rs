@@ -325,22 +325,14 @@ impl UnjessDesktopApp {
         ]
     }
 
-    /// Extracts an image from the system clipboard (e.g. from Windows Snipping Tool `Win+Shift+S`),
-    /// writes it as a PNG file in `<workspace>/.unjess/attachments/` (or `~/.unjess/attachments/`),
-    /// and returns an `AttachedImage` descriptor.
+    /// Extracts an image from the system clipboard (e.g. from Windows Snipping Tool `Win+Shift+S`,
+    /// Discord, or browser image copies), writes it as a PNG file in `<workspace>/.unjess/attachments/`
+    /// (or `~/.unjess/attachments/`), and returns an `AttachedImage` descriptor.
     ///
-    /// If `force_image` is false, it only extracts if the clipboard does not contain non-empty text,
-    /// so normal text paste into `TextEdit` is never intercepted or disrupted.
-    pub fn try_paste_clipboard_image(target_dir: &Path, force_image: bool) -> Option<AttachedImage> {
+    /// If the clipboard does not contain valid bitmap data, returns `None` so standard text paste
+    /// into `TextEdit` proceeds completely unaffected.
+    pub fn try_paste_clipboard_image(target_dir: &Path) -> Option<AttachedImage> {
         let mut clipboard = arboard::Clipboard::new().ok()?;
-
-        if !force_image {
-            if let Ok(text) = clipboard.get_text() {
-                if !text.is_empty() {
-                    return None;
-                }
-            }
-        }
 
         let img_data = clipboard.get_image().ok()?;
         if img_data.width == 0 || img_data.height == 0 {
@@ -3055,19 +3047,24 @@ impl UnjessDesktopApp {
                             i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
                         });
 
-                        // Intercept Ctrl+V / Cmd+V paste for clipboard screenshot images
+                        // Intercept Ctrl+V / Cmd+V / Shift+Insert paste for clipboard screenshot images
                         let paste_image_detected = ui.input(|i| {
-                            i.modifiers.command && i.key_pressed(egui::Key::V)
+                            ((i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::V))
+                                || (i.modifiers.shift && i.key_pressed(egui::Key::Insert))
+                                || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
                         });
                         if paste_image_detected {
                             let ws_path = self.hm.active_workspace_path();
-                            if let Some(att) = Self::try_paste_clipboard_image(&ws_path, false) {
+                            if let Some(att) = Self::try_paste_clipboard_image(&ws_path) {
                                 let toast = format!(
                                     "Attached screenshot `{}` ({}×{})",
                                     att.filename, att.width, att.height
                                 );
                                 self.attached_images.push(att);
                                 self.status_toast = Some((toast, Instant::now()));
+                                ui.input_mut(|i| {
+                                    i.events.retain(|e| !matches!(e, egui::Event::Paste(_) | egui::Event::Key { key: egui::Key::V, .. }));
+                                });
                             }
                         }
 
@@ -3163,7 +3160,7 @@ impl UnjessDesktopApp {
                             }
                             if icon_btn(ui, Icon::Image, false, "Paste Screenshot from Clipboard (Ctrl+V)").clicked() {
                                 let ws_path = self.hm.active_workspace_path();
-                                if let Some(att) = Self::try_paste_clipboard_image(&ws_path, true) {
+                                if let Some(att) = Self::try_paste_clipboard_image(&ws_path) {
                                     let toast = format!(
                                         "Attached screenshot `{}` ({}×{})",
                                         att.filename, att.width, att.height
