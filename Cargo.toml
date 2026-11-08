@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "4.0.0"
 edition = "2024"
-authors = ["Bexx <zanzupancic95@gmail.com>"]
+authors = ["Bexx"]
 license = "MIT"
 
 [profile.release]

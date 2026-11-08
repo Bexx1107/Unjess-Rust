@@ -126,18 +126,23 @@ fn parse_jsonrpc_or_sse(raw: &str) -> Option<serde_json::Value> {
     last_json
 }
 
-fn resolve_mashina_token(env: &HashMap<String, String>) -> String {
-    if let Some(t) = env
-        .get("MASHINA_COLLAB_TOKEN")
-        .or_else(|| env.get("MASHINA_TOKEN"))
-    {
-        if !t.trim().is_empty() {
-            return t.trim().to_string();
+fn resolve_mcp_auth_token(env: &HashMap<String, String>) -> String {
+    for k in &[
+        "AUTH_TOKEN",
+        "BEARER_TOKEN",
+        "MCP_TOKEN",
+        "MASHINA_COLLAB_TOKEN",
+        "MASHINA_TOKEN",
+    ] {
+        if let Some(t) = env.get(*k) {
+            if !t.trim().is_empty() {
+                return t.trim().to_string();
+            }
         }
-    }
-    if let Ok(t) = std::env::var("MASHINA_COLLAB_TOKEN") {
-        if !t.trim().is_empty() {
-            return t.trim().to_string();
+        if let Ok(t) = std::env::var(*k) {
+            if !t.trim().is_empty() {
+                return t.trim().to_string();
+            }
         }
     }
     let settings = Settings::load();
@@ -173,10 +178,6 @@ impl McpManager {
                     "rea-agents@latest".to_string(),
                     "mcp".to_string(),
                 ];
-                changed = true;
-            }
-            if srv.name == "mashina-collab" && srv.url == "https://mashina.si/api/mcp" {
-                srv.url = "https://mashina.si/api/collab/mcp".to_string();
                 changed = true;
             }
             // If URL was placed into `command` field by mistake, move it to `url`
@@ -444,7 +445,7 @@ impl McpManager {
                 .build()
                 .map_err(|e| e.to_string())?;
 
-            let bearer_tok = resolve_mashina_token(&env);
+            let bearer_tok = resolve_mcp_auth_token(&env);
 
             // Step 1: Send MCP `initialize` handshake (captures `mcp-session-id` if server is stateful)
             let init_payload = serde_json::json!({
@@ -864,7 +865,7 @@ impl McpManager {
                     .timeout(Duration::from_secs(30))
                     .build()
                     .map_err(|e| e.to_string())?;
-                let bearer_tok = resolve_mashina_token(&env);
+                let bearer_tok = resolve_mcp_auth_token(&env);
 
                 // Initialize session if needed
                 let init_payload = serde_json::json!({
@@ -1025,31 +1026,9 @@ impl McpManager {
         }
     }
 
-    /// Returns the built-in 1-click MCP server presets (`mashina-collab`, `rea`, `filesystem`, `github`, `fetch`).
-    pub fn presets(mashina_token: &str) -> Vec<McpServerConfig> {
-        let mut mashina_env = HashMap::new();
-        if !mashina_token.trim().is_empty() {
-            mashina_env.insert(
-                "MASHINA_COLLAB_TOKEN".to_string(),
-                mashina_token.trim().to_string(),
-            );
-        }
-
+    /// Returns the built-in 1-click MCP server presets (`rea`, `filesystem`, `github`, `fetch`).
+    pub fn presets(_token: &str) -> Vec<McpServerConfig> {
         vec![
-            McpServerConfig {
-                name: "mashina-collab".to_string(),
-                command: String::new(),
-                url: "https://mashina.si/api/collab/mcp".to_string(),
-                args: Vec::new(),
-                env: mashina_env,
-                cwd: None,
-                headers: HashMap::new(),
-                enabled: !mashina_token.trim().is_empty(),
-                description: "Mashina.si Multi-Agent Collaboration & Shared Dossier Bus".to_string(),
-                cached_tools: Vec::new(),
-                last_probe_ok: None,
-                last_error: None,
-            },
             McpServerConfig {
                 name: "rea".to_string(),
                 command: "npx".to_string(),

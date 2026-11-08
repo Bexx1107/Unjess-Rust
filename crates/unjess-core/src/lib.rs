@@ -6,7 +6,7 @@
 //! - `workspace`: Sandboxed workspace path resolution, Git status inspection, and recursive file indexing.
 //! - `tools`: Sandboxed file read/write/edit with unified diff generation & 1-click revert, regex grep, glob search, shell execution, and web search.
 //! - `memory`: Persistent cross-session memory store (`~/.unjess-rust/memory.json`).
-//! - `mcp`: Model Context Protocol server registry & 1-click presets (`mashina-collab`, `rea`, `filesystem`, `github`, `fetch`).
+//! - `mcp`: Model Context Protocol server registry & 1-click presets (`rea`, `filesystem`, `github`, `fetch`).
 //! - `skills`: Built-in `reverse-engineer-anything` (REA) skill and custom skill manager.
 //! - `scheduler`: Persistent cron/interval task scheduler.
 //! - `codeintel`: Multi-language AST symbol outline & caller search.

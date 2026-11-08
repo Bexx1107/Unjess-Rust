@@ -1580,20 +1580,6 @@ impl UnjessDesktopApp {
                     ui.add_space(10.0);
                 }
 
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Mashina.si Multi-Agent Collaboration Token")
-                        .size(11.5)
-                        .color(theme::TEXT_SECONDARY),
-                );
-                ui.add_space(4.0);
-                ui.add_sized(
-                    egui::vec2(ui.available_width(), 30.0),
-                    TextEdit::singleline(&mut self.settings_draft.mashina_collab_token)
-                        .password(!self.show_api_keys_plain)
-                        .font(FontId::new(12.0, FontFamily::Monospace))
-                        .hint_text("msh_..."),
-                );
             });
     }
 

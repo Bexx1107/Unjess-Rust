@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo_banner.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo_banner_light.png">
+    <img src="assets/logo_banner.png" alt="Unjess — Agentic Harness" width="500">
+  </picture>
+</p>
+
 # Unjess
 
 **Unjess** (`v4.0.0`) is a native **Rust** autonomous AI coding and security engineering harness built as a self-contained Cargo workspace.

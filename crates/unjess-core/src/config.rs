@@ -86,7 +86,7 @@ impl Default for Settings {
             lmstudio_base_url: "http://localhost:1234".to_string(),
             kimi_base_url: "https://api.moonshot.ai/v1".to_string(),
             qwen_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".to_string(),
-            mashina_url: "https://mashina.si".to_string(),
+            mashina_url: String::new(),
             mashina_collab_token: String::new(),
             workspace: cwd,
             max_iterations: 200,
