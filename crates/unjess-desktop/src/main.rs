@@ -15,6 +15,11 @@ use icons::{
 };
 use markdown::render_markdown;
 use std::collections::HashSet;
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    fn GetAsyncKeyState(v_key: i32) -> i16;
+}
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -84,6 +89,7 @@ pub struct UnjessDesktopApp {
     // Chat & Composer state
     pub prompt_input: String,
     pub attached_images: Vec<AttachedImage>,
+    pub last_paste_hotkey: bool,
     pub renaming_conv_id: Option<String>,
     pub rename_conv_buf: String,
     pub renaming_ws_id: Option<String>,
@@ -212,6 +218,7 @@ impl UnjessDesktopApp {
             show_right_sidebar: true,
             prompt_input: String::new(),
             attached_images: Vec::new(),
+            last_paste_hotkey: false,
             renaming_conv_id: None,
             rename_conv_buf: String::new(),
             renaming_ws_id: None,
@@ -332,12 +339,20 @@ impl UnjessDesktopApp {
     /// If the clipboard does not contain valid bitmap data, returns `None` so standard text paste
     /// into `TextEdit` proceeds completely unaffected.
     pub fn try_paste_clipboard_image(target_dir: &Path) -> Option<AttachedImage> {
-        let mut clipboard = arboard::Clipboard::new().ok()?;
-
-        let img_data = clipboard.get_image().ok()?;
-        if img_data.width == 0 || img_data.height == 0 {
-            return None;
+        let mut img_opt = None;
+        for _ in 0..4 {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(img_data) = clipboard.get_image() {
+                    if img_data.width > 0 && img_data.height > 0 {
+                        img_opt = Some(img_data);
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
+
+        let img_data = img_opt?;
 
         let attach_dir = if target_dir.exists() && target_dir.is_dir() {
             target_dir.join(".unjess").join("attachments")
@@ -370,6 +385,56 @@ impl UnjessDesktopApp {
     }
 
     /// Submits the prompt currently in the composer together with any attached screenshots.
+    /// Checks for global or focused Ctrl+V / Shift+Insert hotkey edge to paste clipboard screenshots.
+    /// This bypasses egui-winit's internal key-swallowing behavior when the system clipboard contains
+    /// an image rather than text.
+    pub fn handle_clipboard_paste_hotkey(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.focused);
+
+        #[cfg(target_os = "windows")]
+        let paste_edge = {
+            if focused {
+                unsafe {
+                    let ctrl_down = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0;
+                    let v_down = (GetAsyncKeyState(0x56) as u16 & 0x8000) != 0;
+                    let shift_down = (GetAsyncKeyState(0x10) as u16 & 0x8000) != 0;
+                    let ins_down = (GetAsyncKeyState(0x2D) as u16 & 0x8000) != 0;
+                    let down = (ctrl_down && v_down) || (shift_down && ins_down);
+                    let edge = down && !self.last_paste_hotkey;
+                    self.last_paste_hotkey = down;
+                    edge
+                }
+            } else {
+                self.last_paste_hotkey = false;
+                false
+            }
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let paste_edge = false;
+
+        let egui_paste_event = ctx.input(|i| {
+            ((i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::V))
+                || (i.modifiers.shift && i.key_pressed(egui::Key::Insert))
+                || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+        });
+
+        if paste_edge || egui_paste_event {
+            let ws_path = self.hm.active_workspace_path();
+            if let Some(att) = Self::try_paste_clipboard_image(&ws_path) {
+                let toast = format!(
+                    "Attached screenshot `{}` ({}×{})",
+                    att.filename, att.width, att.height
+                );
+                self.attached_images.push(att);
+                self.status_toast = Some((toast, Instant::now()));
+                ctx.input_mut(|i| {
+                    i.events.retain(|e| !matches!(e, egui::Event::Paste(_) | egui::Event::Key { key: egui::Key::V, .. }));
+                });
+            }
+        }
+    }
+
     pub fn submit_current_composer_prompt(&mut self) {
         let clean = self.prompt_input.trim().to_string();
         if clean.is_empty() && self.attached_images.is_empty() {
@@ -3411,6 +3476,9 @@ impl eframe::App for UnjessDesktopApp {
             self.refresh_workspace_cache();
         }
 
+        // Handle direct Ctrl+V / Shift+Insert clipboard image paste
+        self.handle_clipboard_paste_hotkey(ctx);
+
         // Top Global Header Bar
         self.render_top_header(ctx);
 
@@ -3580,4 +3648,17 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| Ok(Box::new(UnjessDesktopApp::new(cc, hm)))),
     )
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clipboard_image_read() {
+        let ws_path = std::path::PathBuf::from(".");
+        let res = UnjessDesktopApp::try_paste_clipboard_image(&ws_path);
+        println!("try_paste_clipboard_image result: {:?}", res);
+    }
 }

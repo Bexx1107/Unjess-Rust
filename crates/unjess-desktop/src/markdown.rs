@@ -11,6 +11,12 @@ pub fn render_markdown(ui: &mut Ui, text: &str) {
     let mut block_idx = 0usize;
 
     for raw_line in text.lines() {
+        let trimmed_line = raw_line.trim();
+        // Hide HTML comments (such as internal <!-- GOAL_COMPLETE --> sentinels) from markdown rendering
+        if trimmed_line.starts_with("<!--") && trimmed_line.ends_with("-->") {
+            continue;
+        }
+
         let trimmed = raw_line.trim_end();
         if let Some(fence_rest) = trimmed.strip_prefix("```") {
             if in_code_block {

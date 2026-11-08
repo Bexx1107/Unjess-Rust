@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.0.5";
+pub const CURRENT_VERSION: &str = "4.0.6";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,22 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.0.6".to_string(),
+            date: "2026-11-08".to_string(),
+            title: "Unjess 4.0.6 — Native Win32 Hotkey Image Paste & Sentinel Tag Cleanup".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Bypassed egui-winit event swallow via native Win32 GetAsyncKeyState hotkey detection so Ctrl+V and Shift+Insert reliably attach clipboard screenshots.".to_string(),
+                "Added multi-attempt retry loop for OS clipboard image reading to eliminate race conditions with Windows Snipping Tool.".to_string(),
+                "Eliminated false-positive autonomous loop nudges on conversational replies and questions, stopping unwanted 'goal complete' loop stalls.".to_string(),
+                "Sanitized internal <!-- GOAL_COMPLETE --> and HTML comments from Markdown renderer and chat history display.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.0.5".to_string(),
             date: "2026-11-08".to_string(),
             title: "Unjess 4.0.5 — Zero-Interference Clipboard Screenshot Pasting".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Eliminated text-clipboard interference check so Windows Snipping Tool OCR and clipboard URLs never block image pasting.".to_string(),
                 "Expanded paste detection across Ctrl+V, Cmd+V, Shift+Insert, and OS paste events.".to_string(),
@@ -127,9 +139,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.0.5");
+        assert_eq!(CURRENT_VERSION, "4.0.6");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.0.5");
+        assert_eq!(log[0].version, "4.0.6");
     }
 }

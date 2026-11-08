@@ -1306,6 +1306,22 @@ impl HarnessManager {
         }
     }
 
+    /// Strips internal sentinel tags (such as `<!-- GOAL_COMPLETE -->`) from user-visible text.
+    pub fn clean_sentinel_tags(text: &str) -> String {
+        let mut cleaned = text.to_string();
+        for token in &[
+            "<!-- GOAL_COMPLETE -->",
+            "<!-- goal_complete -->",
+            "<!--GOAL_COMPLETE-->",
+            "<!--goal_complete-->",
+            "<goal_complete>",
+            "</goal_complete>",
+        ] {
+            cleaned = cleaned.replace(token, "");
+        }
+        cleaned.trim_end().to_string()
+    }
+
     /// Detects when an LLM outputs transitional narration ("I will now check...", "Let me inspect...")
     /// without invoking any tool so the loop can auto-continue instead of terminating prematurely.
     pub fn is_transitional_narration(text: &str) -> bool {
@@ -3032,7 +3048,7 @@ impl HarnessManager {
 
                     if let Ok(mut live) = self.live_turn.write() {
                         live.thinking = collected_thinking.clone();
-                        live.streaming_text = final_text.clone();
+                        live.streaming_text = Self::clean_sentinel_tags(&final_text);
                         live.tokens = total_turn_tokens;
                         live.cost_usd = total_turn_cost;
                     }
@@ -3059,33 +3075,31 @@ impl HarnessManager {
                             || lower_resp.contains("could you clarify")
                             || lower_resp.contains("please provide");
 
-                        // 1. Autonomous Continuation Invariant & Execution Guard:
-                        // In autonomous mode (enable_tools), turns without tools CANNOT terminate unless explicit completion is declared.
-                        // Up to 15 progressive nudges are provided before treating it as an intractable stall.
+                        let is_empty_turn = resp.content.trim().is_empty()
+                            && step_thinking
+                                .as_ref()
+                                .map_or(false, |t| !t.trim().is_empty());
+                        let is_transitional = Self::is_transitional_narration(&resp.content);
+
+                        // Autonomous Continuation Guard:
+                        // Only nudge if the model produced an empty turn or genuine transitional narration without invoking tools.
+                        // Substantive conversational replies, direct answers to questions, or final summaries are accepted without nagging.
                         if enable_tools
                             && iter < max_iters
                             && !is_user_question
                             && !is_explicit_completion
+                            && (is_empty_turn || is_transitional)
                         {
-                            let is_empty_turn = resp.content.trim().is_empty()
-                                && step_thinking
-                                    .as_ref()
-                                    .map_or(false, |t| !t.trim().is_empty());
-
-                            if transitional_nudges < 15 {
+                            if transitional_nudges < 5 {
                                 transitional_nudges += 1;
                                 let nudge_msg = if is_empty_turn {
-                                    "[System Guidance]: You completed your reasoning but did not invoke any tools or output a final answer. Please invoke the appropriate tool to proceed with the task or provide your final response with `<!-- GOAL_COMPLETE -->`.".to_string()
-                                } else if transitional_nudges <= 2 {
-                                    "[System Guidance]: You provided intermediate commentary without invoking any tools. In autonomous mode, you must not narrate your intent without acting. If you need to inspect files, execute commands, or edit code, CALL THE RELEVANT TOOL IMMEDIATELY now. If you are completely finished and have verified your solution, provide your final response summarizing what you accomplished and include `<!-- GOAL_COMPLETE -->`.".to_string()
-                                } else if transitional_nudges <= 6 {
-                                    "[Autonomous Execution Guard]: You must invoke an actionable tool (`run_command`, `write_file`, `edit_file`, or `read_file`) to advance the task. Do not output text without a tool call. If all requirements and verification steps are 100% satisfied, emit `<!-- GOAL_COMPLETE -->` alongside your final summary.".to_string()
+                                    "[System Guidance]: You completed your reasoning but did not invoke any tools or output a final answer. Please invoke the appropriate tool to proceed with the task or provide your final response.".to_string()
                                 } else {
-                                    "[Autonomous Execution Guard - Escalation]: Turn execution cannot terminate without invoking tools or completing verification. You have not submitted the final result. Call `run_command` now to verify your output against ground-truth files, or execute the next implementation step.".to_string()
+                                    "[System Guidance]: You described a pending action without invoking a tool. In autonomous mode, call the relevant tool immediately to advance the task, or output your final verified response if finished.".to_string()
                                 };
                                 working_history.push(ChatMessage {
                                     role: "assistant".to_string(),
-                                    content: resp.content.clone(),
+                                    content: Self::clean_sentinel_tags(&resp.content),
                                     thinking: step_thinking,
                                     tool_calls: Vec::new(),
                                     diffs: Vec::new(),
@@ -3641,7 +3655,7 @@ impl HarnessManager {
                     let steps_remaining = max_iters.saturating_sub(iter);
                     if is_autonomous && steps_remaining <= 30 && steps_remaining > 0 {
                         let warning_msg = format!(
-                            "\n\n<budget_warning>\n[Autonomous Budget Notice: {} step(s) remaining out of {}]\nYou are approaching the execution step limit. Stop exploratory diagnostics, sub-searches, and grid-scans now. Implement your final solution, execute it to write and verify all required final output files, run tests, and emit `<!-- GOAL_COMPLETE -->`.\n</budget_warning>",
+                            "\n\n<budget_warning>\n[Autonomous Budget Notice: {} step(s) remaining out of {}]\nYou are approaching the execution step limit. Stop exploratory diagnostics, sub-searches, and grid-scans now. Implement your final solution, execute it to write and verify all required final output files, run tests, and emit your final verified response.\n</budget_warning>",
                             steps_remaining, max_iters
                         );
                         if let Some(last_msg) = working_history.last_mut() {
@@ -3682,6 +3696,8 @@ impl HarnessManager {
                 collected_diffs.len()
             );
         }
+
+        final_text = Self::clean_sentinel_tags(&final_text);
 
         // Commit assistant turn to conversation
         if let Ok(mut g) = self.state.write() {
