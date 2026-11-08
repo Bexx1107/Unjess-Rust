@@ -982,9 +982,32 @@ impl HarnessManager {
         if messages.len() <= keep_recent {
             return messages.to_vec();
         }
-        let split_at = messages.len().saturating_sub(keep_recent);
-        let head = &messages[..split_at];
-        let tail = &messages[split_at..];
+
+        // Always preserve initial user prompt if present at index 0 (Task Specification Anchor)
+        let has_initial_user = !messages.is_empty() && messages[0].role == "user";
+        let (root_user, rest) = if has_initial_user {
+            (Some(messages[0].clone()), &messages[1..])
+        } else {
+            (None, messages)
+        };
+
+        if rest.len() <= keep_recent {
+            let mut out = Vec::new();
+            if let Some(root) = root_user {
+                out.push(root);
+            }
+            out.extend_from_slice(rest);
+            return out;
+        }
+
+        let mut split_at = rest.len().saturating_sub(keep_recent);
+        // Avoid splitting an assistant tool call from its tool result:
+        if split_at > 0 && rest[split_at].role == "tool" {
+            split_at = split_at.saturating_sub(1);
+        }
+
+        let head = &rest[..split_at];
+        let tail = &rest[split_at..];
 
         let mut digest_lines = Vec::new();
         let mut touched_files = Vec::new();
@@ -1023,7 +1046,7 @@ impl HarnessManager {
         }
 
         let mut summary_text = format!(
-            "[Context Compacted — Summarized {} earlier messages]:\n{}",
+            "[Context Compacted — Summarized {} earlier intermediate messages]:\n{}",
             head.len(),
             digest_lines
                 .into_iter()
@@ -1040,19 +1063,26 @@ impl HarnessManager {
 
         let tok_est = (summary_text.len() / 4).max(16);
         let head_model = head.iter().rev().find_map(|m| m.model.clone());
-        let mut new_msgs = vec![ChatMessage {
-            role: "system".to_string(),
-            content: summary_text,
-            thinking: None,
-            tool_calls: Vec::new(),
-            diffs: Vec::new(),
-            timestamp: Utc::now().format("%H:%M:%S").to_string(),
-            model: head_model,
-            tokens: head_tokens.max(tok_est),
-            input_tokens: head_in_tokens.max(tok_est),
-            output_tokens: head_out_tokens,
-            cost_usd: head_cost_usd,
-        }];
+
+        let mut new_msgs = Vec::new();
+        if let Some(root) = root_user {
+            new_msgs.push(root);
+        }
+        if !head.is_empty() {
+            new_msgs.push(ChatMessage {
+                role: "system".to_string(),
+                content: summary_text,
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                model: head_model,
+                tokens: head_tokens.max(tok_est),
+                input_tokens: head_in_tokens.max(tok_est),
+                output_tokens: head_out_tokens,
+                cost_usd: head_cost_usd,
+            });
+        }
         new_msgs.extend_from_slice(tail);
         new_msgs
     }
@@ -1200,8 +1230,8 @@ impl HarnessManager {
 
         // Pass 3: Stage-2 structural digest compaction when context still exceeds `stage2_threshold`
         let post_stage1_chars: usize = msgs.iter().map(|m| m.content.len()).sum();
-        if (post_stage1_chars > stage2_threshold || msgs.len() > 40) && msgs.len() > 8 {
-            msgs = Self::compact_messages(&msgs, 8);
+        if post_stage1_chars > stage2_threshold && msgs.len() > 16 {
+            msgs = Self::compact_messages(&msgs, 16);
         }
 
         msgs
@@ -3938,9 +3968,11 @@ mod tests {
             },
         ];
         let compacted = HarnessManager::compact_messages(&msgs, 1);
-        assert_eq!(compacted.len(), 2);
-        assert_eq!(compacted[0].model.as_deref(), Some("claude-4-sonnet"));
-        assert!((compacted[0].cost_usd - 0.002).abs() < 1e-6);
+        assert_eq!(compacted.len(), 3);
+        assert_eq!(compacted[0].content, "First prompt");
+        assert_eq!(compacted[1].model.as_deref(), Some("claude-4-sonnet"));
+        assert!((compacted[1].cost_usd - 0.002).abs() < 1e-6);
+        assert_eq!(compacted[2].content, "Second prompt");
 
         // Verify @file context injection in build_system_prompt_for_query
         let sample_file = tmp.path().join("pinned_note.txt");
