@@ -137,20 +137,28 @@ fn parse_update_manifest_json(
         }
     }
 
-    // Also support `version.json` format (`hashes: { "Unjess.exe": "...", "Unjess-Setup.exe": "..." }`)
-    if let Some(hashes) = json.get("hashes").and_then(|v| v.as_object()) {
-        if asset_digest.is_empty() {
-            if let Some(h) = hashes
-                .get("Unjess-Setup.exe")
-                .or_else(|| hashes.get("Unjess.exe"))
-                .and_then(|v| v.as_str())
-            {
-                asset_digest = h.trim().to_lowercase();
-                asset_name = "Unjess-Setup.exe".to_string();
+    // Support `version.json` format (`binaries: { "Unjess.exe": "...", "Unjess-Setup.exe": "..." }` or `hashes: { ... }`)
+    let mut setup_digest = String::new();
+    for map_key in ["binaries", "hashes"] {
+        if let Some(hashes) = json.get(map_key).and_then(|v| v.as_object()) {
+            if setup_digest.is_empty() {
+                if let Some(h) = hashes.get("Unjess-Setup.exe").and_then(|v| v.as_str()) {
+                    setup_digest = h.trim().to_lowercase();
+                }
             }
-        }
-        if download_url.is_empty() {
-            download_url = DEFAULT_SETUP_DOWNLOAD_URL.to_string();
+            if asset_digest.is_empty() {
+                if let Some(h) = hashes
+                    .get("Unjess-Setup.exe")
+                    .or_else(|| hashes.get("Unjess.exe"))
+                    .and_then(|v| v.as_str())
+                {
+                    asset_digest = h.trim().to_lowercase();
+                    asset_name = "Unjess-Setup.exe".to_string();
+                }
+            }
+            if download_url.is_empty() {
+                download_url = DEFAULT_SETUP_DOWNLOAD_URL.to_string();
+            }
         }
     }
 
@@ -166,13 +174,18 @@ fn parse_update_manifest_json(
         notes = format!("Verified against {}", DEFAULT_GITHUB_REPO);
     }
 
-    let mut sha256 = json
-        .get("sha256")
-        .or_else(|| json.get("checksum"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().trim_start_matches("sha256:").to_lowercase())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(asset_digest);
+    let mut sha256 = if !setup_digest.is_empty()
+        && (download_url.is_empty() || download_url.ends_with("Unjess-Setup.exe"))
+    {
+        setup_digest
+    } else {
+        json.get("sha256")
+            .or_else(|| json.get("checksum"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().trim_start_matches("sha256:").to_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(asset_digest)
+    };
 
     if sha256.is_empty() && !notes.is_empty() {
         if let Ok(re) = Regex::new(r"\b([a-fA-F0-9]{64})\b") {
@@ -210,7 +223,7 @@ pub async fn check_for_updates(server_url: &str) -> Result<UpdateCheckResult, St
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
-        .user_agent("Unjess-Rust/4.0.0")
+        .user_agent("Unjess-Rust/4.0.1")
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -326,7 +339,7 @@ pub fn download_and_launch_installer_blocking(
     {
         use std::os::windows::process::CommandExt;
         std::process::Command::new(&temp_installer)
-            .creation_flags(0x08000000)
+            .creation_flags(0x00000008) // DETACHED_PROCESS
             .spawn()
             .map_err(|e| format!("Failed to spawn installer: {}", e))?;
         std::thread::sleep(Duration::from_millis(500));

@@ -21,13 +21,13 @@ fn stop_running_processes() {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        for proc_name in ["Unjess.exe", "unjessd.exe", "unjess-cli.exe"] {
+        for proc_name in ["Unjess.exe", "unjessd.exe", "unjess-cli.exe", "unjess.exe"] {
             let _ = Command::new("taskkill")
                 .args(["/F", "/T", "/IM", proc_name])
                 .creation_flags(0x08000000)
                 .status();
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(350));
     }
 }
 
@@ -105,7 +105,6 @@ fn main() {
         "unjessd.exe",
         "unjess-cli.exe",
         "Unjess-Uninstall.exe",
-        "WebView2Loader.dll",
         "version.json",
     ];
 
@@ -113,6 +112,7 @@ fn main() {
     for bin_name in binaries {
         let candidates = [
             exe_dir.join(bin_name),
+            exe_dir.join("dist").join(bin_name),
             PathBuf::from("dist").join(bin_name),
             PathBuf::from("target").join("release").join(bin_name),
             PathBuf::from(bin_name),
@@ -163,9 +163,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Install CLI alias `bin\unjess.exe` so `unjess` in cmd.exe / PowerShell launches the Rust CLI
+    // Install CLI alias `bin\unjess.exe` and `unjess.exe` so `unjess` in cmd.exe / PowerShell launches the Rust CLI
     let cli_bin = target_dir.join("unjess-cli.exe");
     if cli_bin.exists() {
+        let _ = fs::copy(&cli_bin, target_dir.join("unjess.exe"));
         let bin_subdir = target_dir.join("bin");
         if fs::create_dir_all(&bin_subdir).is_ok() {
             let alias_dst = bin_subdir.join("unjess.exe");
@@ -173,17 +174,32 @@ fn main() {
             println!("[+] Installed CLI command alias -> {}", alias_dst.display());
         }
         if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
-            let legacy_bin_dir = PathBuf::from(local_app_data)
+            let legacy_root = PathBuf::from(local_app_data)
                 .join("Programs")
-                .join("Unjess")
-                .join("bin");
-            if legacy_bin_dir.exists() {
-                let legacy_cli = legacy_bin_dir.join("unjess.exe");
-                if fs::copy(&cli_bin, &legacy_cli).is_ok() {
-                    println!(
-                        "[+] Updated PATH CLI binary -> {}",
-                        legacy_cli.display()
-                    );
+                .join("Unjess");
+            if legacy_root.exists() {
+                for name in [
+                    "Unjess.exe",
+                    "unjessd.exe",
+                    "unjess-cli.exe",
+                    "Unjess-Uninstall.exe",
+                    "version.json",
+                ] {
+                    let src = target_dir.join(name);
+                    if src.exists() {
+                        let _ = fs::copy(&src, legacy_root.join(name));
+                    }
+                }
+                let _ = fs::copy(&cli_bin, legacy_root.join("unjess.exe"));
+                let legacy_bin_dir = legacy_root.join("bin");
+                if legacy_bin_dir.exists() {
+                    let legacy_cli = legacy_bin_dir.join("unjess.exe");
+                    if fs::copy(&cli_bin, &legacy_cli).is_ok() {
+                        println!(
+                            "[+] Updated PATH CLI binary -> {}",
+                            legacy_cli.display()
+                        );
+                    }
                 }
             }
         }
@@ -207,7 +223,7 @@ fn main() {
             }
         }
         let manifest = format!(
-            "{{\n  \"version\": \"{}\",\n  \"engine\": \"100% Native Rust (WebView2 + Axum + Tokio)\",\n  \"port\": 9758,\n  \"hashes\": {{\n{}\n  }}\n}}\n",
+            "{{\n  \"version\": \"{}\",\n  \"engine\": \"100% Native Rust (eframe/egui + Axum + Tokio)\",\n  \"port\": 9758,\n  \"binaries\": {{\n{}\n  }}\n}}\n",
             CURRENT_VERSION,
             hash_entries.join(",\n")
         );
@@ -251,12 +267,14 @@ fn main() {
         {
             use std::os::windows::process::CommandExt;
             let _ = Command::new(&desktop_exe)
-                .creation_flags(0x08000000)
+                .current_dir(&target_dir)
+                .creation_flags(0x00000008) // DETACHED_PROCESS
                 .spawn();
         }
         #[cfg(not(windows))]
         {
             let _ = Command::new(&desktop_exe).spawn();
         }
+        std::thread::sleep(std::time::Duration::from_millis(800));
     }
 }

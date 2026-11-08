@@ -2183,7 +2183,8 @@ impl ToolEngine {
                 .spawn()?
         };
 
-        let _child_pid = child.id();
+        #[allow(unused_variables)]
+        let child_pid = child.id();
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
 
