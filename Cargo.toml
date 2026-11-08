@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/unjess-core",
+    "crates/unjess-daemon",
+    "crates/unjess-cli",
+    "crates/unjess-desktop",
+    "crates/unjess-installer",
+    "crates/unjess-uninstaller",
+]
+
+[workspace.package]
+version = "4.0.0"
+edition = "2024"
+authors = ["Bexx <zanzupancic95@gmail.com>"]
+license = "MIT"
+
+[profile.release]
+strip = true
+lto = "thin"
+opt-level = 3

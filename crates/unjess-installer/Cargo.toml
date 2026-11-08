@@ -1,0 +1,12 @@
+[package]
+name = "unjess-installer"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "Unjess-Setup"
+path = "src/main.rs"
+
+[dependencies]
+unjess-core = { path = "../unjess-core" }
+dirs = "6.0"

@@ -1,0 +1,228 @@
+//! Self-Updater & Release Version Checker (`updater.rs`).
+//!
+//! Performs semantic version comparison, GitHub/manifest asset resolution,
+//! and cryptographic SHA-256 verification using `sha2::Sha256`.
+
+use crate::version::CURRENT_VERSION;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateCheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub download_url: String,
+    pub notes: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub asset_name: String,
+}
+
+/// Computes the hex-encoded SHA-256 digest of `data` and compares it against `expected_hex`.
+pub fn verify_sha256_bytes(data: &[u8], expected_hex: &str) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let actual_hex = hex::encode(hasher.finalize());
+    let clean_expected = expected_hex
+        .trim()
+        .trim_start_matches("sha256:")
+        .trim()
+        .to_lowercase();
+    if !clean_expected.is_empty() {
+        if clean_expected.len() != 64 || !clean_expected.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "Invalid expected SHA-256 hex string '{}' (must be 64 hex characters)",
+                expected_hex
+            ));
+        }
+        if actual_hex != clean_expected {
+            return Err(format!(
+                "SHA-256 mismatch: expected {}, computed {}",
+                clean_expected, actual_hex
+            ));
+        }
+    }
+    Ok(actual_hex)
+}
+
+/// Computes and verifies the SHA-256 digest of a file on disk.
+pub fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<bool, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed reading {}: {}", path.display(), e))?;
+    verify_sha256_bytes(&bytes, expected_hex).map(|_| true)
+}
+
+/// Queries the release endpoint (GitHub Releases API or `version.json`) and checks if a newer version exists.
+pub async fn check_for_updates(server_url: &str) -> Result<UpdateCheckResult, String> {
+    let effective_url = if server_url.trim().is_empty() {
+        "https://api.github.com/repos/Bexx1107/unjess/releases/latest"
+    } else {
+        server_url.trim()
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .user_agent("Unjess-Rust/4.0.0")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .get(effective_url)
+        .send()
+        .await
+        .map_err(|e| format!("Update check request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Update endpoint {} returned HTTP {}",
+            effective_url,
+            resp.status()
+        ));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Invalid update manifest JSON: {}", e))?;
+
+    let raw_tag = json
+        .get("tag_name")
+        .or_else(|| json.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(CURRENT_VERSION);
+
+    let latest = raw_tag.trim().trim_start_matches('v').to_string();
+    let update_available = is_newer_semver(CURRENT_VERSION, &latest);
+
+    let mut download_url = json
+        .get("download_url")
+        .or_else(|| json.get("html_url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut asset_name = String::new();
+    let mut asset_digest = String::new();
+
+    if let Some(assets) = json.get("assets").and_then(|v| v.as_array()) {
+        for asset in assets {
+            let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.ends_with(".exe") || name.contains("Unjess") {
+                asset_name = name.to_string();
+                if let Some(dig) = asset.get("digest").and_then(|v| v.as_str()) {
+                    asset_digest = dig
+                        .trim_start_matches("sha256:")
+                        .trim()
+                        .to_lowercase();
+                }
+                if let Some(burl) = asset.get("browser_download_url").and_then(|v| v.as_str()) {
+                    download_url = burl.to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    let notes = json
+        .get("body")
+        .or_else(|| json.get("notes"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut sha256 = json
+        .get("sha256")
+        .or_else(|| json.get("checksum"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().trim_start_matches("sha256:").to_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(asset_digest);
+
+    if sha256.is_empty() && !notes.is_empty() {
+        if let Ok(re) = Regex::new(r"\b([a-fA-F0-9]{64})\b") {
+            if let Some(caps) = re.captures(&notes) {
+                if let Some(m) = caps.get(1) {
+                    sha256 = m.as_str().to_lowercase();
+                }
+            }
+        }
+    }
+
+    if !download_url.is_empty()
+        && !download_url.starts_with("https://")
+        && !download_url.starts_with("http://")
+    {
+        download_url.clear();
+    }
+
+    Ok(UpdateCheckResult {
+        current_version: CURRENT_VERSION.to_string(),
+        latest_version: latest,
+        update_available,
+        download_url,
+        notes,
+        sha256,
+        asset_name,
+    })
+}
+
+fn is_newer_semver(current: &str, candidate: &str) -> bool {
+    let parse = |s: &str| -> ((u32, u32, u32), bool) {
+        let clean = s.trim().trim_start_matches('v');
+        let no_build = clean.split('+').next().unwrap_or("");
+        let (core, has_prerelease) = match no_build.split_once('-') {
+            Some((c, pre)) => (c, !pre.trim().is_empty()),
+            None => (no_build, false),
+        };
+        let mut parts = core
+            .split('.')
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| p.parse::<u32>().ok());
+        (
+            (
+                parts.next().unwrap_or(0),
+                parts.next().unwrap_or(0),
+                parts.next().unwrap_or(0),
+            ),
+            has_prerelease,
+        )
+    };
+    let (cur_ver, cur_pre) = parse(current);
+    let (cand_ver, cand_pre) = parse(candidate);
+    if cand_ver != cur_ver {
+        cand_ver > cur_ver
+    } else {
+        // Stable release (cand_pre == false) is newer than pre-release of the same version (cur_pre == true)
+        cur_pre && !cand_pre
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_semver_and_sha256_verification() {
+        assert!(is_newer_semver("4.0.0", "4.0.1"));
+        assert!(!is_newer_semver("4.0.0", "3.0.2"));
+        assert!(!is_newer_semver("4.0.0", "4.0-beta.5"));
+        assert!(!is_newer_semver("4.0.0", "4.0.0-alpha.1"));
+        assert!(is_newer_semver("4.0.0-beta.1", "4.0.0"));
+
+        let payload = b"unjess-rust-binary-payload";
+        let digest = verify_sha256_bytes(payload, "").unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(verify_sha256_bytes(payload, &digest).is_ok());
+        assert!(verify_sha256_bytes(payload, "not-a-valid-hex").is_err());
+        assert!(verify_sha256_bytes(payload, "0000000000000000000000000000000000000000000000000000000000000000").is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fpath = tmp.path().join("payload.bin");
+        fs::write(&fpath, payload).unwrap();
+        assert!(verify_file_sha256(&fpath, &digest).unwrap());
+    }
+}

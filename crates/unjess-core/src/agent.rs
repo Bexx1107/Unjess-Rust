@@ -1,0 +1,2972 @@
+//! Autonomous Multi-Turn Agent Engine & Persistent Harness Manager (`agent.rs`).
+//!
+//! Manages workspaces, conversations, custom subagents, multi-step workflows,
+//! 4-way execution modes (`Autonomous`, `Plan`, `Supervised`, `Duel`),
+//! `Caveman` & `Ponytail` persona modifiers, slash-command execution, stuck-loop
+//! recovery, budget circuit-breakers, provider fallback chains, and the asynchronous
+//! multi-turn tool loop.
+
+use crate::codeintel::generate_repo_map;
+use crate::config::Settings;
+use crate::llm::{complete_llm_turn, ChatMessage};
+use crate::mcp::McpManager;
+use crate::memory::MemoryStore;
+use crate::security::scan_workspace;
+use crate::skills::SkillsManager;
+use crate::tools::{FileDiff, ToolCallRecord, ToolEngine};
+use crate::workspace::Workspace;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    pub model: String,
+    pub autonomous: bool,
+    pub workspace_path: String,
+    pub context_mode: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            model: "qwen2.5-coder:7b".to_string(),
+            autonomous: true,
+            workspace_path: ".".to_string(),
+            context_mode: "Auto".to_string(),
+        }
+    }
+}
+
+/// Workspace entry registered in the Harness state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceEntry {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+fn default_conv_mode() -> String {
+    "workspace".to_string()
+}
+
+/// Persistent conversation thread with messages, token usage, and USD cost tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conversation {
+    pub id: String,
+    pub title: String,
+    pub workspace_id: String,
+    #[serde(default = "default_conv_mode")]
+    pub mode: String,
+    pub messages: Vec<ChatMessage>,
+    pub created_at: String,
+    #[serde(default)]
+    pub total_tokens: usize,
+    #[serde(default)]
+    pub total_input_tokens: usize,
+    #[serde(default)]
+    pub total_output_tokens: usize,
+    #[serde(default)]
+    pub total_cost_usd: f64,
+}
+
+fn deserialize_log_time<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(format!("{:.0}", n.as_f64().unwrap_or(0.0))),
+        _ => Ok(Utc::now().format("%H:%M:%S").to_string()),
+    }
+}
+
+/// Timestamped log entry for subagent activity inspection in the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentLogEntry {
+    #[serde(deserialize_with = "deserialize_log_time")]
+    pub time: String,
+    pub event: String,
+}
+
+/// Result of a multi-turn subagent task execution, including rolled-up diffs and token/cost metrics.
+#[derive(Debug, Clone, Default)]
+pub struct SubagentTurnResult {
+    pub output: String,
+    pub diffs: Vec<FileDiff>,
+    pub tool_calls: Vec<ToolCallRecord>,
+    pub tokens: usize,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cost_usd: f64,
+}
+
+/// Custom or built-in autonomous subagent definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentDef {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub system_prompt: String,
+    pub model: String,
+    pub status: String,
+    #[serde(default)]
+    pub last_output: String,
+    #[serde(default)]
+    pub output: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub result: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub conv_id: String,
+    #[serde(default)]
+    pub current_task: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallRecord>,
+    #[serde(default)]
+    pub diffs: Vec<FileDiff>,
+    #[serde(default)]
+    pub logs: Vec<SubagentLogEntry>,
+    #[serde(default)]
+    pub total_tokens: usize,
+    #[serde(default)]
+    pub total_cost_usd: f64,
+}
+
+fn default_wf_category() -> String {
+    "general".to_string()
+}
+
+/// Multi-step reusable prompt workflow definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowDef {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_wf_category")]
+    pub category: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub steps: Vec<String>,
+}
+
+impl WorkflowDef {
+    pub fn normalize(&mut self) {
+        if self.title.is_empty() && !self.name.is_empty() {
+            self.title = self.name.clone();
+        } else if self.name.is_empty() && !self.title.is_empty() {
+            self.name = self.title.clone();
+        }
+        if self.prompt.is_empty() && !self.steps.is_empty() {
+            self.prompt = self.steps.join("\n");
+        } else if self.steps.is_empty() && !self.prompt.is_empty() {
+            self.steps = self
+                .prompt
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+        }
+        if self.category.is_empty() {
+            self.category = "general".to_string();
+        }
+    }
+}
+
+/// Real-time snapshot of an in-progress autonomous agent turn.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LiveTurnSnapshot {
+    pub running: bool,
+    pub conv_id: String,
+    pub current_step: String,
+    pub thinking: String,
+    pub streaming_text: String,
+    pub tool_calls: Vec<ToolCallRecord>,
+    pub diffs: Vec<FileDiff>,
+    pub iteration: usize,
+    #[serde(default)]
+    pub started_at: f64,
+    #[serde(default)]
+    pub elapsed_s: f64,
+    #[serde(default)]
+    pub tokens: usize,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedHarnessState {
+    workspaces: Vec<WorkspaceEntry>,
+    active_workspace_id: String,
+    conversations: Vec<Conversation>,
+    active_conversation_id: String,
+    subagents: Vec<SubagentDef>,
+    workflows: Vec<WorkflowDef>,
+    agent_mode: String,
+    caveman_mode: bool,
+    ponytail_mode: bool,
+}
+
+/// Thread-safe central state and autonomous execution manager for Unjess 4.0.
+pub struct HarnessManager {
+    settings: RwLock<Settings>,
+    state: RwLock<PersistedHarnessState>,
+    live_turn: RwLock<LiveTurnSnapshot>,
+    abort_flag: Arc<AtomicBool>,
+}
+
+impl Default for HarnessManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HarnessManager {
+    fn state_path() -> PathBuf {
+        Settings::config_dir().join("harness_state.json")
+    }
+
+    fn now_epoch_secs() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// Initializes `HarnessManager`, loading settings and persistent state from `~/.unjess-rust`.
+    pub fn new() -> Self {
+        let settings = Settings::load();
+        let state_file = Self::state_path();
+
+        let mut state = if let Ok(raw) = fs::read_to_string(&state_file) {
+            serde_json::from_str::<PersistedHarnessState>(&raw)
+                .unwrap_or_else(|_| Self::default_state(&settings))
+        } else {
+            Self::default_state(&settings)
+        };
+
+        for wf in &mut state.workflows {
+            wf.normalize();
+        }
+        // Reset any stale "running" subagent statuses left from a prior process exit
+        for sub in &mut state.subagents {
+            if sub.status == "running" {
+                sub.status = "idle".to_string();
+            }
+        }
+
+        let mgr = Self {
+            settings: RwLock::new(settings),
+            state: RwLock::new(state),
+            live_turn: RwLock::new(LiveTurnSnapshot::default()),
+            abort_flag: Arc::new(AtomicBool::new(false)),
+        };
+        mgr.save_state();
+        mgr
+    }
+
+    fn default_state(settings: &Settings) -> PersistedHarnessState {
+        let ws_path = if settings.workspace.trim().is_empty() {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        } else {
+            settings.workspace.clone()
+        };
+        let ws_name = PathBuf::from(&ws_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "workspace".to_string());
+
+        let ws_id = "ws-default".to_string();
+        let conv_id = Uuid::new_v4().to_string();
+        let now = Utc::now().format("%Y-%m-%d %H:%M").to_string();
+
+        let mut wf1 = WorkflowDef {
+            id: "wf-audit-fix".to_string(),
+            name: "Full Security Audit & Patch".to_string(),
+            title: "Full Security Audit & Patch".to_string(),
+            description: "Scans the workspace for vulnerabilities, synthesizes White Team patches, and runs unit tests.".to_string(),
+            category: "security".to_string(),
+            prompt: "Inspect workspace structure and identify high-risk entrypoints.\nAudit authentication, command execution, and file handling for vulnerabilities.\nApply defensive patches and verify test suite passes.".to_string(),
+            tools: vec!["grep_search".to_string(), "read_file".to_string(), "edit_file".to_string(), "run_command".to_string()],
+            steps: vec![
+                "Inspect workspace structure and identify high-risk entrypoints.".to_string(),
+                "Audit authentication, command execution, and file handling for vulnerabilities.".to_string(),
+                "Apply defensive patches and verify test suite passes.".to_string(),
+            ],
+        };
+        wf1.normalize();
+
+        let mut wf2 = WorkflowDef {
+            id: "wf-test-hardening".to_string(),
+            name: "Test Suite & Build Verification".to_string(),
+            title: "Test Suite & Build Verification".to_string(),
+            description: "Runs compiler checks and unit tests, fixing any regressions automatically.".to_string(),
+            category: "testing".to_string(),
+            prompt: "Run build and test suite across workspace.\nDiagnose any compiler warnings or failing tests and patch them.".to_string(),
+            tools: vec!["run_command".to_string(), "read_file".to_string(), "edit_file".to_string()],
+            steps: vec![
+                "Run build and test suite across workspace.".to_string(),
+                "Diagnose any compiler warnings or failing tests and patch them.".to_string(),
+            ],
+        };
+        wf2.normalize();
+
+        PersistedHarnessState {
+            workspaces: vec![WorkspaceEntry {
+                id: ws_id.clone(),
+                name: ws_name,
+                path: ws_path,
+            }],
+            active_workspace_id: ws_id.clone(),
+            conversations: vec![Conversation {
+                id: conv_id.clone(),
+                title: "Main Engineering Session".to_string(),
+                workspace_id: ws_id,
+                mode: "workspace".to_string(),
+                messages: Vec::new(),
+                created_at: now,
+                total_tokens: 0,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                total_cost_usd: 0.0,
+            }],
+            active_conversation_id: conv_id.clone(),
+            subagents: vec![
+                SubagentDef {
+                    id: "sub-architect".to_string(),
+                    name: "Code Architect".to_string(),
+                    role: "Systems & Rust Architecture Specialist".to_string(),
+                    system_prompt: "You are the Unjess Code Architect. Design clean, modular, memory-safe systems and verify module boundaries.".to_string(),
+                    model: "inherit".to_string(),
+                    status: "idle".to_string(),
+                    last_output: String::new(),
+                    output: String::new(),
+                    prompt: String::new(),
+                    result: String::new(),
+                    text: String::new(),
+                    conv_id: conv_id.clone(),
+                    current_task: String::new(),
+                    tools: vec!["read_file".to_string(), "outline_file".to_string(), "repo_map".to_string(), "find_callers".to_string(), "run_skill_plugin".to_string(), "call_mcp_tool".to_string(), "probe_mcp_server".to_string(), "mcp_status".to_string()],
+                    tool_calls: Vec::new(),
+                    diffs: Vec::new(),
+                    logs: Vec::new(),
+                    total_tokens: 0,
+                    total_cost_usd: 0.0,
+                },
+                SubagentDef {
+                    id: "sub-coder".to_string(),
+                    name: "Autonomous Coder".to_string(),
+                    role: "Full-Stack & Native Implementation Engineer".to_string(),
+                    system_prompt: "You are the Unjess Autonomous Coder. Write complete, production-ready code with zero stubs and run verification tests.".to_string(),
+                    model: "inherit".to_string(),
+                    status: "idle".to_string(),
+                    last_output: String::new(),
+                    output: String::new(),
+                    prompt: String::new(),
+                    result: String::new(),
+                    text: String::new(),
+                    conv_id: conv_id.clone(),
+                    current_task: String::new(),
+                    tools: vec!["read_file".to_string(), "write_file".to_string(), "edit_file".to_string(), "multi_edit_file".to_string(), "run_command".to_string(), "run_skill_plugin".to_string(), "call_mcp_tool".to_string(), "probe_mcp_server".to_string(), "mcp_status".to_string()],
+                    tool_calls: Vec::new(),
+                    diffs: Vec::new(),
+                    logs: Vec::new(),
+                    total_tokens: 0,
+                    total_cost_usd: 0.0,
+                },
+                SubagentDef {
+                    id: "sub-security".to_string(),
+                    name: "Security Auditor".to_string(),
+                    role: "Red Team / White Team Vulnerability Researcher".to_string(),
+                    system_prompt: "You are the Unjess Security Auditor. Audit code for injection, secret leaks, path traversal, and unsafe memory patterns.".to_string(),
+                    model: "inherit".to_string(),
+                    status: "idle".to_string(),
+                    last_output: String::new(),
+                    output: String::new(),
+                    prompt: String::new(),
+                    result: String::new(),
+                    text: String::new(),
+                    conv_id: conv_id,
+                    current_task: String::new(),
+                    tools: vec!["grep_search".to_string(), "read_file".to_string(), "outline_file".to_string(), "find_callers".to_string(), "security_scan".to_string(), "run_skill_plugin".to_string(), "call_mcp_tool".to_string()],
+                    tool_calls: Vec::new(),
+                    diffs: Vec::new(),
+                    logs: Vec::new(),
+                    total_tokens: 0,
+                    total_cost_usd: 0.0,
+                },
+            ],
+            workflows: vec![wf1, wf2],
+            agent_mode: "Autonomous".to_string(),
+            caveman_mode: false,
+            ponytail_mode: false,
+        }
+    }
+
+    fn save_state(&self) {
+        let Ok(guard) = self.state.read() else {
+            return;
+        };
+        let path = Self::state_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&*guard) {
+            let tmp_path = path.with_extension("json.tmp");
+            if fs::write(&tmp_path, &json).is_ok() {
+                if fs::rename(&tmp_path, &path).is_err() {
+                    let _ = fs::write(&path, &json);
+                    let _ = fs::remove_file(&tmp_path);
+                }
+            } else {
+                let _ = fs::write(&path, &json);
+            }
+        }
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.settings
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn update_settings(&self, mut s: Settings) {
+        s.sync_provider_with_model();
+        let _ = s.save();
+        if let Ok(mut guard) = self.settings.write() {
+            *guard = s;
+        }
+    }
+
+    /// Updates settings in memory for the current process without overwriting `config.yaml` on disk.
+    pub fn update_settings_in_memory(&self, mut s: Settings) {
+        s.sync_provider_with_model();
+        if let Ok(mut guard) = self.settings.write() {
+            *guard = s;
+        }
+    }
+
+    pub fn active_workspace_path(&self) -> PathBuf {
+        if let Ok(guard) = self.state.read() {
+            if let Some(ws) = guard
+                .workspaces
+                .iter()
+                .find(|w| w.id == guard.active_workspace_id)
+                .or_else(|| guard.workspaces.first())
+            {
+                return PathBuf::from(&ws.path);
+            }
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    pub fn workspaces(&self) -> Vec<WorkspaceEntry> {
+        self.prune_missing_workspaces();
+        self.state
+            .read()
+            .map(|g| g.workspaces.clone())
+            .unwrap_or_default()
+    }
+
+    /// Automatically removes workspace entries whose directories were deleted in File Explorer
+    /// (always keeping at least one fallback workspace).
+    pub fn prune_missing_workspaces(&self) {
+        let mut changed = false;
+        if let Ok(mut g) = self.state.write() {
+            if g.workspaces.len() > 1 {
+                let mut removed_ids = Vec::new();
+                let total = g.workspaces.len();
+                let mut kept = Vec::with_capacity(total);
+                for ws in g.workspaces.drain(..) {
+                    let p = std::path::Path::new(&ws.path);
+                    if ws.path == "." || p.exists() {
+                        kept.push(ws);
+                    } else {
+                        removed_ids.push((ws.id.clone(), ws.path.clone()));
+                        changed = true;
+                    }
+                }
+                if kept.is_empty() {
+                    let fallback_path = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| ".".to_string());
+                    let fallback_name = PathBuf::from(&fallback_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "workspace".to_string());
+                    kept.push(WorkspaceEntry {
+                        id: "ws-default".to_string(),
+                        name: fallback_name,
+                        path: fallback_path,
+                    });
+                }
+                g.workspaces = kept;
+                if !g.workspaces.iter().any(|w| w.id == g.active_workspace_id) {
+                    if let Some(first) = g.workspaces.first() {
+                        g.active_workspace_id = first.id.clone();
+                    }
+                }
+                if !removed_ids.is_empty() {
+                    g.conversations.retain(|c| {
+                        !removed_ids
+                            .iter()
+                            .any(|(rid, _)| c.workspace_id.eq_ignore_ascii_case(rid))
+                    });
+                    if g.conversations.is_empty() {
+                        let active_ws_id = g.active_workspace_id.clone();
+                        let new_cid = Uuid::new_v4().to_string();
+                        g.conversations.push(Conversation {
+                            id: new_cid.clone(),
+                            title: "Main Engineering Session".to_string(),
+                            workspace_id: active_ws_id,
+                            mode: "workspace".to_string(),
+                            messages: Vec::new(),
+                            created_at: Utc::now().format("%Y-%m-%d %H:%M").to_string(),
+                            total_tokens: 0,
+                            total_input_tokens: 0,
+                            total_output_tokens: 0,
+                            total_cost_usd: 0.0,
+                        });
+                        g.active_conversation_id = new_cid;
+                    } else if !g
+                        .conversations
+                        .iter()
+                        .any(|c| c.id == g.active_conversation_id)
+                    {
+                        if let Some(first_c) = g.conversations.first() {
+                            g.active_conversation_id = first_c.id.clone();
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            self.save_state();
+        }
+    }
+
+    /// Removes a workspace by `id`, `path`, or `name` from the harness state and cleans up its conversations.
+    pub fn remove_workspace(&self, target: &str) -> bool {
+        let clean = target.trim();
+        if clean.is_empty() {
+            return false;
+        }
+        let norm_target = clean.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        let mut removed_ids = Vec::new();
+        if let Ok(mut g) = self.state.write() {
+            let before = g.workspaces.len();
+            g.workspaces.retain(|w| {
+                let norm_path = w
+                    .path
+                    .replace('/', "\\")
+                    .trim_end_matches('\\')
+                    .to_lowercase();
+                let matched = w.id.eq_ignore_ascii_case(clean)
+                    || norm_path == norm_target
+                    || w.name.eq_ignore_ascii_case(clean);
+                if matched {
+                    removed_ids.push(w.id.clone());
+                }
+                !matched
+            });
+            if g.workspaces.len() == before && removed_ids.is_empty() {
+                return false;
+            }
+            if g.workspaces.is_empty() {
+                let fallback_path = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string());
+                let fallback_name = PathBuf::from(&fallback_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "workspace".to_string());
+                g.workspaces.push(WorkspaceEntry {
+                    id: "ws-default".to_string(),
+                    name: fallback_name,
+                    path: fallback_path,
+                });
+            }
+            if !g.workspaces.iter().any(|w| w.id == g.active_workspace_id) {
+                if let Some(first) = g.workspaces.first() {
+                    g.active_workspace_id = first.id.clone();
+                }
+            }
+            g.conversations
+                .retain(|c| !removed_ids.iter().any(|rid| c.workspace_id == *rid));
+            if g.conversations.is_empty() {
+                let active_ws_id = g.active_workspace_id.clone();
+                let new_cid = Uuid::new_v4().to_string();
+                g.conversations.push(Conversation {
+                    id: new_cid.clone(),
+                    title: "Main Engineering Session".to_string(),
+                    workspace_id: active_ws_id,
+                    mode: "workspace".to_string(),
+                    messages: Vec::new(),
+                    created_at: Utc::now().format("%Y-%m-%d %H:%M").to_string(),
+                    total_tokens: 0,
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
+                    total_cost_usd: 0.0,
+                });
+                g.active_conversation_id = new_cid;
+            } else if !g
+                .conversations
+                .iter()
+                .any(|c| c.id == g.active_conversation_id)
+            {
+                if let Some(first_c) = g.conversations.first() {
+                    g.active_conversation_id = first_c.id.clone();
+                }
+            }
+        }
+        self.save_state();
+        true
+    }
+
+    pub fn active_workspace_id(&self) -> String {
+        self.state
+            .read()
+            .map(|g| g.active_workspace_id.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_active_workspace(&self, id: &str) {
+        if let Ok(mut g) = self.state.write() {
+            if let Some(ws) = g.workspaces.iter().find(|w| w.id == id).cloned() {
+                g.active_workspace_id = ws.id;
+                if let Ok(mut s) = self.settings.write() {
+                    s.workspace = ws.path;
+                    let _ = s.save();
+                }
+            }
+        }
+        self.save_state();
+    }
+
+    pub fn rename_workspace(&self, id: &str, new_name: &str) {
+        let clean = new_name.trim();
+        if clean.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.state.write() {
+            if let Some(ws) = g.workspaces.iter_mut().find(|w| w.id == id) {
+                ws.name = clean.to_string();
+            }
+        }
+        self.save_state();
+    }
+
+    pub fn add_workspace(&self, path: &str) -> String {
+        let clean_path = path.trim().to_string();
+        let name = PathBuf::from(&clean_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| clean_path.clone());
+        let id = format!("ws-{}", &Uuid::new_v4().to_string()[..8]);
+
+        if let Ok(mut g) = self.state.write() {
+            if let Some(existing) = g.workspaces.iter().find(|w| w.path == clean_path) {
+                let existing_id = existing.id.clone();
+                g.active_workspace_id = existing_id.clone();
+                drop(g);
+                self.save_state();
+                return existing_id;
+            }
+            g.workspaces.push(WorkspaceEntry {
+                id: id.clone(),
+                name,
+                path: clean_path.clone(),
+            });
+            g.active_workspace_id = id.clone();
+        }
+        if let Ok(mut s) = self.settings.write() {
+            s.workspace = clean_path;
+            let _ = s.save();
+        }
+        self.save_state();
+        id
+    }
+
+    pub fn conversations(&self) -> Vec<Conversation> {
+        self.state
+            .read()
+            .map(|g| g.conversations.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn active_conversation_id(&self) -> String {
+        self.state
+            .read()
+            .map(|g| g.active_conversation_id.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn active_conversation(&self) -> Conversation {
+        if let Ok(g) = self.state.read() {
+            if let Some(c) = g
+                .conversations
+                .iter()
+                .find(|c| c.id == g.active_conversation_id)
+                .or_else(|| g.conversations.first())
+            {
+                return c.clone();
+            }
+        }
+        Conversation {
+            id: "default".to_string(),
+            title: "New Chat".to_string(),
+            workspace_id: "ws-default".to_string(),
+            mode: "workspace".to_string(),
+            messages: Vec::new(),
+            created_at: Utc::now().format("%Y-%m-%d %H:%M").to_string(),
+            total_tokens: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_usd: 0.0,
+        }
+    }
+
+    pub fn conversation_by_id(&self, conv_id: &str) -> Conversation {
+        if !conv_id.trim().is_empty() {
+            if let Ok(g) = self.state.read() {
+                if let Some(c) = g.conversations.iter().find(|c| c.id == conv_id) {
+                    return c.clone();
+                }
+            }
+        }
+        self.active_conversation()
+    }
+
+    pub fn set_active_conversation(&self, id: &str) {
+        if let Ok(mut g) = self.state.write() {
+            if g.conversations.iter().any(|c| c.id == id) {
+                g.active_conversation_id = id.to_string();
+            }
+        }
+        self.save_state();
+    }
+
+    pub fn new_conversation(&self, title: Option<&str>) -> String {
+        self.new_conversation_with_mode(title, None)
+    }
+
+    pub fn new_conversation_with_mode(&self, title: Option<&str>, mode: Option<&str>) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().format("%Y-%m-%d %H:%M").to_string();
+        let conv_mode = mode
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or("workspace")
+            .to_string();
+        if let Ok(mut g) = self.state.write() {
+            let ws_id = g.active_workspace_id.clone();
+            let chat_title = title
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| t.trim().to_string())
+                .unwrap_or_else(|| {
+                    if conv_mode == "quick" {
+                        "Quick Chat".to_string()
+                    } else {
+                        format!("Session {}", g.conversations.len() + 1)
+                    }
+                });
+            g.conversations.insert(
+                0,
+                Conversation {
+                    id: id.clone(),
+                    title: chat_title,
+                    workspace_id: ws_id,
+                    mode: conv_mode,
+                    messages: Vec::new(),
+                    created_at: now,
+                    total_tokens: 0,
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
+                    total_cost_usd: 0.0,
+                },
+            );
+            g.active_conversation_id = id.clone();
+        }
+        self.save_state();
+        id
+    }
+
+    pub fn rename_conversation(&self, id: &str, new_title: &str) {
+        if new_title.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.state.write() {
+            if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == id) {
+                conv.title = new_title.trim().to_string();
+            }
+        }
+        self.save_state();
+    }
+
+    pub fn delete_conversation(&self, id: &str) {
+        if let Ok(mut g) = self.state.write() {
+            g.conversations.retain(|c| c.id != id);
+            if g.conversations.is_empty() {
+                let new_id = Uuid::new_v4().to_string();
+                let ws_id = g.active_workspace_id.clone();
+                g.conversations.push(Conversation {
+                    id: new_id.clone(),
+                    title: "Main Engineering Session".to_string(),
+                    workspace_id: ws_id,
+                    mode: "workspace".to_string(),
+                    messages: Vec::new(),
+                    created_at: Utc::now().format("%Y-%m-%d %H:%M").to_string(),
+                    total_tokens: 0,
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
+                    total_cost_usd: 0.0,
+                });
+                g.active_conversation_id = new_id;
+            } else if g.active_conversation_id == id {
+                g.active_conversation_id = g.conversations[0].id.clone();
+            }
+        }
+        self.save_state();
+    }
+
+    pub fn clear_active_conversation(&self) {
+        if let Ok(mut g) = self.state.write() {
+            let active_id = g.active_conversation_id.clone();
+            if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == active_id) {
+                conv.messages.clear();
+                conv.total_tokens = 0;
+                conv.total_input_tokens = 0;
+                conv.total_output_tokens = 0;
+                conv.total_cost_usd = 0.0;
+            }
+        }
+        self.save_state();
+    }
+
+    /// Deterministically summarizes older messages into a structured digest preserving
+    /// user requests, modified files, tool invocations, and key assistant conclusions.
+    pub fn compact_messages(messages: &[ChatMessage], keep_recent: usize) -> Vec<ChatMessage> {
+        if messages.len() <= keep_recent {
+            return messages.to_vec();
+        }
+        let split_at = messages.len().saturating_sub(keep_recent);
+        let head = &messages[..split_at];
+        let tail = &messages[split_at..];
+
+        let mut digest_lines = Vec::new();
+        let mut touched_files = Vec::new();
+        let mut head_tokens = 0usize;
+        let mut head_in_tokens = 0usize;
+        let mut head_out_tokens = 0usize;
+        let mut head_cost_usd = 0.0f64;
+
+        for m in head {
+            head_tokens += m.tokens;
+            head_in_tokens += m.input_tokens;
+            head_out_tokens += m.output_tokens;
+            head_cost_usd += m.cost_usd;
+            for d in &m.diffs {
+                if !touched_files.contains(&d.path) {
+                    touched_files.push(d.path.clone());
+                }
+            }
+            let snippet: String = m
+                .content
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(140)
+                .collect();
+            if m.role == "user" || m.role == "assistant" {
+                let tools_note = if m.tool_calls.is_empty() {
+                    String::new()
+                } else {
+                    let names: Vec<String> = m.tool_calls.iter().map(|t| t.name.clone()).collect();
+                    format!(" [tools: {}]", names.join(", "))
+                };
+                digest_lines.push(format!("- [{}]{}: {}", m.role, tools_note, snippet));
+            }
+        }
+
+        let mut summary_text = format!(
+            "[Context Compacted — Summarized {} earlier messages]:\n{}",
+            head.len(),
+            digest_lines
+                .into_iter()
+                .take(25)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        if !touched_files.is_empty() {
+            summary_text.push_str(&format!(
+                "\nFiles modified in earlier turns: {}",
+                touched_files.join(", ")
+            ));
+        }
+
+        let tok_est = (summary_text.len() / 4).max(16);
+        let head_model = head.iter().rev().find_map(|m| m.model.clone());
+        let mut new_msgs = vec![ChatMessage {
+            role: "system".to_string(),
+            content: summary_text,
+            thinking: None,
+            tool_calls: Vec::new(),
+            diffs: Vec::new(),
+            timestamp: Utc::now().format("%H:%M:%S").to_string(),
+            model: head_model,
+            tokens: head_tokens.max(tok_est),
+            input_tokens: head_in_tokens.max(tok_est),
+            output_tokens: head_out_tokens,
+            cost_usd: head_cost_usd,
+        }];
+        new_msgs.extend_from_slice(tail);
+        new_msgs
+    }
+
+    pub fn compact_active_conversation(&self) {
+        if let Ok(mut g) = self.state.write() {
+            let active_id = g.active_conversation_id.clone();
+            if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == active_id) {
+                if conv.messages.len() > 3 {
+                    conv.messages = Self::compact_messages(&conv.messages, 3);
+                }
+            }
+        }
+        self.save_state();
+    }
+
+    pub fn subagents(&self) -> Vec<SubagentDef> {
+        self.state
+            .read()
+            .map(|g| g.subagents.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn add_subagent(&self, name: &str, role: &str, system_prompt: &str, model: &str) {
+        let _ = self.upsert_subagent(None, name, role, system_prompt, model, Vec::new());
+    }
+
+    pub fn upsert_subagent(
+        &self,
+        id_opt: Option<&str>,
+        name: &str,
+        role: &str,
+        system_prompt: &str,
+        model: &str,
+        tools: Vec<String>,
+    ) -> Option<SubagentDef> {
+        if name.trim().is_empty() {
+            return None;
+        }
+        let clean_model = if model.trim().is_empty() {
+            "inherit".to_string()
+        } else {
+            model.trim().to_string()
+        };
+        let mut result_sub = None;
+        if let Ok(mut g) = self.state.write() {
+            let active_cid = g.active_conversation_id.clone();
+            if let Some(target_id) = id_opt.filter(|s| !s.trim().is_empty()) {
+                if let Some(existing) = g.subagents.iter_mut().find(|s| s.id == target_id) {
+                    existing.name = name.trim().to_string();
+                    existing.role = role.trim().to_string();
+                    existing.system_prompt = system_prompt.trim().to_string();
+                    existing.model = clean_model.clone();
+                    if !tools.is_empty() {
+                        existing.tools = tools.clone();
+                    }
+                    result_sub = Some(existing.clone());
+                }
+            }
+            if result_sub.is_none() {
+                let id = id_opt
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| format!("sub-{}", &Uuid::new_v4().to_string()[..8]));
+                let sub = SubagentDef {
+                    id,
+                    name: name.trim().to_string(),
+                    role: role.trim().to_string(),
+                    system_prompt: system_prompt.trim().to_string(),
+                    model: clean_model,
+                    status: "idle".to_string(),
+                    last_output: String::new(),
+                    output: String::new(),
+                    prompt: String::new(),
+                    result: String::new(),
+                    text: String::new(),
+                    conv_id: active_cid,
+                    current_task: String::new(),
+                    tools,
+                    tool_calls: Vec::new(),
+                    diffs: Vec::new(),
+                    logs: Vec::new(),
+                    total_tokens: 0,
+                    total_cost_usd: 0.0,
+                };
+                g.subagents.push(sub.clone());
+                result_sub = Some(sub);
+            }
+        }
+        self.save_state();
+        result_sub
+    }
+
+    pub fn abort_subagent(&self, subagent_id: &str) {
+        if let Ok(mut g) = self.state.write() {
+            if let Some(sub) = g
+                .subagents
+                .iter_mut()
+                .find(|s| s.id == subagent_id || s.name.eq_ignore_ascii_case(subagent_id))
+            {
+                sub.status = "aborted".to_string();
+                sub.last_output = "Subagent aborted by user.".to_string();
+                sub.output = sub.last_output.clone();
+                sub.result = sub.last_output.clone();
+                sub.text = sub.last_output.clone();
+                sub.logs.push(SubagentLogEntry {
+                    time: Utc::now().format("%H:%M:%S").to_string(),
+                    event: "Aborted by user".to_string(),
+                });
+            }
+        }
+        self.save_state();
+    }
+
+    /// Executes a multi-turn tool-enabled subagent task and returns its final output string.
+    pub async fn execute_subagent_task(&self, subagent_id: &str, task: &str) -> Result<String, String> {
+        self.execute_subagent_task_detailed(subagent_id, task, None)
+            .await
+            .map(|r| r.output)
+    }
+
+    /// Executes a multi-turn tool-enabled subagent task with full abort, budget, fallback,
+    /// stuck-loop protection, tool-allowlist enforcement, and diff/token/cost rollup.
+    pub async fn execute_subagent_task_detailed(
+        &self,
+        subagent_id: &str,
+        task: &str,
+        parent_conv_id: Option<&str>,
+    ) -> Result<SubagentTurnResult, String> {
+        let mut settings = self.settings();
+        let ws_path = self.active_workspace_path();
+        let workspace = Workspace::new(&ws_path).map_err(|e| e.to_string())?;
+        let mut tool_engine =
+            ToolEngine::new(workspace).with_abort_flag(Arc::clone(&self.abort_flag));
+
+        let mut resolved_id = if subagent_id.trim().is_empty() {
+            "sub-coder".to_string()
+        } else {
+            subagent_id.trim().to_string()
+        };
+        let mut allowed_tools: Vec<String> = Vec::new();
+        let mut sys_prompt = format!(
+            "You are a specialized Unjess autonomous subagent operating in workspace {}. Use tools to inspect and complete your assigned task.",
+            ws_path.display()
+        );
+
+        let target_conv_id = parent_conv_id
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.active_conversation_id());
+
+        if let Ok(mut g) = self.state.write() {
+            if !g.subagents.iter().any(|s| {
+                s.id.eq_ignore_ascii_case(&resolved_id) || s.name.eq_ignore_ascii_case(&resolved_id)
+            }) {
+                g.subagents.push(SubagentDef {
+                    id: resolved_id.clone(),
+                    name: resolved_id.clone(),
+                    role: "Dynamic Autonomous Subagent".to_string(),
+                    system_prompt: sys_prompt.clone(),
+                    model: "inherit".to_string(),
+                    status: "idle".to_string(),
+                    last_output: String::new(),
+                    output: String::new(),
+                    prompt: String::new(),
+                    result: String::new(),
+                    text: String::new(),
+                    conv_id: target_conv_id.clone(),
+                    current_task: String::new(),
+                    tools: Vec::new(),
+                    tool_calls: Vec::new(),
+                    diffs: Vec::new(),
+                    logs: Vec::new(),
+                    total_tokens: 0,
+                    total_cost_usd: 0.0,
+                });
+            }
+            if let Some(sub) = g.subagents.iter_mut().find(|s| {
+                s.id.eq_ignore_ascii_case(&resolved_id) || s.name.eq_ignore_ascii_case(&resolved_id)
+            }) {
+                resolved_id = sub.id.clone();
+                allowed_tools = sub.tools.clone();
+                sub.status = "running".to_string();
+                sub.conv_id = target_conv_id.clone();
+                sub.current_task = task.to_string();
+                sub.prompt = task.to_string();
+                sub.last_output = format!("Executing task: {}...", task);
+                sub.output = sub.last_output.clone();
+                sub.logs.push(SubagentLogEntry {
+                    time: Utc::now().format("%H:%M:%S").to_string(),
+                    event: format!("Started task: {}", task),
+                });
+                sys_prompt = format!(
+                    "{}\nRole: {}\nWorkspace: {}\nAllowed Tools: {}",
+                    sub.system_prompt,
+                    sub.role,
+                    ws_path.display(),
+                    if sub.tools.is_empty() {
+                        "all".to_string()
+                    } else {
+                        sub.tools.join(", ")
+                    }
+                );
+                if sub.model != "inherit" && !sub.model.is_empty() {
+                    settings.model = sub.model.clone();
+                } else if settings.subagent_model != "inherit" && !settings.subagent_model.is_empty()
+                {
+                    settings.model = settings.subagent_model.clone();
+                }
+            }
+        }
+        self.save_state();
+
+        let max_turns = settings.subagent_max_turns.clamp(1, 100);
+        let inflight_parent_cost = {
+            let ls = self.live_turn_snapshot();
+            if ls.running && ls.conv_id == target_conv_id {
+                ls.cost_usd
+            } else {
+                0.0
+            }
+        };
+        let initial_session_cost =
+            self.conversation_by_id(&target_conv_id).total_cost_usd + inflight_parent_cost;
+        let mut history = vec![ChatMessage {
+            role: "user".to_string(),
+            content: task.to_string(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            diffs: Vec::new(),
+            timestamp: Utc::now().format("%H:%M:%S").to_string(),
+            model: None,
+            tokens: task.len() / 4,
+            input_tokens: task.len() / 4,
+            output_tokens: 0,
+            cost_usd: 0.0,
+        }];
+
+        let mut final_output = String::new();
+        let mut status = "completed".to_string();
+        let mut sub_diffs = Vec::new();
+        let mut sub_tools = Vec::new();
+        let mut sub_tokens = 0usize;
+        let mut sub_in_tokens = 0usize;
+        let mut sub_out_tokens = 0usize;
+        let mut sub_cost = 0.0f64;
+        let mut recent_sigs: Vec<String> = Vec::new();
+
+        for turn in 1..=max_turns {
+            if self.abort_flag.load(Ordering::SeqCst) {
+                status = "aborted".to_string();
+                final_output = "Subagent aborted.".to_string();
+                break;
+            }
+            if let Ok(g) = self.state.read() {
+                if g.subagents
+                    .iter()
+                    .any(|s| s.id == resolved_id && s.status == "aborted")
+                {
+                    status = "aborted".to_string();
+                    final_output = "Subagent aborted by user.".to_string();
+                    break;
+                }
+            }
+            if settings.max_cost_per_session > 0.0
+                && (initial_session_cost + sub_cost) >= settings.max_cost_per_session
+            {
+                final_output = format!(
+                    "Subagent stopped: session budget limit (${:.4}) reached.",
+                    settings.max_cost_per_session
+                );
+                break;
+            }
+
+            let mut llm_res = complete_llm_turn(&settings, &sys_prompt, &history, true).await;
+            if llm_res.is_err() && !settings.fallback_models.is_empty() {
+                for fb_model in settings.fallback_models.clone() {
+                    if fb_model.trim().is_empty() || fb_model == settings.model {
+                        continue;
+                    }
+                    let mut fb_settings = settings.clone();
+                    fb_settings.model = fb_model.trim().to_string();
+                    if let Ok(ok_resp) =
+                        complete_llm_turn(&fb_settings, &sys_prompt, &history, true).await
+                    {
+                        settings.model = fb_settings.model;
+                        llm_res = Ok(ok_resp);
+                        break;
+                    }
+                }
+            }
+
+            match llm_res {
+                Ok(resp) => {
+                    sub_tokens += resp.tokens;
+                    sub_in_tokens += resp.input_tokens;
+                    sub_out_tokens += resp.output_tokens;
+                    sub_cost += resp.cost_usd;
+
+                    if !resp.content.is_empty() {
+                        final_output = resp.content.clone();
+                    }
+                    if resp.pending_tool_calls.is_empty() {
+                        break;
+                    }
+                    let mut tool_outputs = Vec::new();
+                    let mut stuck = false;
+                    for (tc_id, tc_name, tc_args) in resp.pending_tool_calls {
+                        if self.abort_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if tc_name == "delegate_subagent" || tc_name == "delegate_parallel_subagents" {
+                            tool_outputs.push(
+                                "[Tool `delegate_subagent` result]: Recursive subagent delegation is disabled inside subagents.".to_string(),
+                            );
+                            continue;
+                        }
+                        if !allowed_tools.is_empty()
+                            && !allowed_tools.iter().any(|t| {
+                                t.eq_ignore_ascii_case(&tc_name)
+                                    || (t.eq_ignore_ascii_case("call_mcp_tool")
+                                        && tc_name.starts_with("mcp__"))
+                            })
+                        {
+                            let blocked_msg = format!(
+                                "[Tool `{}` blocked]: Subagent `{}` is restricted to tools: {}",
+                                tc_name,
+                                resolved_id,
+                                allowed_tools.join(", ")
+                            );
+                            sub_tools.push(ToolCallRecord {
+                                id: tc_id,
+                                name: tc_name,
+                                arguments: tc_args,
+                                result: blocked_msg.clone(),
+                                status: "error".to_string(),
+                                duration_ms: 0,
+                            });
+                            tool_outputs.push(blocked_msg);
+                            continue;
+                        }
+                        let sig = format!("{}:{}", tc_name, tc_args);
+                        recent_sigs.push(sig.clone());
+                        let slen = recent_sigs.len();
+                        if slen >= 3
+                            && recent_sigs[slen - 1] == sig
+                            && recent_sigs[slen - 2] == sig
+                            && recent_sigs[slen - 3] == sig
+                        {
+                            stuck = true;
+                            break;
+                        }
+
+                        if let Ok(mut g) = self.state.write() {
+                            if let Some(sub) =
+                                g.subagents.iter_mut().find(|s| s.id == resolved_id)
+                            {
+                                sub.logs.push(SubagentLogEntry {
+                                    time: Utc::now().format("%H:%M:%S").to_string(),
+                                    event: format!("Turn {}: running `{}`", turn, tc_name),
+                                });
+                            }
+                        }
+
+                        let started = Instant::now();
+                        let (res_str, is_ok, diff_opt) =
+                            tool_engine.execute_tool(&tc_name, &tc_args);
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        let clipped = ToolEngine::truncate_head_tail(&res_str, 10000);
+                        if let Some(d) = diff_opt {
+                            sub_diffs.push(d);
+                        }
+                        sub_tools.push(ToolCallRecord {
+                            id: tc_id,
+                            name: tc_name.clone(),
+                            arguments: tc_args,
+                            result: clipped.clone(),
+                            status: if is_ok {
+                                "ok".to_string()
+                            } else {
+                                "error".to_string()
+                            },
+                            duration_ms,
+                        });
+                        tool_outputs.push(format!("[Tool `{}` result]:\n{}", tc_name, clipped));
+                    }
+                    history.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: if final_output.is_empty() {
+                            "Executing subagent tools...".to_string()
+                        } else {
+                            final_output.clone()
+                        },
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        diffs: Vec::new(),
+                        timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                        model: Some(settings.model.clone()),
+                        tokens: resp.tokens,
+                        input_tokens: resp.input_tokens,
+                        output_tokens: resp.output_tokens,
+                        cost_usd: resp.cost_usd,
+                    });
+                    history.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: tool_outputs.join("\n\n"),
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        diffs: Vec::new(),
+                        timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                        model: None,
+                        tokens: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                    });
+                    if stuck {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    status = "error".to_string();
+                    final_output = format!("Subagent error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        if let Ok(mut g) = self.state.write() {
+            if let Some(sub) = g.subagents.iter_mut().find(|s| s.id == resolved_id) {
+                sub.status = status.clone();
+                sub.prompt = task.to_string();
+                sub.last_output = final_output.clone();
+                sub.output = final_output.clone();
+                sub.result = final_output.clone();
+                sub.text = final_output.clone();
+                sub.tool_calls = sub_tools.clone();
+                sub.diffs = sub_diffs.clone();
+                sub.total_tokens += sub_tokens;
+                sub.total_cost_usd += sub_cost;
+                sub.logs.push(SubagentLogEntry {
+                    time: Utc::now().format("%H:%M:%S").to_string(),
+                    event: format!(
+                        "Finished ({}) — {} tokens, ${:.4}",
+                        status, sub_tokens, sub_cost
+                    ),
+                });
+            }
+        }
+        self.save_state();
+
+        let result = SubagentTurnResult {
+            output: final_output.clone(),
+            diffs: sub_diffs,
+            tool_calls: sub_tools,
+            tokens: sub_tokens,
+            input_tokens: sub_in_tokens,
+            output_tokens: sub_out_tokens,
+            cost_usd: sub_cost,
+        };
+
+        if status == "error" {
+            Err(final_output)
+        } else {
+            Ok(result)
+        }
+    }
+
+    pub fn spawn_subagent_task(self: &Arc<Self>, subagent_id: &str, task: &str) {
+        self.spawn_subagent_task_with_conv(subagent_id, task, None);
+    }
+
+    pub fn spawn_subagent_task_with_conv(
+        self: &Arc<Self>,
+        subagent_id: &str,
+        task: &str,
+        conv_id: Option<&str>,
+    ) {
+        let sub_id = subagent_id.to_string();
+        let task_str = task.to_string();
+        let cid = conv_id
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.active_conversation_id());
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Ok(res) = mgr
+                .execute_subagent_task_detailed(&sub_id, &task_str, Some(&cid))
+                .await
+            {
+                let active_model = mgr.settings().model;
+                if let Ok(mut g) = mgr.state.write() {
+                    if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == cid) {
+                        conv.total_tokens += res.tokens;
+                        conv.total_input_tokens += res.input_tokens;
+                        conv.total_output_tokens += res.output_tokens;
+                        conv.total_cost_usd += res.cost_usd;
+                        if !res.diffs.is_empty() || !res.tool_calls.is_empty() || !res.output.is_empty() {
+                            conv.messages.push(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: format!(
+                                    "**[Subagent `{}` Completed]**:\n{}",
+                                    sub_id, res.output
+                                ),
+                                thinking: None,
+                                tool_calls: res.tool_calls,
+                                diffs: res.diffs,
+                                timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                model: Some(active_model),
+                                tokens: res.tokens,
+                                input_tokens: res.input_tokens,
+                                output_tokens: res.output_tokens,
+                                cost_usd: res.cost_usd,
+                            });
+                        }
+                    }
+                }
+                mgr.save_state();
+            }
+        });
+    }
+
+    pub fn workflows(&self) -> Vec<WorkflowDef> {
+        self.state
+            .read()
+            .map(|g| g.workflows.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn add_workflow(&self, name: &str, desc: &str, steps: Vec<String>) {
+        self.save_workflow(WorkflowDef {
+            id: String::new(),
+            name: name.trim().to_string(),
+            title: name.trim().to_string(),
+            description: desc.trim().to_string(),
+            category: "general".to_string(),
+            prompt: steps.join("\n"),
+            tools: Vec::new(),
+            steps,
+        });
+    }
+
+    pub fn save_workflow(&self, mut wf: WorkflowDef) {
+        wf.normalize();
+        if wf.name.trim().is_empty() {
+            return;
+        }
+        if wf.id.trim().is_empty() {
+            wf.id = format!("wf-{}", &Uuid::new_v4().to_string()[..8]);
+        }
+        if let Ok(mut g) = self.state.write() {
+            if let Some(existing) = g.workflows.iter_mut().find(|w| w.id == wf.id) {
+                *existing = wf;
+            } else {
+                g.workflows.push(wf);
+            }
+        }
+        self.save_state();
+    }
+
+    pub fn delete_workflow(&self, id: &str) {
+        if let Ok(mut g) = self.state.write() {
+            g.workflows.retain(|w| w.id != id);
+        }
+        self.save_state();
+    }
+
+    pub fn delete_subagent(&self, id: &str) {
+        if let Ok(mut g) = self.state.write() {
+            g.subagents.retain(|s| s.id != id);
+        }
+        self.save_state();
+    }
+
+    pub fn undo_last_turn(&self, conv_id: &str) -> (Vec<String>, Vec<String>) {
+        let mut restored = Vec::new();
+        let mut deleted = Vec::new();
+        let ws_root = self.active_workspace_path();
+
+        if let Ok(mut g) = self.state.write() {
+            let target_id = if conv_id.is_empty() {
+                g.active_conversation_id.clone()
+            } else {
+                conv_id.to_string()
+            };
+            if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == target_id) {
+                if let Some(last_assistant_idx) =
+                    conv.messages.iter().rposition(|m| m.role != "user")
+                {
+                    let diffs = conv.messages[last_assistant_idx].diffs.clone();
+                    for d in diffs.iter().rev() {
+                        if ToolEngine::revert_diff(&ws_root, d).is_ok() {
+                            if d.status == "created" {
+                                deleted.push(d.path.clone());
+                            } else {
+                                restored.push(d.path.clone());
+                            }
+                        }
+                    }
+                    let cut_from = if last_assistant_idx > 0
+                        && conv.messages[last_assistant_idx - 1].role == "user"
+                    {
+                        last_assistant_idx - 1
+                    } else {
+                        last_assistant_idx
+                    };
+                    for removed in &conv.messages[cut_from..] {
+                        conv.total_tokens = conv.total_tokens.saturating_sub(removed.tokens);
+                        conv.total_input_tokens =
+                            conv.total_input_tokens.saturating_sub(removed.input_tokens);
+                        conv.total_output_tokens = conv
+                            .total_output_tokens
+                            .saturating_sub(removed.output_tokens);
+                        conv.total_cost_usd = (conv.total_cost_usd - removed.cost_usd).max(0.0);
+                    }
+                    conv.messages.truncate(cut_from);
+                }
+            }
+        }
+        self.save_state();
+        (restored, deleted)
+    }
+
+    /// Removes the most recent `FileDiff` matching `file_path` from the specified conversation after a revert.
+    pub fn remove_diff_from_conversation(&self, conv_id: &str, file_path: &str) {
+        let norm_target = file_path.replace('\\', "/");
+        if let Ok(mut g) = self.state.write() {
+            let target_id = if conv_id.trim().is_empty() {
+                g.active_conversation_id.clone()
+            } else {
+                conv_id.to_string()
+            };
+            if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == target_id) {
+                for msg in conv.messages.iter_mut().rev() {
+                    if let Some(pos) = msg
+                        .diffs
+                        .iter()
+                        .rposition(|d| d.path.replace('\\', "/") == norm_target)
+                    {
+                        msg.diffs.remove(pos);
+                        break;
+                    }
+                }
+            }
+        }
+        self.save_state();
+    }
+
+    pub fn agent_mode(&self) -> String {
+        self.state
+            .read()
+            .map(|g| g.agent_mode.clone())
+            .unwrap_or_else(|_| "Autonomous".to_string())
+    }
+
+    pub fn set_agent_mode(&self, mode: &str) {
+        let normalized = match mode.trim().to_lowercase().as_str() {
+            "plan" => "Plan",
+            "supervised" => "Supervised",
+            "duel" => "Duel",
+            _ => "Autonomous",
+        };
+        if let Ok(mut g) = self.state.write() {
+            g.agent_mode = normalized.to_string();
+        }
+        self.save_state();
+    }
+
+    pub fn caveman_mode(&self) -> bool {
+        self.state.read().map(|g| g.caveman_mode).unwrap_or(false)
+    }
+
+    pub fn set_caveman_mode(&self, v: bool) {
+        if let Ok(mut g) = self.state.write() {
+            g.caveman_mode = v;
+        }
+        self.save_state();
+    }
+
+    pub fn ponytail_mode(&self) -> bool {
+        self.state.read().map(|g| g.ponytail_mode).unwrap_or(false)
+    }
+
+    pub fn set_ponytail_mode(&self, v: bool) {
+        if let Ok(mut g) = self.state.write() {
+            g.ponytail_mode = v;
+        }
+        self.save_state();
+    }
+
+    pub fn live_turn_snapshot(&self) -> LiveTurnSnapshot {
+        self.live_turn
+            .read()
+            .map(|l| {
+                let mut snap = l.clone();
+                if snap.running && snap.started_at > 0.0 {
+                    snap.elapsed_s = (Self::now_epoch_secs() - snap.started_at).max(0.0);
+                }
+                snap
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn abort_turn(&self) {
+        self.abort_flag.store(true, Ordering::SeqCst);
+        if let Ok(mut live) = self.live_turn.write() {
+            live.running = false;
+            live.current_step = "Aborted by user".to_string();
+        }
+    }
+
+    pub fn revert_diff(&self, diff: &FileDiff) -> Result<(), String> {
+        let ws_root = self.active_workspace_path();
+        ToolEngine::revert_diff(&ws_root, diff)
+    }
+
+    /// Handles built-in slash commands (`/clear`, `/compact`, `/undo`, `/caveman`, `/ponytail`,
+    /// `/plan`, `/duel`, `/supervised`, `/auto`, `/goal`, `/help`) directly if matched.
+    /// Returns `Some(rewritten_prompt)` if the prompt should still proceed to the LLM (e.g., `/goal <task>`),
+    /// or `None` if the slash command was handled instantaneously.
+    fn try_handle_slash_command(&self, conv_id: &str, raw_prompt: &str) -> Option<String> {
+        let trimmed = raw_prompt.trim();
+        if !trimmed.starts_with('/') {
+            return Some(trimmed.to_string());
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("").to_lowercase();
+        let arg = parts.next().unwrap_or("").trim();
+
+        let append_instant_reply = |user_txt: &str, reply_txt: String| {
+            let now_ts = Utc::now().format("%H:%M:%S").to_string();
+            if let Ok(mut g) = self.state.write() {
+                if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == conv_id) {
+                    conv.messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: user_txt.to_string(),
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        diffs: Vec::new(),
+                        timestamp: now_ts.clone(),
+                        model: None,
+                        tokens: user_txt.len() / 4,
+                        input_tokens: user_txt.len() / 4,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                    });
+                    conv.messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: reply_txt,
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        diffs: Vec::new(),
+                        timestamp: now_ts,
+                        model: Some(self.settings().model),
+                        tokens: 16,
+                        input_tokens: 0,
+                        output_tokens: 16,
+                        cost_usd: 0.0,
+                    });
+                }
+            }
+            self.save_state();
+        };
+
+        match cmd.as_str() {
+            "/clear" => {
+                self.clear_active_conversation();
+                None
+            }
+            "/compact" => {
+                self.compact_active_conversation();
+                append_instant_reply(
+                    trimmed,
+                    "**Context Compacted**: Summarized earlier messages into a structured digest to free context window tokens.".to_string(),
+                );
+                None
+            }
+            "/undo" => {
+                let (restored, deleted) = self.undo_last_turn(conv_id);
+                append_instant_reply(
+                    trimmed,
+                    format!(
+                        "**Reverted Last Turn**: Restored {} file(s), removed {} newly created file(s).",
+                        restored.len(),
+                        deleted.len()
+                    ),
+                );
+                None
+            }
+            "/caveman" => {
+                match arg.to_lowercase().as_str() {
+                    "" => {
+                        let next = !self.caveman_mode();
+                        self.set_caveman_mode(next);
+                        append_instant_reply(
+                            trimmed,
+                            format!(
+                                "**Caveman Mode {}**.",
+                                if next { "ENABLED" } else { "DISABLED" }
+                            ),
+                        );
+                        None
+                    }
+                    "on" | "true" | "1" => {
+                        self.set_caveman_mode(true);
+                        append_instant_reply(trimmed, "**Caveman Mode ENABLED**.".to_string());
+                        None
+                    }
+                    "off" | "false" | "0" => {
+                        self.set_caveman_mode(false);
+                        append_instant_reply(trimmed, "**Caveman Mode DISABLED**.".to_string());
+                        None
+                    }
+                    _ => {
+                        self.set_caveman_mode(true);
+                        Some(arg.to_string())
+                    }
+                }
+            }
+            "/ponytail" => {
+                match arg.to_lowercase().as_str() {
+                    "" => {
+                        let next = !self.ponytail_mode();
+                        self.set_ponytail_mode(next);
+                        append_instant_reply(
+                            trimmed,
+                            format!(
+                                "**Ponytail Mode {}**.",
+                                if next { "ENABLED" } else { "DISABLED" }
+                            ),
+                        );
+                        None
+                    }
+                    "on" | "true" | "1" => {
+                        self.set_ponytail_mode(true);
+                        append_instant_reply(trimmed, "**Ponytail Mode ENABLED**.".to_string());
+                        None
+                    }
+                    "off" | "false" | "0" => {
+                        self.set_ponytail_mode(false);
+                        append_instant_reply(trimmed, "**Ponytail Mode DISABLED**.".to_string());
+                        None
+                    }
+                    _ => {
+                        self.set_ponytail_mode(true);
+                        Some(arg.to_string())
+                    }
+                }
+            }
+            "/model" => {
+                if arg.is_empty() {
+                    let s = self.settings();
+                    let prov = crate::llm::resolve_provider_for_model(&s, &s.model);
+                    append_instant_reply(
+                        trimmed,
+                        format!("**Active Model**: `{}` (provider: `{}`)", s.model, prov),
+                    );
+                } else {
+                    let mut s = self.settings();
+                    s.model = arg.to_string();
+                    s.sync_provider_with_model();
+                    let prov = s.provider.clone();
+                    self.update_settings(s);
+                    append_instant_reply(
+                        trimmed,
+                        format!("Switched active model to **`{}`** (provider: `{}`).", arg, prov),
+                    );
+                }
+                None
+            }
+            "/status" => {
+                let s = self.settings();
+                let conv = self.conversation_by_id(conv_id);
+                let ws = self.active_workspace_path();
+                append_instant_reply(
+                    trimmed,
+                    format!(
+                        "### Unjess 4.0 Session Status\n\
+                         - **Workspace**: `{}`\n\
+                         - **Model**: `{}` (`{}`)\n\
+                         - **Mode**: `{}` (Caveman: `{}`, Ponytail: `{}`)\n\
+                         - **Session Tokens**: `{}` (in: `{}`, out: `{}`)\n\
+                         - **Session Cost**: `${:.4}`",
+                        ws.display(),
+                        s.model,
+                        s.provider,
+                        self.agent_mode(),
+                        self.caveman_mode(),
+                        self.ponytail_mode(),
+                        conv.total_tokens,
+                        conv.total_input_tokens,
+                        conv.total_output_tokens,
+                        conv.total_cost_usd
+                    ),
+                );
+                None
+            }
+            "/skill" => {
+                if arg.is_empty() {
+                    let ws = self.active_workspace_path();
+                    let list: Vec<String> = SkillsManager::list_skills_for_workspace(Some(&ws))
+                        .into_iter()
+                        .map(|sk| format!("- `{}` ({}): {}", sk.id, sk.name, sk.description))
+                        .collect();
+                    append_instant_reply(
+                        trimmed,
+                        format!("**Installed Skills**:\n{}", list.join("\n")),
+                    );
+                    None
+                } else {
+                    Some(format!("/skill {}", arg))
+                }
+            }
+            "/plan" => {
+                self.set_agent_mode("Plan");
+                if arg.is_empty() {
+                    append_instant_reply(trimmed, "Switched execution mode to **Plan**.".to_string());
+                    None
+                } else {
+                    Some(arg.to_string())
+                }
+            }
+            "/supervised" => {
+                self.set_agent_mode("Supervised");
+                if arg.is_empty() {
+                    append_instant_reply(
+                        trimmed,
+                        "Switched execution mode to **Supervised**.".to_string(),
+                    );
+                    None
+                } else {
+                    Some(arg.to_string())
+                }
+            }
+            "/auto" | "/autonomous" => {
+                self.set_agent_mode("Autonomous");
+                if arg.is_empty() {
+                    append_instant_reply(
+                        trimmed,
+                        "Switched execution mode to **Autonomous**.".to_string(),
+                    );
+                    None
+                } else {
+                    Some(arg.to_string())
+                }
+            }
+            "/mcp" => {
+                let servers = McpManager::load();
+                let mut md = String::from("### Configured MCP Servers\n");
+                for s in &servers {
+                    let status = if !s.enabled {
+                        "disabled"
+                    } else if s.last_probe_ok == Some(true) {
+                        "online"
+                    } else {
+                        "enabled"
+                    };
+                    let tool_names: Vec<String> =
+                        s.cached_tools.iter().map(|t| t.name.clone()).collect();
+                    md.push_str(&format!(
+                        "- **{}** (`{}`): {} — **{} tools** {}\n",
+                        s.name,
+                        status,
+                        s.description,
+                        tool_names.len(),
+                        if tool_names.is_empty() {
+                            String::new()
+                        } else {
+                            format!("(`[{}]`) ", tool_names.join(", "))
+                        }
+                    ));
+                }
+                append_instant_reply(trimmed, md);
+                None
+            }
+            "/duel" => {
+                self.set_agent_mode("Duel");
+                if arg.is_empty() {
+                    let ws = self.active_workspace_path();
+                    let report = scan_workspace(&ws);
+                    let mut md = format!(
+                        "### Security Duel Scan — Score: **{}/100**\n{}\n",
+                        report.score, report.summary
+                    );
+                    for f in report.red_team_findings.iter().take(15) {
+                        md.push_str(&format!(
+                            "- **[{}]** `{}` (`{}:{}`) — {}\n",
+                            f.severity.to_uppercase(),
+                            f.title,
+                            f.file,
+                            f.line,
+                            f.remediation
+                        ));
+                    }
+                    append_instant_reply(trimmed, md);
+                    None
+                } else {
+                    Some(arg.to_string())
+                }
+            }
+            "/goal" => {
+                self.set_agent_mode("Autonomous");
+                if arg.is_empty() {
+                    append_instant_reply(
+                        trimmed,
+                        "Usage: `/goal <objective>` — Runs a thorough multi-step autonomous engineering loop until the objective is verified.".to_string(),
+                    );
+                    None
+                } else {
+                    Some(format!(
+                        "[AUTONOMOUS GOAL MODE]: Complete the following goal thoroughly end-to-end, verifying all changes with tests before finishing:\n{}",
+                        arg
+                    ))
+                }
+            }
+            "/budget" | "/cost" => {
+                let mut s = self.settings();
+                let conv = self.conversation_by_id(conv_id);
+                if cmd == "/cost" || arg.is_empty() {
+                    let limit_str = if s.max_cost_per_session > 0.0 {
+                        format!("${:.4}", s.max_cost_per_session)
+                    } else {
+                        "unlimited".to_string()
+                    };
+                    append_instant_reply(
+                        trimmed,
+                        format!(
+                            "### Session Cost & Budget\n\
+                             - **Session Tokens**: `{}` (in: `{}`, out: `{}`)\n\
+                             - **Session Cost**: `${:.4}`\n\
+                             - **Session Budget Limit**: `{}`",
+                            conv.total_tokens,
+                            conv.total_input_tokens,
+                            conv.total_output_tokens,
+                            conv.total_cost_usd,
+                            limit_str
+                        ),
+                    );
+                } else if matches!(arg.to_lowercase().as_str(), "off" | "0" | "none" | "unlimited")
+                {
+                    s.max_cost_per_session = 0.0;
+                    self.update_settings(s);
+                    append_instant_reply(
+                        trimmed,
+                        "**Session Budget Limit disabled** (`unlimited`).".to_string(),
+                    );
+                } else if let Ok(val) = arg.trim_start_matches('$').parse::<f64>() {
+                    s.max_cost_per_session = val.max(0.0);
+                    self.update_settings(s.clone());
+                    append_instant_reply(
+                        trimmed,
+                        format!(
+                            "**Session Budget Limit** set to **`${:.4}`**.",
+                            s.max_cost_per_session
+                        ),
+                    );
+                } else {
+                    append_instant_reply(
+                        trimmed,
+                        "Usage: `/budget [usd|off]` or `/cost`.".to_string(),
+                    );
+                }
+                None
+            }
+            "/help" => {
+                append_instant_reply(
+                    trimmed,
+                    "**Available Slash Commands**:\n\
+                     - `/auto [prompt]` — Switch to Autonomous mode\n\
+                     - `/plan [prompt]` — Switch to Plan mode\n\
+                     - `/supervised [prompt]` — Switch to Supervised mode\n\
+                     - `/duel [prompt]` — Run Red Team vs. White Team Security Duel\n\
+                     - `/goal <objective>` — Execute a thorough end-to-end goal\n\
+                     - `/model [name]` — View or switch the active LLM model\n\
+                     - `/status` — Show workspace, model, mode, token, and cost telemetry\n\
+                     - `/budget [usd|off]` / `/cost` — View or configure session USD budget limit\n\
+                     - `/skill [id]` — List installed skills or invoke a skill\n\
+                     - `/compact` — Deterministically compact conversation history\n\
+                     - `/undo` — Revert the last turn and restore modified files\n\
+                     - `/caveman [on|off|prompt]` — Toggle or set ultra-dense Caveman output mode\n\
+                     - `/ponytail [on|off|prompt]` — Toggle or set high-energy Ponytail systems-architect mode\n\
+                     - `/clear` — Clear the active conversation"
+                        .to_string(),
+                );
+                None
+            }
+            _ => Some(trimmed.to_string()),
+        }
+    }
+
+    /// Appends the user prompt to the active conversation and spawns the multi-step
+    /// autonomous agent tool-execution loop on Tokio, updating `live_turn` in real time.
+    pub fn submit_prompt(self: &Arc<Self>, prompt: String) {
+        let trimmed = prompt.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let conv_id = self.active_conversation_id();
+        let Some(effective_prompt) = self.try_handle_slash_command(&conv_id, &trimmed) else {
+            return;
+        };
+
+        self.abort_flag.store(false, Ordering::SeqCst);
+        let now_ts = Utc::now().format("%H:%M:%S").to_string();
+        let est_in = (effective_prompt.len() / 4).max(1);
+
+        if let Ok(mut g) = self.state.write() {
+            if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == conv_id) {
+                if conv.messages.is_empty()
+                    && (conv.title == "Main Engineering Session"
+                        || conv.title.starts_with("Session")
+                        || conv.title == "Quick Chat")
+                {
+                    let short: String = effective_prompt.chars().take(42).collect();
+                    conv.title = short;
+                }
+                conv.messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: effective_prompt,
+                    thinking: None,
+                    tool_calls: Vec::new(),
+                    diffs: Vec::new(),
+                    timestamp: now_ts,
+                    model: None,
+                    tokens: est_in,
+                    input_tokens: est_in,
+                    output_tokens: 0,
+                    cost_usd: 0.0,
+                });
+            }
+        }
+        self.save_state();
+
+        if let Ok(mut live) = self.live_turn.write() {
+            *live = LiveTurnSnapshot {
+                running: true,
+                conv_id: conv_id.clone(),
+                current_step: "Initializing autonomous reasoning turn...".to_string(),
+                thinking: String::new(),
+                streaming_text: String::new(),
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                iteration: 1,
+                started_at: Self::now_epoch_secs(),
+                elapsed_s: 0.0,
+                tokens: 0,
+                cost_usd: 0.0,
+            };
+        }
+
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            mgr.run_autonomous_loop(&conv_id).await;
+        });
+    }
+
+    /// Appends the user prompt and awaits the multi-turn autonomous agent loop completion,
+    /// returning the updated `Conversation` while updating `live_turn` in real time.
+    pub async fn execute_prompt_turn(
+        self: &Arc<Self>,
+        conv_id_opt: Option<&str>,
+        prompt: String,
+    ) -> Conversation {
+        let trimmed = prompt.trim().to_string();
+        if let Some(cid) = conv_id_opt.filter(|s| !s.trim().is_empty()) {
+            self.set_active_conversation(cid);
+        }
+        let conv_id = self.active_conversation_id();
+        if trimmed.is_empty() {
+            return self.active_conversation();
+        }
+
+        let Some(effective_prompt) = self.try_handle_slash_command(&conv_id, &trimmed) else {
+            return self.active_conversation();
+        };
+
+        self.abort_flag.store(false, Ordering::SeqCst);
+        let now_ts = Utc::now().format("%H:%M:%S").to_string();
+        let est_in = (effective_prompt.len() / 4).max(1);
+
+        if let Ok(mut g) = self.state.write() {
+            if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == conv_id) {
+                if conv.messages.is_empty()
+                    && (conv.title == "Main Engineering Session"
+                        || conv.title.starts_with("Session")
+                        || conv.title == "Quick Chat")
+                {
+                    let short: String = effective_prompt.chars().take(42).collect();
+                    conv.title = short;
+                }
+                conv.messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: effective_prompt,
+                    thinking: None,
+                    tool_calls: Vec::new(),
+                    diffs: Vec::new(),
+                    timestamp: now_ts,
+                    model: None,
+                    tokens: est_in,
+                    input_tokens: est_in,
+                    output_tokens: 0,
+                    cost_usd: 0.0,
+                });
+            }
+        }
+        self.save_state();
+
+        if let Ok(mut live) = self.live_turn.write() {
+            *live = LiveTurnSnapshot {
+                running: true,
+                conv_id: conv_id.clone(),
+                current_step: "Initializing autonomous reasoning turn...".to_string(),
+                thinking: String::new(),
+                streaming_text: String::new(),
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                iteration: 1,
+                started_at: Self::now_epoch_secs(),
+                elapsed_s: 0.0,
+                tokens: 0,
+                cost_usd: 0.0,
+            };
+        }
+
+        self.run_autonomous_loop(&conv_id).await;
+        self.conversation_by_id(&conv_id)
+    }
+
+    async fn run_autonomous_loop(&self, conv_id: &str) {
+        let mut settings = self.settings();
+        let ws_path = self.active_workspace_path();
+        let workspace = Workspace::new(&ws_path).unwrap_or_else(|_| {
+            Workspace::new(".").expect("Fallback workspace must resolve")
+        });
+        let mut tool_engine =
+            ToolEngine::new(workspace).with_abort_flag(Arc::clone(&self.abort_flag));
+
+        let max_iters = settings.max_iterations.clamp(1, 300);
+        let enable_tools = self.agent_mode() != "Plan";
+
+        let active_conv = self.conversation_by_id(conv_id);
+        let mut working_history = active_conv.messages.clone();
+        let initial_session_cost = active_conv.total_cost_usd;
+        let latest_user_query = working_history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        let mut collected_tools: Vec<ToolCallRecord> = Vec::new();
+        let mut collected_diffs: Vec<FileDiff> = Vec::new();
+        let mut collected_thinking = String::new();
+        let mut final_text = String::new();
+        let mut total_turn_tokens = 0usize;
+        let mut total_turn_in_tokens = 0usize;
+        let mut total_turn_out_tokens = 0usize;
+        let mut total_turn_cost = 0.0f64;
+        let mut recent_tool_signatures: Vec<String> = Vec::new();
+        let mut stuck_strikes = 0usize;
+        let mut system_prompt = self.build_system_prompt_for_query(&ws_path, &latest_user_query);
+        let mut system_prompt_dirty = false;
+
+        for iter in 1..=max_iters {
+            if self.abort_flag.load(Ordering::SeqCst) {
+                final_text = "*[Turn aborted by user]*".to_string();
+                break;
+            }
+
+            // Session budget circuit-breaker
+            if settings.max_cost_per_session > 0.0
+                && (initial_session_cost + total_turn_cost) >= settings.max_cost_per_session
+            {
+                final_text = format!(
+                    "**Session Budget Limit Reached**: Current session cost (`${:.4}`) reached `max_cost_per_session` (`${:.4}`). Increase the limit in Settings to continue.",
+                    initial_session_cost + total_turn_cost,
+                    settings.max_cost_per_session
+                );
+                break;
+            }
+
+            // Automatic context compaction when conversation history grows large by message count OR character volume
+            let total_history_chars: usize = working_history.iter().map(|m| m.content.len()).sum();
+            if settings.enable_compaction
+                && (working_history.len() > 20 || total_history_chars > 48_000)
+                && working_history.len() > 6
+            {
+                working_history = Self::compact_messages(&working_history, 6);
+            }
+
+            if system_prompt_dirty {
+                system_prompt = self.build_system_prompt_for_query(&ws_path, &latest_user_query);
+                system_prompt_dirty = false;
+            }
+
+            if let Ok(mut live) = self.live_turn.write() {
+                live.iteration = iter;
+                live.tokens = total_turn_tokens;
+                live.cost_usd = total_turn_cost;
+                live.current_step = format!(
+                    "Calling {} (step {}/{})...",
+                    settings.model, iter, max_iters
+                );
+            }
+
+            // Call primary model, with automatic fallback to `settings.fallback_models` if configured
+            let mut turn_result =
+                complete_llm_turn(&settings, &system_prompt, &working_history, enable_tools).await;
+            if turn_result.is_err() && !settings.fallback_models.is_empty() {
+                for fb_model in settings.fallback_models.clone() {
+                    if fb_model.trim().is_empty() || fb_model == settings.model {
+                        continue;
+                    }
+                    let mut fb_settings = settings.clone();
+                    fb_settings.model = fb_model.trim().to_string();
+                    if let Ok(ok_resp) = complete_llm_turn(
+                        &fb_settings,
+                        &system_prompt,
+                        &working_history,
+                        enable_tools,
+                    )
+                    .await
+                    {
+                        settings.model = fb_settings.model;
+                        turn_result = Ok(ok_resp);
+                        break;
+                    }
+                }
+            }
+
+            match turn_result {
+                Ok(resp) => {
+                    total_turn_tokens += resp.tokens;
+                    total_turn_in_tokens += resp.input_tokens;
+                    total_turn_out_tokens += resp.output_tokens;
+                    total_turn_cost += resp.cost_usd;
+
+                    if let Some(t) = resp.thinking {
+                        if !t.is_empty() {
+                            if !collected_thinking.is_empty() {
+                                collected_thinking.push_str("\n\n");
+                            }
+                            collected_thinking.push_str(&t);
+                        }
+                    }
+
+                    if !resp.content.trim().is_empty() {
+                        let chunk = resp.content.trim();
+                        if final_text.is_empty() {
+                            final_text = chunk.to_string();
+                        } else if !final_text.contains(chunk) {
+                            final_text.push_str("\n\n");
+                            final_text.push_str(chunk);
+                        }
+                    }
+
+                    if let Ok(mut live) = self.live_turn.write() {
+                        live.thinking = collected_thinking.clone();
+                        live.streaming_text = final_text.clone();
+                        live.tokens = total_turn_tokens;
+                        live.cost_usd = total_turn_cost;
+                    }
+
+                    if resp.pending_tool_calls.is_empty() {
+                        break;
+                    }
+
+                    // Execute requested tool calls
+                    let mut tool_results_summary = Vec::new();
+                    let mut stuck_detected = false;
+
+                    for (tc_id, tc_name, tc_args) in resp.pending_tool_calls {
+                        if self.abort_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+
+                        // Stuck-loop detection: check 3 identical calls in a row OR 2-step ping-pong cycle (A, B, A, B, A, B)
+                        let sig = format!("{}:{}", tc_name, tc_args);
+                        recent_tool_signatures.push(sig.clone());
+                        let sig_len = recent_tool_signatures.len();
+                        let same_three = sig_len >= 3
+                            && recent_tool_signatures[sig_len - 1] == sig
+                            && recent_tool_signatures[sig_len - 2] == sig
+                            && recent_tool_signatures[sig_len - 3] == sig;
+                        let ping_pong = sig_len >= 6
+                            && recent_tool_signatures[sig_len - 1]
+                                == recent_tool_signatures[sig_len - 3]
+                            && recent_tool_signatures[sig_len - 3]
+                                == recent_tool_signatures[sig_len - 5]
+                            && recent_tool_signatures[sig_len - 2]
+                                == recent_tool_signatures[sig_len - 4]
+                            && recent_tool_signatures[sig_len - 4]
+                                == recent_tool_signatures[sig_len - 6];
+
+                        if same_three || ping_pong {
+                            stuck_detected = true;
+                            stuck_strikes += 1;
+                            tool_results_summary.push(format!(
+                                "[System Stuck-Loop Detector]: You have repeated `{}` in a loop. Stop repeating this call and either try a different approach or summarize your findings.",
+                                tc_name
+                            ));
+                            break;
+                        }
+
+                        if let Ok(mut live) = self.live_turn.write() {
+                            live.current_step = format!("Executing tool `{}`...", tc_name);
+                        }
+
+                        if matches!(
+                            tc_name.as_str(),
+                            "write_file"
+                                | "edit_file"
+                                | "multi_edit_file"
+                                | "delete_file"
+                                | "save_memory"
+                                | "delete_memory"
+                                | "create_skill_plugin"
+                                | "register_mcp_plugin"
+                                | "delegate_subagent"
+                                | "delegate_parallel_subagents"
+                        ) {
+                            system_prompt_dirty = true;
+                        }
+
+                        let started = Instant::now();
+                        let (result_str, is_ok, diff_opt) = if tc_name == "delegate_subagent" {
+                            let sub_id = tc_args
+                                .get("subagent_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("sub-coder");
+                            let sub_task = tc_args
+                                .get("task")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            match self
+                                .execute_subagent_task_detailed(sub_id, sub_task, Some(conv_id))
+                                .await
+                            {
+                                Ok(sub_res) => {
+                                    total_turn_tokens += sub_res.tokens;
+                                    total_turn_in_tokens += sub_res.input_tokens;
+                                    total_turn_out_tokens += sub_res.output_tokens;
+                                    total_turn_cost += sub_res.cost_usd;
+                                    for mut tc in sub_res.tool_calls {
+                                        tc.name = format!("{}:{}", sub_id, tc.name);
+                                        collected_tools.push(tc);
+                                    }
+                                    for d in sub_res.diffs {
+                                        collected_diffs.push(d);
+                                    }
+                                    (sub_res.output, true, None)
+                                }
+                                Err(e) => (e, false, None),
+                            }
+                        } else if tc_name == "delegate_parallel_subagents" {
+                            let specs: Vec<(String, String)> = tc_args
+                                .get("tasks")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .take(4)
+                                        .filter_map(|item| {
+                                            let sid = item
+                                                .get("subagent_id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("sub-coder")
+                                                .to_string();
+                                            let t = item
+                                                .get("task")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .trim()
+                                                .to_string();
+                                            if t.is_empty() {
+                                                None
+                                            } else {
+                                                Some((sid, t))
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
+                            if specs.is_empty() {
+                                (
+                                    "Missing non-empty `tasks` array for `delegate_parallel_subagents`."
+                                        .to_string(),
+                                    false,
+                                    None,
+                                )
+                            } else {
+                                let results = match specs.len() {
+                                    1 => {
+                                        let r0 = self
+                                            .execute_subagent_task_detailed(
+                                                &specs[0].0,
+                                                &specs[0].1,
+                                                Some(conv_id),
+                                            )
+                                            .await;
+                                        vec![(specs[0].0.clone(), r0)]
+                                    }
+                                    2 => {
+                                        let (r0, r1) = tokio::join!(
+                                            self.execute_subagent_task_detailed(
+                                                &specs[0].0,
+                                                &specs[0].1,
+                                                Some(conv_id)
+                                            ),
+                                            self.execute_subagent_task_detailed(
+                                                &specs[1].0,
+                                                &specs[1].1,
+                                                Some(conv_id)
+                                            ),
+                                        );
+                                        vec![(specs[0].0.clone(), r0), (specs[1].0.clone(), r1)]
+                                    }
+                                    3 => {
+                                        let (r0, r1, r2) = tokio::join!(
+                                            self.execute_subagent_task_detailed(
+                                                &specs[0].0,
+                                                &specs[0].1,
+                                                Some(conv_id)
+                                            ),
+                                            self.execute_subagent_task_detailed(
+                                                &specs[1].0,
+                                                &specs[1].1,
+                                                Some(conv_id)
+                                            ),
+                                            self.execute_subagent_task_detailed(
+                                                &specs[2].0,
+                                                &specs[2].1,
+                                                Some(conv_id)
+                                            ),
+                                        );
+                                        vec![
+                                            (specs[0].0.clone(), r0),
+                                            (specs[1].0.clone(), r1),
+                                            (specs[2].0.clone(), r2),
+                                        ]
+                                    }
+                                    _ => {
+                                        let (r0, r1, r2, r3) = tokio::join!(
+                                            self.execute_subagent_task_detailed(
+                                                &specs[0].0,
+                                                &specs[0].1,
+                                                Some(conv_id)
+                                            ),
+                                            self.execute_subagent_task_detailed(
+                                                &specs[1].0,
+                                                &specs[1].1,
+                                                Some(conv_id)
+                                            ),
+                                            self.execute_subagent_task_detailed(
+                                                &specs[2].0,
+                                                &specs[2].1,
+                                                Some(conv_id)
+                                            ),
+                                            self.execute_subagent_task_detailed(
+                                                &specs[3].0,
+                                                &specs[3].1,
+                                                Some(conv_id)
+                                            ),
+                                        );
+                                        vec![
+                                            (specs[0].0.clone(), r0),
+                                            (specs[1].0.clone(), r1),
+                                            (specs[2].0.clone(), r2),
+                                            (specs[3].0.clone(), r3),
+                                        ]
+                                    }
+                                };
+
+                                let mut sections = Vec::new();
+                                let mut any_ok = false;
+                                for (sid, res) in results {
+                                    match res {
+                                        Ok(sub_res) => {
+                                            any_ok = true;
+                                            total_turn_tokens += sub_res.tokens;
+                                            total_turn_in_tokens += sub_res.input_tokens;
+                                            total_turn_out_tokens += sub_res.output_tokens;
+                                            total_turn_cost += sub_res.cost_usd;
+                                            for mut tc in sub_res.tool_calls {
+                                                tc.name = format!("{}:{}", sid, tc.name);
+                                                collected_tools.push(tc);
+                                            }
+                                            for d in sub_res.diffs {
+                                                collected_diffs.push(d);
+                                            }
+                                            sections.push(format!(
+                                                "### Subagent `{}`\n{}",
+                                                sid, sub_res.output
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            sections.push(format!(
+                                                "### Subagent `{}` (Error)\n{}",
+                                                sid, e
+                                            ));
+                                        }
+                                    }
+                                }
+                                (sections.join("\n\n"), any_ok, None)
+                            }
+                        } else {
+                            tool_engine.execute_tool(&tc_name, &tc_args)
+                        };
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        let clipped_result = ToolEngine::truncate_head_tail(&result_str, 12000);
+
+                        let record = ToolCallRecord {
+                            id: tc_id,
+                            name: tc_name.clone(),
+                            arguments: tc_args,
+                            result: clipped_result.clone(),
+                            status: if is_ok {
+                                "ok".to_string()
+                            } else {
+                                "error".to_string()
+                            },
+                            duration_ms,
+                        };
+                        collected_tools.push(record);
+                        if let Some(d) = diff_opt {
+                            collected_diffs.push(d);
+                        }
+
+                        if let Ok(mut live) = self.live_turn.write() {
+                            live.tool_calls = collected_tools.clone();
+                            live.diffs = collected_diffs.clone();
+                            live.tokens = total_turn_tokens;
+                            live.cost_usd = total_turn_cost;
+                        }
+
+                        tool_results_summary.push(format!(
+                            "[Tool `{}` result]:\n{}",
+                            tc_name, clipped_result
+                        ));
+                    }
+
+                    working_history.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: if final_text.is_empty() {
+                            "Executing workspace tools...".to_string()
+                        } else {
+                            final_text.clone()
+                        },
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        diffs: Vec::new(),
+                        timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                        model: Some(settings.model.clone()),
+                        tokens: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                    });
+                    working_history.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: tool_results_summary.join("\n\n"),
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        diffs: Vec::new(),
+                        timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                        model: None,
+                        tokens: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                    });
+
+                    if stuck_detected && (stuck_strikes >= 2 || iter >= max_iters.saturating_sub(1))
+                    {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    final_text = format!(
+                        "**LLM Provider Error (`{}`)**:\n```\n{}\n```\n\n*Tip: Verify that Ollama / llama.cpp / LM Studio is running locally or configure a cloud API key in the **Settings** tab.*",
+                        settings.model, err
+                    );
+                    break;
+                }
+            }
+        }
+
+        if final_text.trim().is_empty() && !collected_tools.is_empty() {
+            final_text = format!(
+                "Completed {} tool operation(s) and applied {} file modification(s).",
+                collected_tools.len(),
+                collected_diffs.len()
+            );
+        }
+
+        // Commit assistant turn to conversation
+        if let Ok(mut g) = self.state.write() {
+            if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == conv_id) {
+                conv.total_tokens += total_turn_tokens;
+                conv.total_input_tokens += total_turn_in_tokens;
+                conv.total_output_tokens += total_turn_out_tokens;
+                conv.total_cost_usd += total_turn_cost;
+                conv.messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: final_text,
+                    thinking: if collected_thinking.is_empty() {
+                        None
+                    } else {
+                        Some(collected_thinking)
+                    },
+                    tool_calls: collected_tools,
+                    diffs: collected_diffs,
+                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                    model: Some(settings.model),
+                    tokens: total_turn_tokens,
+                    input_tokens: total_turn_in_tokens,
+                    output_tokens: total_turn_out_tokens,
+                    cost_usd: total_turn_cost,
+                });
+            }
+        }
+        self.save_state();
+
+        if let Ok(mut live) = self.live_turn.write() {
+            if live.started_at > 0.0 {
+                live.elapsed_s = (Self::now_epoch_secs() - live.started_at).max(0.0);
+            }
+            live.running = false;
+            live.current_step = "Ready".to_string();
+        }
+    }
+
+    pub fn build_system_prompt(&self, ws_path: &std::path::Path) -> String {
+        self.build_system_prompt_for_query(ws_path, "")
+    }
+
+    pub fn build_system_prompt_for_query(
+        &self,
+        ws_path: &std::path::Path,
+        user_query: &str,
+    ) -> String {
+        let mode = self.agent_mode();
+        let caveman = self.caveman_mode();
+        let ponytail = self.ponytail_mode();
+        let skills = SkillsManager::list_skills_for_workspace(Some(ws_path));
+        let triggered_skills = SkillsManager::match_triggered_skills(user_query, Some(ws_path));
+        let mcp_servers = McpManager::load();
+        let subagents = self.subagents();
+
+        let mut prompt = format!(
+            "You are Unjess 4.0 (100% Native Rust Autonomous AI Coding & Security Engineering Harness).\n\
+             Active Workspace: {}\n\
+             Execution Mode: {}\n",
+            ws_path.display(),
+            mode
+        );
+
+        match mode.as_str() {
+            "Plan" => {
+                prompt.push_str(
+                    "MODE DIRECTIVE (PLAN): Do not modify files yet. Produce a rigorous, step-by-step architectural & implementation plan.\n",
+                );
+            }
+            "Supervised" => {
+                prompt.push_str(
+                    "MODE DIRECTIVE (SUPERVISED): Explain each file edit or command clearly before or during execution.\n",
+                );
+            }
+            "Duel" => {
+                prompt.push_str(
+                    "MODE DIRECTIVE (SECURITY DUEL): Operate as both Red Team (offensive vulnerability discovery) and White Team (defensive hardening & patching).\n",
+                );
+            }
+            _ => {
+                prompt.push_str(
+                    "MODE DIRECTIVE (AUTONOMOUS): Use tools proactively to inspect, implement, test, and verify changes end-to-end.\n",
+                );
+            }
+        }
+
+        if caveman {
+            prompt.push_str(
+                "PERSONA (CAVEMAN MODE): Respond with ultra-dense, minimal words. Skip pleasantries; output pure code and direct facts.\n",
+            );
+        }
+        if ponytail {
+            prompt.push_str(
+                "PERSONA (PONYTAIL MODE): Bring high-energy, sharp systems-engineering enthusiasm and crystal-clear architectural insight.\n",
+            );
+        }
+
+        let repo_map = generate_repo_map(ws_path, 30, 3200);
+        if !repo_map.is_empty() {
+            prompt.push_str("\nWorkspace Structural Repo Map (top files & symbols):\n");
+            prompt.push_str(&repo_map);
+        }
+
+        if !subagents.is_empty() {
+            prompt.push_str("\nAvailable Autonomous Subagents (use `delegate_subagent` to delegate specialized work):\n");
+            for sub in &subagents {
+                prompt.push_str(&format!("- `{}` ({}): {}\n", sub.id, sub.name, sub.role));
+            }
+        }
+
+        if !skills.is_empty() {
+            prompt.push_str("\nInstalled Skill Plugins (use `run_skill_plugin` to read instructions, read `references/`, or execute `scripts/`):\n");
+            for s in &skills {
+                let scripts_meta = if s.scripts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | scripts: [{}]", s.scripts.join(", "))
+                };
+                let refs_meta = if s.references.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | references: [{}]", s.references.join(", "))
+                };
+                let dir_meta = if s.dir_path.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [dir: `{}`]", s.dir_path)
+                };
+                prompt.push_str(&format!(
+                    "- `{}` ({}): {}{}{}{}\n",
+                    s.id, s.name, s.description, dir_meta, scripts_meta, refs_meta
+                ));
+            }
+        }
+
+        if !triggered_skills.is_empty() {
+            prompt.push_str("\nActive Triggered Skill Instructions:\n");
+            for ts in triggered_skills.into_iter().take(3) {
+                prompt.push_str(&format!("--- SKILL: {} ({}) ---\n", ts.name, ts.id));
+                if !ts.dir_path.is_empty() {
+                    prompt.push_str(&format!("Skill Directory: `{}`\n", ts.dir_path));
+                }
+                if !ts.scripts.is_empty() {
+                    prompt.push_str(&format!(
+                        "Bundled Scripts (execute via `run_skill_plugin` with `script_name`): `{}`\n",
+                        ts.scripts.join("`, `")
+                    ));
+                }
+                if !ts.references.is_empty() {
+                    prompt.push_str(&format!(
+                        "Bundled References (read via `run_skill_plugin` with `reference_name`): `{}`\n",
+                        ts.references.join("`, `")
+                    ));
+                }
+                prompt.push_str(&format!("{}\n", ts.body));
+            }
+        }
+
+        if !mcp_servers.is_empty() {
+            prompt.push_str("\nConfigured MCP Servers (use `mcp__<server>__<tool>`, `call_mcp_tool`, or `probe_mcp_server`):\n");
+            for srv in mcp_servers.iter().filter(|s| s.enabled) {
+                let tnames: Vec<String> = srv.cached_tools.iter().map(|t| t.name.clone()).collect();
+                let tools_meta = if tnames.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | tools: [{}]", tnames.join(", "))
+                };
+                prompt.push_str(&format!(
+                    "- `{}`: {}{}\n",
+                    srv.name, srv.description, tools_meta
+                ));
+            }
+        }
+
+        prompt.push_str(
+            "\nSELF-PLUGIN AUTHORING CAPABILITY:\n\
+             - When asked to code or create a skill or plugin for yourself, call `create_skill_plugin` (writes SKILL.md + optional executable script into ~/.unjess-rust/skills/<id>/ and hot-loads it immediately in the UI) or `register_mcp_plugin` (writes & registers an MCP server in ~/.unjess-rust/mcp.json).\n",
+        );
+
+        // Combine query-relevant recalled memories with recent memories (deduplicated)
+        let mut selected_memories = Vec::new();
+        let mut seen_mem_ids = std::collections::HashSet::new();
+        if !user_query.trim().is_empty() {
+            for m in MemoryStore::recall(user_query).into_iter().take(12) {
+                if seen_mem_ids.insert(m.id.clone()) {
+                    selected_memories.push(m);
+                }
+            }
+        }
+        for m in MemoryStore::load().into_iter().rev().take(15) {
+            if selected_memories.len() >= 20 {
+                break;
+            }
+            if seen_mem_ids.insert(m.id.clone()) {
+                selected_memories.push(m);
+            }
+        }
+
+        if !selected_memories.is_empty() {
+            prompt.push_str("\nPersistent Cross-Session Memories:\n");
+            for m in &selected_memories {
+                prompt.push_str(&format!("- [{}] {}: {}\n", m.category, m.key, m.content));
+            }
+        }
+
+        // Auto-inject @<file_path> mentions from the user query (up to 4 workspace files)
+        if !user_query.trim().is_empty() {
+            if let Ok(ws) = Workspace::new(ws_path) {
+                let mut pinned_files = Vec::new();
+                let mut seen_paths = std::collections::HashSet::new();
+                for token in user_query.split_whitespace() {
+                    if let Some(raw_mention) = token.strip_prefix('@') {
+                        let cleaned = raw_mention.trim_matches(|c: char| {
+                            matches!(c, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '"' | '\'')
+                        });
+                        if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("rea") {
+                            continue;
+                        }
+                        if let Ok(resolved) = ws.resolve(cleaned) {
+                            if resolved.is_file() && seen_paths.insert(resolved.clone()) {
+                                if let Ok(content) = fs::read_to_string(&resolved) {
+                                    let clipped = ToolEngine::truncate_head_tail(&content, 6000);
+                                    pinned_files.push((cleaned.to_string(), clipped));
+                                    if pinned_files.len() >= 4 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !pinned_files.is_empty() {
+                    prompt.push_str("\nPinned @file Context:\n");
+                    for (rel_path, content) in pinned_files {
+                        prompt.push_str(&format!(
+                            "--- FILE: {} ---\n{}\n",
+                            rel_path, content
+                        ));
+                    }
+                }
+            }
+        }
+
+        prompt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_harness_manager_state_lifecycle_and_compaction() {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("UNJESS_RUST_CONFIG_DIR", tmp.path());
+            std::env::set_var("UNJESS_SKIP_LOCAL_PROBE", "1");
+        }
+
+        let hm = HarnessManager::new();
+        assert!(!hm.workspaces().is_empty());
+        assert!(!hm.subagents().is_empty());
+        assert!(!hm.workflows().is_empty());
+
+        let conv_id = hm.new_conversation_with_mode(Some("Rust GPU Test"), Some("quick"));
+        assert_eq!(hm.active_conversation().title, "Rust GPU Test");
+        assert_eq!(hm.active_conversation().mode, "quick");
+
+        hm.rename_conversation(&conv_id, "Renamed Session");
+        assert_eq!(hm.active_conversation().title, "Renamed Session");
+
+        hm.set_caveman_mode(true);
+        assert!(hm.caveman_mode());
+
+        // Verify /budget slash command updates max_cost_per_session
+        let res = hm.try_handle_slash_command(&conv_id, "/budget 2.50");
+        assert!(res.is_none());
+        assert!((hm.settings().max_cost_per_session - 2.50).abs() < 1e-6);
+
+        // Verify compact_messages preserves dominant/last assistant model
+        let msgs = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "First prompt".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                timestamp: "12:00:00".to_string(),
+                model: None,
+                tokens: 50,
+                input_tokens: 50,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "First answer".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                timestamp: "12:00:01".to_string(),
+                model: Some("claude-4-sonnet".to_string()),
+                tokens: 150,
+                input_tokens: 50,
+                output_tokens: 100,
+                cost_usd: 0.002,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Second prompt".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                timestamp: "12:00:02".to_string(),
+                model: None,
+                tokens: 30,
+                input_tokens: 30,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            },
+        ];
+        let compacted = HarnessManager::compact_messages(&msgs, 1);
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(compacted[0].model.as_deref(), Some("claude-4-sonnet"));
+        assert!((compacted[0].cost_usd - 0.002).abs() < 1e-6);
+
+        // Verify @file context injection in build_system_prompt_for_query
+        let sample_file = tmp.path().join("pinned_note.txt");
+        fs::write(&sample_file, "PINNED_FILE_SECRET_MARKER_42").unwrap();
+        let sys = hm.build_system_prompt_for_query(tmp.path(), "Please inspect @pinned_note.txt");
+        assert!(sys.contains("Pinned @file Context:"));
+        assert!(sys.contains("PINNED_FILE_SECRET_MARKER_42"));
+    }
+}
