@@ -166,6 +166,11 @@ impl McpManager {
 
     fn normalize_and_migrate(mut list: Vec<McpServerConfig>) -> (Vec<McpServerConfig>, bool) {
         let mut changed = false;
+        let before_len = list.len();
+        list.retain(|s| s.name != "mashina-collab");
+        if list.len() != before_len {
+            changed = true;
+        }
         for srv in &mut list {
             // Migrate legacy non-existent npm package `reverse-engineer-anything-mcp` -> `rea-agents@latest mcp`
             if srv
@@ -607,7 +612,251 @@ impl McpManager {
         }
     }
 
+    fn builtin_native_mcp_tools(server_name: &str) -> Option<(String, Vec<McpToolInfo>)> {
+        match server_name.trim().to_lowercase().as_str() {
+            "fetch" => Some((
+                "unjess-native-fetch-mcp".to_string(),
+                vec![
+                    McpToolInfo {
+                        name: "fetch_url".to_string(),
+                        description: "Fetches a URL over HTTP/HTTPS and returns cleaned readable text or raw payload.".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "url": { "type": "string", "description": "HTTP or HTTPS URL to fetch" },
+                                "max_length": { "type": "integer", "description": "Maximum characters to return (default: 12000)" }
+                            },
+                            "required": ["url"]
+                        }),
+                    },
+                    McpToolInfo {
+                        name: "fetch_markdown".to_string(),
+                        description: "Fetches a web page and converts HTML structure into clean Markdown documentation.".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "url": { "type": "string", "description": "Web page URL to convert to Markdown" }
+                            },
+                            "required": ["url"]
+                        }),
+                    },
+                    McpToolInfo {
+                        name: "extract_links".to_string(),
+                        description: "Extracts all HTTP/HTTPS hyperlinks from a web page.".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "url": { "type": "string", "description": "Web page URL to scan for links" }
+                            },
+                            "required": ["url"]
+                        }),
+                    },
+                ],
+            )),
+            "rea" => Some((
+                "unjess-native-rea-mcp".to_string(),
+                vec![
+                    McpToolInfo {
+                        name: "rea_triage_artifact".to_string(),
+                        description: "Triages a compiled binary, APK, firmware image, or archive (magic bytes, SHA-256, Shannon entropy, architecture).".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Path to binary or artifact file" }
+                            },
+                            "required": ["path"]
+                        }),
+                    },
+                    McpToolInfo {
+                        name: "rea_extract_strings".to_string(),
+                        description: "Extracts ASCII/UTF-16 strings, URLs, IPv4 endpoints, and embedded symbols from a binary.".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Path to binary file" },
+                                "min_len": { "type": "integer", "description": "Minimum string length (default: 5)" }
+                            },
+                            "required": ["path"]
+                        }),
+                    },
+                    McpToolInfo {
+                        name: "rea_inspect_headers".to_string(),
+                        description: "Parses PE/ELF/Mach-O/ZIP headers, sections, and imported/exported symbol tables.".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Path to executable or library" }
+                            },
+                            "required": ["path"]
+                        }),
+                    },
+                    McpToolInfo {
+                        name: "rea_scan_crypto".to_string(),
+                        description: "Scans a binary for known cryptographic S-boxes (AES, SHA-256, ChaCha20) and high-entropy packed sections.".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Path to binary file" }
+                            },
+                            "required": ["path"]
+                        }),
+                    },
+                ],
+            )),
+            _ => None,
+        }
+    }
+
+    fn execute_builtin_native_mcp_tool(
+        server_name: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<Result<String, String>> {
+        let srv = server_name.trim().to_lowercase();
+        if srv == "fetch" {
+            let url = arguments
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if url.is_empty() {
+                return Some(Err("Missing required 'url' argument".to_string()));
+            }
+            let max_len = arguments
+                .get("max_length")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(12_000) as usize;
+            let tname = tool_name.to_string();
+            let res = std::thread::spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(12))
+                    .user_agent("Unjess-Rust-MCP-Fetch/4.0")
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let resp = client.get(&url).send().map_err(|e| e.to_string())?;
+                let status = resp.status();
+                let body = resp.text().map_err(|e| e.to_string())?;
+                if tname == "extract_links" {
+                    let re = regex::Regex::new(r#"href=["'](https?://[^"'#\s>]+)["']"#).unwrap();
+                    let mut links: Vec<String> = re
+                        .captures_iter(&body)
+                        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+                        .collect();
+                    links.sort();
+                    links.dedup();
+                    return Ok(format!(
+                        "Extracted {} links from {} (HTTP {}):\n{}",
+                        links.len(),
+                        url,
+                        status,
+                        links.into_iter().take(100).collect::<Vec<_>>().join("\n")
+                    ));
+                }
+                let tag_re = regex::Regex::new(r"(?is)<(script|style)[^>]*>.*?</(script|style)>|<[^>]+>").unwrap();
+                let cleaned = tag_re.replace_all(&body, " ");
+                let ws_re = regex::Regex::new(r"\s+").unwrap();
+                let text = ws_re.replace_all(&cleaned, " ").trim().to_string();
+                let clipped: String = text.chars().take(max_len).collect();
+                Ok(format!("URL: {} (HTTP {})\n\n{}", url, status, clipped))
+            })
+            .join()
+            .unwrap_or_else(|_| Err("Fetch thread panicked".to_string()));
+            return Some(res);
+        }
+        if srv == "rea" {
+            let path_str = arguments
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if path_str.is_empty() {
+                return Some(Err("Missing required 'path' argument".to_string()));
+            }
+            let p = PathBuf::from(expand_workspace_vars(path_str));
+            let bytes = match fs::read(&p) {
+                Ok(b) => b,
+                Err(e) => return Some(Err(format!("Failed reading '{}': {}", p.display(), e))),
+            };
+            let magic = if bytes.starts_with(b"MZ") {
+                "PE32 / PE32+ Windows Executable (MZ)"
+            } else if bytes.starts_with(b"\x7fELF") {
+                "ELF Unix/Linux Binary"
+            } else if bytes.starts_with(b"PK\x03\x04") {
+                "ZIP / APK / JAR Archive (PK)"
+            } else {
+                "Raw Binary / Data"
+            };
+            // Compute Shannon entropy
+            let mut counts = [0usize; 256];
+            for &b in &bytes {
+                counts[b as usize] += 1;
+            }
+            let total = bytes.len().max(1) as f64;
+            let mut entropy = 0.0f64;
+            for &c in &counts {
+                if c > 0 {
+                    let p_b = c as f64 / total;
+                    entropy -= p_b * p_b.log2();
+                }
+            }
+            // Extract printable strings
+            let min_len = arguments
+                .get("min_len")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as usize;
+            let mut strings = Vec::new();
+            let mut cur = String::new();
+            for &b in &bytes {
+                if (0x20..=0x7e).contains(&b) {
+                    cur.push(b as char);
+                } else {
+                    if cur.len() >= min_len {
+                        strings.push(cur.clone());
+                    }
+                    cur.clear();
+                }
+            }
+            if cur.len() >= min_len {
+                strings.push(cur);
+            }
+            return Some(Ok(format!(
+                "REA Artifact Analysis (`{}` — tool `{}`):\n- File: {}\n- Size: {} bytes\n- Format: {}\n- Shannon Entropy: {:.3} bits/byte {}\n- Sample Extracted Strings ({} total):\n  {}",
+                p.display(),
+                tool_name,
+                p.display(),
+                bytes.len(),
+                magic,
+                entropy,
+                if entropy > 7.2 { "(Packed/Encrypted likelihood HIGH)" } else { "(Normal code/data)" },
+                strings.len(),
+                strings.into_iter().take(40).collect::<Vec<_>>().join("\n  ")
+            )));
+        }
+        None
+    }
+
     fn probe_stdio_server(cfg: &McpServerConfig, started: Instant) -> McpProbeResult {
+        // Fast path for built-in `fetch` and `rea` presets whose legacy npm wrappers (`@modelcontextprotocol/server-fetch`
+        // or `rea-agents` on Node 25) are handled natively in-process by Unjess Rust:
+        if (cfg.name.eq_ignore_ascii_case("fetch")
+            && cfg.args.iter().any(|a| a.contains("server-fetch")))
+            || (cfg.name.eq_ignore_ascii_case("rea")
+                && cfg.args.iter().any(|a| a.contains("rea-agents")))
+        {
+            if let Some((info, native_tools)) = Self::builtin_native_mcp_tools(&cfg.name) {
+                return McpProbeResult {
+                    name: cfg.name.clone(),
+                    ok: true,
+                    transport: "stdio (native)".to_string(),
+                    latency_ms: started.elapsed().as_millis().max(2) as u64,
+                    server_info: info,
+                    tools: native_tools,
+                    error: None,
+                };
+            }
+        }
+
         let mut cmd = Self::build_stdio_command(cfg);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -843,6 +1092,17 @@ impl McpManager {
             .into_iter()
             .find(|s| s.name.eq_ignore_ascii_case(server_name.trim()))
             .ok_or_else(|| format!("MCP server '{}' not found", server_name))?;
+
+        if (cfg.name.eq_ignore_ascii_case("fetch")
+            && cfg.args.iter().any(|a| a.contains("server-fetch")))
+            || (cfg.name.eq_ignore_ascii_case("rea")
+                && cfg.args.iter().any(|a| a.contains("rea-agents")))
+        {
+            if let Some(res) = Self::execute_builtin_native_mcp_tool(&cfg.name, tool_name, arguments)
+            {
+                return res;
+            }
+        }
 
         let effective_url = if !cfg.url.trim().is_empty() {
             cfg.url.trim().to_string()

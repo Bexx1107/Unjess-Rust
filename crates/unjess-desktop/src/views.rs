@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use crate::icons::{
     dark_action_btn, paint_icon, pill_switch, settings_subtab_pill, white_cta_btn, Icon,
 };
@@ -10,7 +12,7 @@ use eframe::egui::{
 };
 use unjess_core::{
     builtin_changelog, outline_file, scan_workspace, McpManager, MemoryStore, ScheduledTask,
-    SchedulerManager, SkillsManager, SubagentDef, ToolEngine, WorkflowDef, Workspace,
+    SchedulerManager, Settings, SkillsManager, SubagentDef, ToolEngine, WorkflowDef, Workspace,
     CURRENT_VERSION,
 };
 
@@ -1346,16 +1348,54 @@ impl UnjessDesktopApp {
                     if dark_action_btn(ui, Some(Icon::RefreshCw), "Test & Fetch Models", true)
                         .clicked()
                     {
-                        self.discovered_models = self.settings_draft.discover_models();
-                        self.status_toast = Some((
-                            format!(
-                                "Fetched {} models from endpoints",
-                                self.discovered_models.len()
-                            ),
-                            std::time::Instant::now(),
-                        ));
+                        let url = self.settings_draft.ollama_base_url.clone();
+                        match Settings::probe_provider_endpoint("ollama", &url) {
+                            Ok(local_models) => {
+                                self.discovered_models = self.settings_draft.discover_models();
+                                let preview = if local_models.is_empty() {
+                                    "server online (0 local models pulled yet)".to_string()
+                                } else {
+                                    let sample: Vec<_> =
+                                        local_models.iter().take(4).cloned().collect();
+                                    format!(
+                                        "{} local model(s) ready ({})",
+                                        local_models.len(),
+                                        sample.join(", ")
+                                    )
+                                };
+                                let msg = format!("✓ Connected to {} — {}", url, preview);
+                                self.ollama_probe_status = Some((true, msg.clone()));
+                                self.status_toast = Some((msg, std::time::Instant::now()));
+                            }
+                            Err(err) => {
+                                self.discovered_models = self.settings_draft.discover_models();
+                                let msg = format!("✗ {}", err);
+                                self.ollama_probe_status = Some((false, msg.clone()));
+                                self.status_toast = Some((
+                                    format!(
+                                        "Ollama unreachable at {} ({} cloud models still available)",
+                                        url,
+                                        self.discovered_models.len()
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
                     }
                 });
+                if let Some((ok, status_txt)) = &self.ollama_probe_status {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(status_txt)
+                            .size(11.5)
+                            .family(FontFamily::Monospace)
+                            .color(if *ok {
+                                theme::ACCENT_EMERALD
+                            } else {
+                                theme::ACCENT_RED
+                            }),
+                    );
+                }
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
@@ -1424,9 +1464,43 @@ impl UnjessDesktopApp {
                             );
                             if dark_action_btn(ui, Some(Icon::RefreshCw), "Fetch", true).clicked()
                             {
-                                self.discovered_models = self.settings_draft.discover_models();
+                                let url = self.settings_draft.lmstudio_base_url.clone();
+                                match Settings::probe_provider_endpoint("LM Studio", &url) {
+                                    Ok(models) => {
+                                        self.discovered_models =
+                                            self.settings_draft.discover_models();
+                                        let msg = format!(
+                                            "✓ Connected ({} LM Studio model(s) loaded)",
+                                            models.len()
+                                        );
+                                        self.lmstudio_probe_status = Some((true, msg.clone()));
+                                        self.status_toast =
+                                            Some((msg, std::time::Instant::now()));
+                                    }
+                                    Err(err) => {
+                                        self.lmstudio_probe_status =
+                                            Some((false, format!("✗ {}", err)));
+                                        self.status_toast = Some((
+                                            format!("LM Studio Fetch: {}", err),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
                             }
                         });
+                        if let Some((ok, status_txt)) = &self.lmstudio_probe_status {
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new(status_txt)
+                                    .size(10.5)
+                                    .family(FontFamily::Monospace)
+                                    .color(if *ok {
+                                        theme::ACCENT_EMERALD
+                                    } else {
+                                        theme::ACCENT_RED
+                                    }),
+                            );
+                        }
                     });
                 });
 
@@ -1450,9 +1524,43 @@ impl UnjessDesktopApp {
                             );
                             if dark_action_btn(ui, Some(Icon::RefreshCw), "Fetch", true).clicked()
                             {
-                                self.discovered_models = self.settings_draft.discover_models();
+                                let url = self.settings_draft.llamacpp_base_url.clone();
+                                match Settings::probe_provider_endpoint("llama.cpp", &url) {
+                                    Ok(models) => {
+                                        self.discovered_models =
+                                            self.settings_draft.discover_models();
+                                        let msg = format!(
+                                            "✓ Connected ({} llama.cpp model(s) loaded)",
+                                            models.len()
+                                        );
+                                        self.llamacpp_probe_status = Some((true, msg.clone()));
+                                        self.status_toast =
+                                            Some((msg, std::time::Instant::now()));
+                                    }
+                                    Err(err) => {
+                                        self.llamacpp_probe_status =
+                                            Some((false, format!("✗ {}", err)));
+                                        self.status_toast = Some((
+                                            format!("llama.cpp Fetch: {}", err),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
                             }
                         });
+                        if let Some((ok, status_txt)) = &self.llamacpp_probe_status {
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new(status_txt)
+                                    .size(10.5)
+                                    .family(FontFamily::Monospace)
+                                    .color(if *ok {
+                                        theme::ACCENT_EMERALD
+                                    } else {
+                                        theme::ACCENT_RED
+                                    }),
+                            );
+                        }
                     });
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
@@ -1975,6 +2083,16 @@ impl UnjessDesktopApp {
     }
 
     fn render_settings_mcp_servers(&mut self, ui: &mut Ui) {
+        let active_probe = self
+            .mcp_probing_target
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        if active_probe.is_none() {
+            // Ensure cache is fresh after any background probe completes
+            self.mcp_cache = McpManager::load();
+        }
+
         egui::Frame::new()
             .fill(theme::BG_CARD)
             .stroke(Stroke::new(1.0, theme::BORDER_SUBTLE))
@@ -1993,19 +2111,102 @@ impl UnjessDesktopApp {
                             .color(theme::TEXT_WHITE),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if dark_action_btn(ui, Some(Icon::RefreshCw), "Probe All Enabled", true)
-                            .clicked()
+                        let btn_label = if active_probe.as_deref() == Some("all") {
+                            "Probing Enabled..."
+                        } else {
+                            "Probe All Enabled"
+                        };
+                        if dark_action_btn(ui, Some(Icon::RefreshCw), btn_label, true).clicked()
+                            && active_probe.is_none()
                         {
-                            let _ = McpManager::probe_all_enabled();
-                            self.mcp_cache = McpManager::load();
+                            if let Ok(mut g) = self.mcp_probing_target.lock() {
+                                *g = Some("all".to_string());
+                            }
+                            self.status_toast = Some((
+                                "Probing all enabled MCP servers...".to_string(),
+                                std::time::Instant::now(),
+                            ));
+                            let target_slot = Arc::clone(&self.mcp_probing_target);
+                            let summary_slot = Arc::clone(&self.mcp_last_summary);
+                            std::thread::spawn(move || {
+                                let results = McpManager::probe_all_enabled();
+                                let ok_count = results.iter().filter(|r| r.ok).count();
+                                let total_tools: usize =
+                                    results.iter().map(|r| r.tools.len()).sum();
+                                let all_ok = !results.is_empty() && ok_count == results.len();
+                                let summary = if results.is_empty() {
+                                    "No MCP servers are currently enabled.".to_string()
+                                } else {
+                                    format!(
+                                        "Probed {} enabled server(s): {} Online · {} tools discovered",
+                                        results.len(),
+                                        ok_count,
+                                        total_tools
+                                    )
+                                };
+                                if let Ok(mut s) = summary_slot.lock() {
+                                    *s = Some((all_ok, summary));
+                                }
+                                if let Ok(mut t) = target_slot.lock() {
+                                    *t = None;
+                                }
+                            });
                         }
                     });
                 });
+
+                if let Some(ref target) = active_probe {
+                    ui.add_space(10.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(24, 22, 14))
+                        .stroke(Stroke::new(1.0, theme::ACCENT_AMBER))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "◌ Probing MCP target '{}' via JSON-RPC 2.0 handshake...",
+                                    target
+                                ))
+                                .size(11.5)
+                                .family(FontFamily::Monospace)
+                                .color(theme::ACCENT_AMBER),
+                            );
+                        });
+                } else if let Some((ok, summary_txt)) = self
+                    .mcp_last_summary
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                {
+                    ui.add_space(10.0);
+                    let col = if ok {
+                        theme::ACCENT_EMERALD
+                    } else {
+                        theme::ACCENT_AMBER
+                    };
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(14, 22, 18))
+                        .stroke(Stroke::new(1.0, col))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(summary_txt)
+                                    .size(11.5)
+                                    .family(FontFamily::Monospace)
+                                    .color(col),
+                            );
+                        });
+                }
 
                 ui.add_space(14.0);
                 let servers = self.mcp_cache.clone();
                 let mut changed = false;
                 for srv in servers {
+                    let is_probing_this =
+                        active_probe.as_deref() == Some(srv.name.as_str())
+                            || (active_probe.as_deref() == Some("all") && srv.enabled);
                     egui::Frame::new()
                         .fill(theme::BG_ACTIVITY)
                         .stroke(Stroke::new(1.0, theme::BORDER_SUBTLE))
@@ -2028,15 +2229,20 @@ impl UnjessDesktopApp {
                                         .strong()
                                         .color(theme::TEXT_WHITE),
                                 );
-                                if let Some(ok) = srv.last_probe_ok {
+                                if is_probing_this {
                                     ui.label(
-                                        RichText::new(if ok {
-                                            "● Online"
-                                        } else {
-                                            "● Error"
-                                        })
-                                        .size(11.0)
-                                        .color(if ok {
+                                        RichText::new("◌ Probing...")
+                                            .size(11.0)
+                                            .color(theme::ACCENT_AMBER),
+                                    );
+                                } else if let Some(ok) = srv.last_probe_ok {
+                                    let badge_txt = if ok {
+                                        format!("● Online ({} tools)", srv.cached_tools.len())
+                                    } else {
+                                        "● Error".to_string()
+                                    };
+                                    ui.label(
+                                        RichText::new(badge_txt).size(11.0).color(if ok {
                                             theme::ACCENT_EMERALD
                                         } else {
                                             theme::ACCENT_RED
@@ -2055,11 +2261,50 @@ impl UnjessDesktopApp {
                                                 },
                                             );
                                         }
-                                        if dark_action_btn(ui, Some(Icon::RefreshCw), "Probe", true)
+                                        let p_label = if is_probing_this {
+                                            "Probing..."
+                                        } else {
+                                            "Probe"
+                                        };
+                                        if dark_action_btn(ui, Some(Icon::RefreshCw), p_label, true)
                                             .clicked()
+                                            && active_probe.is_none()
                                         {
-                                            let _ = McpManager::probe_server(&srv);
-                                            self.mcp_cache = McpManager::load();
+                                            let srv_clone = srv.clone();
+                                            if let Ok(mut g) = self.mcp_probing_target.lock() {
+                                                *g = Some(srv.name.clone());
+                                            }
+                                            self.status_toast = Some((
+                                                format!("Probing MCP server '{}'...", srv.name),
+                                                std::time::Instant::now(),
+                                            ));
+                                            let target_slot = Arc::clone(&self.mcp_probing_target);
+                                            let summary_slot = Arc::clone(&self.mcp_last_summary);
+                                            std::thread::spawn(move || {
+                                                let r = McpManager::probe_server(&srv_clone);
+                                                let summary = if r.ok {
+                                                    format!(
+                                                        "✓ '{}' Online ({} ms · {} tools discovered)",
+                                                        r.name,
+                                                        r.latency_ms,
+                                                        r.tools.len()
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "✗ '{}' probe failed: {}",
+                                                        r.name,
+                                                        r.error.unwrap_or_else(|| {
+                                                            "No response".to_string()
+                                                        })
+                                                    )
+                                                };
+                                                if let Ok(mut s) = summary_slot.lock() {
+                                                    *s = Some((r.ok, summary));
+                                                }
+                                                if let Ok(mut t) = target_slot.lock() {
+                                                    *t = None;
+                                                }
+                                            });
                                         }
                                     },
                                 );
@@ -2080,15 +2325,36 @@ impl UnjessDesktopApp {
                                 ui.add_space(4.0);
                                 let tool_names: Vec<_> =
                                     srv.cached_tools.iter().map(|t| t.name.as_str()).collect();
-                                ui.label(
-                                    RichText::new(format!(
-                                        "Tools ({}): {}",
-                                        tool_names.len(),
-                                        tool_names.join(", ")
-                                    ))
-                                    .size(11.0)
-                                    .color(theme::ACCENT_EMERALD),
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "Tools ({}): {}",
+                                            tool_names.len(),
+                                            tool_names.join(", ")
+                                        ))
+                                        .size(11.0)
+                                        .color(theme::ACCENT_EMERALD),
+                                    )
+                                    .wrap(),
                                 );
+                            }
+                            if srv.last_probe_ok == Some(false) {
+                                if let Some(ref err_msg) = srv.last_error {
+                                    if !err_msg.trim().is_empty() {
+                                        ui.add_space(4.0);
+                                        let short_err: String =
+                                            err_msg.chars().take(180).collect();
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!("Error: {}", short_err))
+                                                    .size(11.0)
+                                                    .family(FontFamily::Monospace)
+                                                    .color(theme::ACCENT_RED),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                }
                             }
                         });
                     ui.add_space(8.0);
@@ -2261,6 +2527,11 @@ impl UnjessDesktopApp {
     }
 
     fn render_settings_updates_changelog(&mut self, ui: &mut Ui) {
+        let is_checking = self.update_checking.load(Ordering::Relaxed);
+        if is_checking {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
         egui::Frame::new()
             .fill(theme::BG_CARD)
             .stroke(Stroke::new(1.0, theme::BORDER_SUBTLE))
@@ -2281,22 +2552,149 @@ impl UnjessDesktopApp {
                         );
                         ui.label(
                             RichText::new(
-                                "Compiled natively with eframe/egui (zero HTML, zero JS, zero WebView2).",
+                                "Compiled natively with eframe/egui (zero HTML, zero JS, zero WebView2). Connected to github.com/Bexx1107/Unjess-Rust.",
                             )
                             .size(12.0)
                             .color(theme::TEXT_SECONDARY),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if white_cta_btn(ui, Some(Icon::RefreshCw), "Check for Updates").clicked()
+                        let btn_label = if is_checking {
+                            "◌ Checking GitHub..."
+                        } else {
+                            "Check for Updates"
+                        };
+                        if white_cta_btn(ui, Some(Icon::RefreshCw), btn_label).clicked()
+                            && !is_checking
                         {
+                            let server_url = self.settings_draft.update_server_url.clone();
+                            let checking_flag = Arc::clone(&self.update_checking);
+                            let result_slot = Arc::clone(&self.update_check_result);
+                            checking_flag.store(true, Ordering::Relaxed);
                             self.status_toast = Some((
-                                format!("Unjess v{} is up to date.", CURRENT_VERSION),
+                                "Checking github.com/Bexx1107/Unjess-Rust for updates...".to_string(),
                                 std::time::Instant::now(),
                             ));
+                            std::thread::spawn(move || {
+                                let res =
+                                    unjess_core::updater::check_for_updates_blocking(&server_url);
+                                if let Ok(mut slot) = result_slot.lock() {
+                                    *slot = Some(res);
+                                }
+                                checking_flag.store(false, Ordering::Relaxed);
+                            });
+                        }
+                        if dark_action_btn(ui, Some(Icon::Globe), "GitHub Repo", false).clicked() {
+                            self.browser_query_buf =
+                                "https://github.com/Bexx1107/Unjess-Rust".to_string();
+                            self.active_tab = MainTab::Browser;
                         }
                     });
                 });
+
+                let check_res_opt = self
+                    .update_check_result
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone());
+                if let Some(check_res) = check_res_opt {
+                    ui.add_space(14.0);
+                    let (border_col, fill_col) = match &check_res {
+                        Ok(st) if st.update_available => (
+                            theme::ACCENT_CYAN,
+                            Color32::from_rgba_unmultiplied(6, 182, 212, 18),
+                        ),
+                        Ok(_) => (
+                            Color32::from_rgba_unmultiplied(16, 185, 129, 90),
+                            Color32::from_rgba_unmultiplied(16, 185, 129, 14),
+                        ),
+                        Err(_) => (
+                            Color32::from_rgba_unmultiplied(239, 68, 68, 90),
+                            Color32::from_rgba_unmultiplied(239, 68, 68, 14),
+                        ),
+                    };
+                    egui::Frame::new()
+                        .fill(fill_col)
+                        .stroke(Stroke::new(1.0, border_col))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(14, 12))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            match check_res {
+                                Ok(st) => {
+                                    ui.horizontal(|ui| {
+                                        if st.update_available {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "↑ Update Available: v{} (Installed: v{})",
+                                                    st.latest_version, st.current_version
+                                                ))
+                                                .size(12.5)
+                                                .strong()
+                                                .color(theme::ACCENT_CYAN),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "✓ Up to Date — Unjess v{} matches latest on GitHub (Bexx1107/Unjess-Rust)",
+                                                    st.current_version
+                                                ))
+                                                .size(12.5)
+                                                .strong()
+                                                .color(theme::ACCENT_EMERALD),
+                                            );
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if st.update_available {
+                                                    if dark_action_btn(
+                                                        ui,
+                                                        Some(Icon::Globe),
+                                                        "Download Release",
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        let target = if st.download_url.is_empty() {
+                                                            "https://github.com/Bexx1107/Unjess-Rust/releases"
+                                                                .to_string()
+                                                        } else {
+                                                            st.download_url.clone()
+                                                        };
+                                                        self.browser_query_buf = target;
+                                                        self.active_tab = MainTab::Browser;
+                                                    }
+                                                }
+                                                if !st.sha256.is_empty() {
+                                                    let short_sha = if st.sha256.len() > 16 {
+                                                        format!("{}…", &st.sha256[..16])
+                                                    } else {
+                                                        st.sha256.clone()
+                                                    };
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "SHA-256: {}",
+                                                            short_sha
+                                                        ))
+                                                        .font(FontId::monospace(10.5))
+                                                        .color(theme::TEXT_SECONDARY),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                                Err(err_msg) => {
+                                    ui.label(
+                                        RichText::new(format!("✗ Update check failed: {}", err_msg))
+                                            .size(12.0)
+                                            .color(theme::ACCENT_RED),
+                                    );
+                                }
+                            }
+                        });
+                }
 
                 ui.add_space(16.0);
                 for entry in builtin_changelog() {

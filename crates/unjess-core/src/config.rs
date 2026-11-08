@@ -101,8 +101,7 @@ impl Default for Settings {
             enable_compaction: true,
             accent_color: "#10b981".to_string(),
             auto_update_enabled: true,
-            update_server_url: "https://api.github.com/repos/Bexx1107/unjess/releases/latest"
-                .to_string(),
+            update_server_url: "https://github.com/Bexx1107/Unjess-Rust".to_string(),
             custom_providers: Vec::new(),
             max_cost_per_session: 0.0,
             fallback_models: Vec::new(),
@@ -201,6 +200,11 @@ impl Settings {
         }
         if settings.model.trim().is_empty() {
             settings.model = "qwen2.5-coder:7b".to_string();
+        }
+        if settings.update_server_url.trim().is_empty()
+            || settings.update_server_url.contains("Bexx1107/unjess")
+        {
+            settings.update_server_url = "https://github.com/Bexx1107/Unjess-Rust".to_string();
         }
         let prev_provider = settings.provider.clone();
         settings.sync_provider_with_model();
@@ -1002,6 +1006,91 @@ impl Settings {
         }
 
         models
+    }
+
+    /// Probes a specific local/LAN LLM endpoint (`ollama`, `lmstudio`, or `llamacpp`)
+    /// and returns the list of discovered model IDs or a descriptive connection error.
+    pub fn probe_provider_endpoint(
+        provider_kind: &str,
+        base_url: &str,
+    ) -> Result<Vec<String>, String> {
+        let clean_base = base_url.trim().trim_end_matches('/').to_string();
+        if clean_base.is_empty() {
+            return Err("Server URL is empty".to_string());
+        }
+        let kind = provider_kind.trim().to_lowercase();
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .map_err(|e| e.to_string())?;
+
+            if kind == "ollama" {
+                let url = format!("{}/api/tags", clean_base);
+                let resp = client.get(&url).send().map_err(|e| {
+                    format!(
+                        "Could not connect to Ollama at {} ({})",
+                        clean_base,
+                        e.without_url()
+                    )
+                })?;
+                if !resp.status().is_success() {
+                    return Err(format!(
+                        "Ollama at {} returned HTTP {}",
+                        clean_base,
+                        resp.status()
+                    ));
+                }
+                let json: serde_json::Value = resp
+                    .json()
+                    .map_err(|e| format!("Invalid JSON from {}: {}", url, e))?;
+                let mut names = Vec::new();
+                if let Some(arr) = json.get("models").and_then(|m| m.as_array()) {
+                    for item in arr {
+                        if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                Ok(names)
+            } else {
+                let url = if clean_base.ends_with("/v1") {
+                    format!("{}/models", clean_base)
+                } else {
+                    format!("{}/v1/models", clean_base)
+                };
+                let resp = client.get(&url).send().map_err(|e| {
+                    format!(
+                        "Could not connect to {} at {} ({})",
+                        kind,
+                        clean_base,
+                        e.without_url()
+                    )
+                })?;
+                if !resp.status().is_success() {
+                    return Err(format!(
+                        "{} at {} returned HTTP {}",
+                        kind,
+                        clean_base,
+                        resp.status()
+                    ));
+                }
+                let json: serde_json::Value = resp
+                    .json()
+                    .map_err(|e| format!("Invalid JSON from {}: {}", url, e))?;
+                let mut ids = Vec::new();
+                if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+                    for item in arr {
+                        if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                            ids.push(id.to_string());
+                        }
+                    }
+                }
+                Ok(ids)
+            }
+        })
+        .join()
+        .unwrap_or_else(|_| Err("Endpoint probe thread panicked".to_string()))
     }
 }
 

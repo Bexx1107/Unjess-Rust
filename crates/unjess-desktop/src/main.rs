@@ -154,6 +154,14 @@ pub struct UnjessDesktopApp {
     pub tool_enabled_web: bool,
 
     pub status_toast: Option<(String, Instant)>,
+    pub ollama_probe_status: Option<(bool, String)>,
+    pub lmstudio_probe_status: Option<(bool, String)>,
+    pub llamacpp_probe_status: Option<(bool, String)>,
+    pub mcp_probing_target: Arc<std::sync::Mutex<Option<String>>>,
+    pub mcp_last_summary: Arc<std::sync::Mutex<Option<(bool, String)>>>,
+    pub update_checking: Arc<std::sync::atomic::AtomicBool>,
+    pub update_check_result:
+        Arc<std::sync::Mutex<Option<Result<unjess_core::updater::UpdateCheckResult, String>>>>,
 }
 
 impl UnjessDesktopApp {
@@ -253,6 +261,13 @@ impl UnjessDesktopApp {
             tool_enabled_grep: true,
             tool_enabled_web: true,
             status_toast: None,
+            ollama_probe_status: None,
+            lmstudio_probe_status: None,
+            llamacpp_probe_status: None,
+            mcp_probing_target: Arc::new(std::sync::Mutex::new(None)),
+            mcp_last_summary: Arc::new(std::sync::Mutex::new(None)),
+            update_checking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_check_result: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -2672,8 +2687,18 @@ impl UnjessDesktopApp {
 
 impl eframe::App for UnjessDesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keep UI responsive during live agent streaming
-        if self.hm.live_turn_snapshot().running {
+        // Keep UI responsive during live agent streaming or background probes/update checks
+        let mcp_busy = self
+            .mcp_probing_target
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some();
+        let upd_busy = self
+            .update_checking
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        if self.hm.live_turn_snapshot().running || mcp_busy || upd_busy {
             ctx.request_repaint_after(Duration::from_millis(80));
         } else if self.last_cache_refresh.elapsed() > Duration::from_secs(12) {
             self.refresh_workspace_cache();
@@ -2717,6 +2742,53 @@ impl eframe::App for UnjessDesktopApp {
 
         // Floating Modals & Terminal Drawer
         self.render_modals(ctx);
+
+        // Floating Status Toast Notification (bottom-right)
+        if let Some((msg, ts)) = self.status_toast.clone() {
+            if ts.elapsed() < Duration::from_secs(5) {
+                ctx.request_repaint_after(Duration::from_millis(200));
+                let is_err = msg.contains("failed")
+                    || msg.contains("Error")
+                    || msg.contains("offline")
+                    || msg.contains("Could not");
+                let accent = if is_err {
+                    theme::ACCENT_RED
+                } else {
+                    theme::ACCENT_EMERALD
+                };
+                egui::Area::new(egui::Id::new("global_status_toast_area"))
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -24.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(18, 20, 24))
+                            .stroke(Stroke::new(1.2, accent))
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(Margin::symmetric(16, 11))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let (dr, _) = ui.allocate_exact_size(
+                                        egui::vec2(8.0, 8.0),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(dr.center(), 4.0, accent);
+                                    ui.label(
+                                        RichText::new(&msg)
+                                            .size(12.5)
+                                            .strong()
+                                            .color(theme::TEXT_WHITE),
+                                    );
+                                    ui.add_space(6.0);
+                                    if icon_btn(ui, Icon::X, false, "Dismiss").clicked() {
+                                        self.status_toast = None;
+                                    }
+                                });
+                            });
+                    });
+            } else {
+                self.status_toast = None;
+            }
+        }
     }
 }
 
