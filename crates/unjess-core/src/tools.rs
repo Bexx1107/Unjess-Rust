@@ -7,7 +7,9 @@
 //! JSON schema definitions for LLM tool calling.
 
 use crate::codeintel::{
-    extract_imports, find_callers, find_symbol_definitions, generate_repo_map, outline_file,
+    debug_trace_command, edit_symbol, extract_imports, find_callers, find_symbol_definitions,
+    generate_repo_map, git_archeology, outline_file, rename_symbol_across_repo,
+    run_post_edit_check,
 };
 use crate::config::Settings;
 use crate::mcp::{McpManager, McpServerConfig};
@@ -16,14 +18,16 @@ use crate::skills::SkillsManager;
 use crate::workspace::{Workspace, WorkspaceError};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -34,8 +38,8 @@ pub enum ToolError {
     Workspace(#[from] WorkspaceError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("File edit failed: target string was not found in '{0}'")]
-    TargetNotFound(String),
+    #[error("File edit failed: target string was not found in '{0}'{1}")]
+    TargetNotFound(String, String),
     #[error("File edit failed: target string matched {0} times (at lines {1}) in '{2}' — include more context lines or set replace_all: true")]
     AmbiguousMatch(usize, String, String),
     #[error("File already exists: '{0}' (pass overwrite: true)")]
@@ -76,16 +80,106 @@ pub struct DirEntryInfo {
     pub size_bytes: u64,
 }
 
+/// Structured checklist item managed via the `todo_write` Frontier tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: String, // "pending" | "in_progress" | "completed" | "cancelled"
+    #[serde(default)]
+    pub priority: String, // "high" | "medium" | "low"
+}
+
+/// User/agent synthesized custom tool definition stored in `~/.unjess-rust/custom_tools/tools.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SynthesizedToolDef {
+    pub name: String,
+    pub description: String,
+    pub script_lang: String,
+    pub script_path: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Extracts negative file modification constraints from a user prompt
+/// (e.g. "Do not modify `/app/run_pretrain.sh`", "Never touch `config.yaml`", "leave `test_eval.py` unchanged").
+pub fn extract_protected_paths_from_prompt(prompt: &str) -> Vec<String> {
+    let mut protected = Vec::new();
+    let split_re =
+        Regex::new(r"(?i)(?:\r?\n|;|!|\.\s+|\b(?:but|however|instead)\b)").ok();
+    let clauses: Vec<&str> = match split_re {
+        Some(ref sre) => sre.split(prompt).collect(),
+        None => vec![prompt],
+    };
+
+    let patterns = [
+        r"(?i)(?:do\s+not|don't|never|must\s+not|cannot|can't)\s+(?:modify|edit|change|touch|alter|overwrite|delete|remove)\s+(.+)",
+        r"(?i)without\s+(?:modifying|editing|changing|touching|altering)\s+(.+)",
+        r"(?i)(?:leave|keep)\s+(.+?)\s+(?:unchanged|untouched|as-is|as\s+is|intact)",
+    ];
+    let token_re = Regex::new(r#"[`"']([^`"'\s]+)[`"']|([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+)"#).ok();
+
+    for sentence in clauses {
+        for pat in patterns {
+            if let Ok(re) = Regex::new(pat) {
+                for cap in re.captures_iter(sentence) {
+                    let Some(clause) = cap.get(1).map(|m| m.as_str()) else {
+                        continue;
+                    };
+                    if let Some(ref tre) = token_re {
+                        for tcap in tre.captures_iter(clause) {
+                            let raw = tcap
+                                .get(1)
+                                .or_else(|| tcap.get(2))
+                                .map(|m| m.as_str())
+                                .unwrap_or("");
+                            let cleaned = raw
+                                .trim_matches(|c: char| {
+                                    matches!(
+                                        c,
+                                        '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '.'
+                                    )
+                                })
+                                .replace('\\', "/");
+                            if cleaned.len() >= 3
+                                && (cleaned.contains('.') || cleaned.contains('/'))
+                                && !cleaned.ends_with('.')
+                                && !protected
+                                    .iter()
+                                    .any(|p: &String| p.eq_ignore_ascii_case(&cleaned))
+                            {
+                                protected.push(cleaned);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    protected
+}
+
+#[derive(Clone)]
 pub struct ToolEngine {
     workspace: Workspace,
     abort_flag: Option<Arc<AtomicBool>>,
+    session_cwd: Arc<Mutex<PathBuf>>,
+    session_env: Arc<Mutex<HashMap<String, String>>>,
+    protected_paths: Arc<Mutex<Vec<String>>>,
+    read_files: Arc<Mutex<HashMap<String, u64>>>,
+    todo_items: Arc<Mutex<Vec<TodoItem>>>,
 }
 
 impl ToolEngine {
     pub fn new(workspace: Workspace) -> Self {
+        let initial_cwd = workspace.root().to_path_buf();
         Self {
             workspace,
             abort_flag: None,
+            session_cwd: Arc::new(Mutex::new(initial_cwd)),
+            session_env: Arc::new(Mutex::new(HashMap::new())),
+            protected_paths: Arc::new(Mutex::new(Vec::new())),
+            read_files: Arc::new(Mutex::new(HashMap::new())),
+            todo_items: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -96,6 +190,96 @@ impl ToolEngine {
 
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+
+    /// Returns the current persistent working directory of the shell session.
+    pub fn session_cwd(&self) -> PathBuf {
+        self.session_cwd
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| self.workspace.root().to_path_buf())
+    }
+
+    /// Returns a snapshot of persistent environment variables set during the shell session.
+    pub fn session_env(&self) -> HashMap<String, String> {
+        self.session_env
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Configures paths that must not be modified or deleted during this turn.
+    pub fn set_protected_paths(&self, paths: Vec<String>) {
+        if let Ok(mut guard) = self.protected_paths.lock() {
+            *guard = paths;
+        }
+    }
+
+    /// Returns the list of protected file paths.
+    pub fn protected_paths(&self) -> Vec<String> {
+        self.protected_paths
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns the current structured todo checklist items.
+    pub fn todo_items(&self) -> Vec<TodoItem> {
+        self.todo_items
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Checks whether `candidate_path` matches any protected path constraint.
+    pub fn check_protected_path(&self, candidate_path: &str) -> Result<(), ToolError> {
+        let norm_cand = candidate_path
+            .trim()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_lowercase();
+        let cand_base = Path::new(&norm_cand)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        for prot in self.protected_paths() {
+            let norm_prot = prot
+                .trim()
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_lowercase();
+            let prot_base = Path::new(&norm_prot)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+
+            let matched = norm_cand == norm_prot
+                || norm_cand.ends_with(&format!("/{}", norm_prot.trim_start_matches('/')))
+                || norm_prot.ends_with(&format!("/{}", norm_cand.trim_start_matches('/')))
+                || (!prot_base.is_empty() && ! norm_prot.contains('/') && cand_base == prot_base);
+
+            if matched {
+                return Err(ToolError::Execution(format!(
+                    "Protected file constraint: '{}' is marked as DO NOT MODIFY by the user prompt.",
+                    prot
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn hash_content(content: &str) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        content.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn record_file_snapshot(&self, rel_path: &str, content: &str) {
+        let norm = rel_path.replace('\\', "/").trim_start_matches("./").to_string();
+        if let Ok(mut guard) = self.read_files.lock() {
+            guard.insert(norm, Self::hash_content(content));
+        }
     }
 
     /// Resolves a path inside the active workspace OR inside any registered skill directory
@@ -199,6 +383,7 @@ impl ToolEngine {
     ) -> Result<String, ToolError> {
         let abs_path = self.resolve_skill_or_workspace_path(rel_path, false)?;
         let content = fs::read_to_string(&abs_path)?;
+        self.record_file_snapshot(rel_path, &content);
         let norm_rel = rel_path.replace('\\', "/");
 
         let lines: Vec<&str> = content.lines().collect();
@@ -241,6 +426,7 @@ impl ToolEngine {
         content: &str,
         overwrite: bool,
     ) -> Result<FileDiff, ToolError> {
+        self.check_protected_path(rel_path)?;
         let abs_path = self.workspace.resolve(rel_path)?;
         let existed = abs_path.exists();
 
@@ -259,6 +445,7 @@ impl ToolEngine {
         }
 
         fs::write(&abs_path, content)?;
+        self.record_file_snapshot(rel_path, content);
 
         let status = if existed { "modified" } else { "created" };
         Ok(Self::compute_diff(
@@ -272,6 +459,7 @@ impl ToolEngine {
     /// Deletes a file within the workspace and returns a `FileDiff` with `status: "deleted"`
     /// so it can be reverted with 1 click.
     pub fn delete_file(&self, rel_path: &str) -> Result<FileDiff, ToolError> {
+        self.check_protected_path(rel_path)?;
         let abs_path = self.workspace.resolve(rel_path)?;
         if !abs_path.is_file() {
             return Err(ToolError::Execution(format!(
@@ -290,8 +478,8 @@ impl ToolEngine {
     }
 
     /// Edits a file by replacing `target` with `replacement`.
-    /// Supports exact matching first, then falls back to normalized line-ending (`\r\n` vs `\n`)
-    /// and trimmed line matching so minor whitespace differences never break autonomous edits.
+    /// Supports exact matching first, then falls back to normalized line-ending (`\r\n` vs `\n`),
+    /// `read_file` line-number prefix stripping (`123: `), and smart-indentation trimmed line matching.
     pub fn edit_file(
         &self,
         rel_path: &str,
@@ -309,6 +497,7 @@ impl ToolEngine {
         replacement: &str,
         replace_all: bool,
     ) -> Result<FileDiff, ToolError> {
+        self.check_protected_path(rel_path)?;
         let abs_path = self.workspace.resolve(rel_path)?;
         let original_content = fs::read_to_string(&abs_path)?;
         let new_content = Self::apply_replacement(
@@ -320,6 +509,7 @@ impl ToolEngine {
         )?;
 
         fs::write(&abs_path, &new_content)?;
+        self.record_file_snapshot(rel_path, &new_content);
         Ok(Self::compute_diff(
             rel_path,
             "modified",
@@ -334,6 +524,7 @@ impl ToolEngine {
         rel_path: &str,
         edits: &[(String, String)],
     ) -> Result<FileDiff, ToolError> {
+        self.check_protected_path(rel_path)?;
         if edits.is_empty() {
             return Err(ToolError::Execution("edits array cannot be empty".to_string()));
         }
@@ -344,6 +535,7 @@ impl ToolEngine {
             working = Self::apply_replacement(rel_path, &working, target, replacement, false)?;
         }
         fs::write(&abs_path, &working)?;
+        self.record_file_snapshot(rel_path, &working);
         Ok(Self::compute_diff(
             rel_path,
             "modified",
@@ -361,6 +553,36 @@ impl ToolEngine {
         lines.join(", ")
     }
 
+    /// Strips accidental `read_file` line prefixes (`  12: code`) if >= 50% of non-empty lines have them.
+    pub fn strip_read_file_line_prefixes(text: &str) -> Option<String> {
+        let prefix_re = Regex::new(r"^\s*\d+:\s?(.*)$").ok()?;
+        let lines: Vec<&str> = text.lines().collect();
+        let non_empty: Vec<&&str> = lines.iter().filter(|l| !l.trim().is_empty()).collect();
+        if non_empty.is_empty() {
+            return None;
+        }
+        let prefixed_count = non_empty.iter().filter(|l| prefix_re.is_match(l)).count();
+        if prefixed_count * 2 < non_empty.len() {
+            return None;
+        }
+        let stripped: Vec<String> = lines
+            .into_iter()
+            .map(|l| {
+                if let Some(cap) = prefix_re.captures(l) {
+                    cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        let joined = stripped.join("\n");
+        if joined == text {
+            None
+        } else {
+            Some(joined)
+        }
+    }
+
     fn apply_replacement(
         rel_path: &str,
         original_content: &str,
@@ -369,14 +591,50 @@ impl ToolEngine {
         replace_all: bool,
     ) -> Result<String, ToolError> {
         if target.is_empty() {
-            return Err(ToolError::TargetNotFound(rel_path.to_string()));
+            return Err(ToolError::TargetNotFound(
+                rel_path.to_string(),
+                String::new(),
+            ));
         }
+
+        if let Some(res) =
+            Self::try_apply_replacement_core(rel_path, original_content, target, replacement, replace_all)?
+        {
+            return Ok(res);
+        }
+
+        // Fallback: if the LLM accidentally copied `123: ` line number prefixes from `read_file`, strip them
+        if let Some(stripped_target) = Self::strip_read_file_line_prefixes(target) {
+            let stripped_replacement = Self::strip_read_file_line_prefixes(replacement)
+                .unwrap_or_else(|| replacement.to_string());
+            if let Some(res) = Self::try_apply_replacement_core(
+                rel_path,
+                original_content,
+                &stripped_target,
+                &stripped_replacement,
+                replace_all,
+            )? {
+                return Ok(res);
+            }
+        }
+
+        let preview = Self::find_closest_match_preview(original_content, target);
+        Err(ToolError::TargetNotFound(rel_path.to_string(), preview))
+    }
+
+    fn try_apply_replacement_core(
+        rel_path: &str,
+        original_content: &str,
+        target: &str,
+        replacement: &str,
+        replace_all: bool,
+    ) -> Result<Option<String>, ToolError> {
         let exact_matches = original_content.matches(target).count();
         if exact_matches == 1 {
-            return Ok(original_content.replacen(target, replacement, 1));
+            return Ok(Some(original_content.replacen(target, replacement, 1)));
         } else if exact_matches > 1 {
             if replace_all {
-                return Ok(original_content.replace(target, replacement));
+                return Ok(Some(original_content.replace(target, replacement)));
             }
             let line_nums = Self::match_line_numbers(original_content, target);
             return Err(ToolError::AmbiguousMatch(
@@ -396,11 +654,11 @@ impl ToolEngine {
             } else {
                 norm_content.replacen(&norm_target, &norm_replacement, 1)
             };
-            return Ok(if original_content.contains("\r\n") {
+            return Ok(Some(if original_content.contains("\r\n") {
                 replaced.replace('\n', "\r\n")
             } else {
                 replaced
-            });
+            }));
         } else if norm_matches > 1 {
             let line_nums = Self::match_line_numbers(&norm_content, &norm_target);
             return Err(ToolError::AmbiguousMatch(
@@ -410,18 +668,17 @@ impl ToolEngine {
             ));
         }
 
-        if let Some(flex_replaced) =
-            Self::flexible_line_replace(original_content, target, replacement)
-        {
-            Ok(flex_replaced)
-        } else {
-            Err(ToolError::TargetNotFound(rel_path.to_string()))
-        }
+        Ok(Self::flexible_line_replace(
+            original_content,
+            target,
+            replacement,
+        ))
     }
 
     fn flexible_line_replace(content: &str, target: &str, replacement: &str) -> Option<String> {
         let content_lines: Vec<&str> = content.lines().collect();
-        let target_lines: Vec<&str> = target.lines().map(|l| l.trim()).collect();
+        let target_raw_lines: Vec<&str> = target.lines().collect();
+        let target_lines: Vec<&str> = target_raw_lines.iter().map(|l| l.trim()).collect();
         if target_lines.is_empty() || target_lines.len() > content_lines.len() {
             return None;
         }
@@ -437,27 +694,32 @@ impl ToolEngine {
             }
         }
         let idx = match_idx?;
-        let file_first_line = content_lines[idx];
-        let file_indent: String = file_first_line
+
+        // Find the first non-empty line in target & matched window to compute relative indentation shift
+        let first_non_empty_offset = (0..target_raw_lines.len())
+            .find(|&o| !target_raw_lines[o].trim().is_empty())
+            .unwrap_or(0);
+        let file_anchor_line = content_lines[idx + first_non_empty_offset];
+        let target_anchor_line = target_raw_lines[first_non_empty_offset];
+
+        let file_indent: String = file_anchor_line
             .chars()
             .take_while(|c| *c == ' ' || *c == '\t')
             .collect();
-        let target_first_has_indent = target
-            .lines()
-            .next()
-            .map(|l| l.starts_with(' ') || l.starts_with('\t'))
-            .unwrap_or(false);
+        let target_indent: String = target_anchor_line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+
+        let shifted_replacement =
+            Self::shift_replacement_indentation(replacement, &target_indent, &file_indent);
 
         let mut out_lines: Vec<String> = content_lines[..idx]
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        for r_line in replacement.lines() {
-            if !target_first_has_indent && !file_indent.is_empty() && !r_line.trim().is_empty() {
-                out_lines.push(format!("{}{}", file_indent, r_line));
-            } else {
-                out_lines.push(r_line.to_string());
-            }
+        for r_line in shifted_replacement.lines() {
+            out_lines.push(r_line.to_string());
         }
         out_lines.extend(
             content_lines[idx + target_lines.len()..]
@@ -470,6 +732,106 @@ impl ToolEngine {
             "\n"
         };
         Some(out_lines.join(sep))
+    }
+
+    /// Shifts the indentation of `replacement` lines from `target_indent` to `file_indent`
+    /// while preserving relative indentation of nested lines.
+    pub fn shift_replacement_indentation(
+        replacement: &str,
+        target_indent: &str,
+        file_indent: &str,
+    ) -> String {
+        if target_indent == file_indent {
+            return replacement.to_string();
+        }
+        let shifted: Vec<String> = replacement
+            .lines()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    return String::new();
+                }
+                if !target_indent.is_empty() && line.starts_with(target_indent) {
+                    format!("{}{}", file_indent, &line[target_indent.len()..])
+                } else if target_indent.is_empty() {
+                    format!("{}{}", file_indent, line)
+                } else {
+                    let line_ws_len = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+                    let strip_len = line_ws_len.min(target_indent.len());
+                    format!("{}{}", file_indent, &line[strip_len..])
+                }
+            })
+            .collect();
+        shifted.join("\n")
+    }
+
+    /// Finds the closest matching lines in `content` when `target` is not found,
+    /// returning a numbered snippet so the LLM can immediately retry with the exact lines.
+    pub fn find_closest_match_preview(content: &str, target: &str) -> String {
+        let content_lines: Vec<&str> = content.lines().collect();
+        if content_lines.is_empty() {
+            return String::new();
+        }
+        let target_non_empty: Vec<&str> = target
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l.len() >= 3)
+            .collect();
+        if target_non_empty.is_empty() {
+            return String::new();
+        }
+
+        let anchor = target_non_empty[0].to_lowercase();
+        let anchor_tokens: Vec<&str> = anchor
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| t.len() >= 2)
+            .collect();
+
+        let mut best_line_idx = None;
+        let mut best_score = 0.0f64;
+
+        for (idx, &line) in content_lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            let mut score = 0.0;
+            if lower == anchor {
+                score = 1.0;
+            } else if lower.contains(&anchor) || anchor.contains(&lower) {
+                let min_l = lower.len().min(anchor.len()) as f64;
+                let max_l = lower.len().max(anchor.len()) as f64;
+                score = 0.65 + 0.30 * (min_l / max_l.max(1.0));
+            } else if !anchor_tokens.is_empty() {
+                let matched_toks = anchor_tokens
+                    .iter()
+                    .filter(|&&tok| lower.contains(tok))
+                    .count();
+                score = (matched_toks as f64) / (anchor_tokens.len() as f64) * 0.75;
+            }
+
+            if score > best_score {
+                best_score = score;
+                best_line_idx = Some(idx);
+            }
+        }
+
+        let Some(center) = best_line_idx.filter(|_| best_score >= 0.35) else {
+            return String::new();
+        };
+
+        let start = center.saturating_sub(2);
+        let end = (center + target.lines().count() + 3).min(content_lines.len());
+        let mut snippet = Vec::new();
+        snippet.push(format!(
+            "\n\nClosest match in file (lines {}..={}):",
+            start + 1,
+            end
+        ));
+        for i in start..end {
+            snippet.push(format!("{:>4}: {}", i + 1, content_lines[i]));
+        }
+        snippet.join("\n")
     }
 
     /// Computes a unified diff using common prefix/suffix stripping and bounded LCS alignment.
@@ -930,36 +1292,338 @@ impl ToolEngine {
         }
     }
 
-    /// Executes a shell command in the workspace root with real timeout and abort enforcement,
+    /// Checks whether a shell command attempts to modify or delete any protected path.
+    fn check_shell_command_protected_paths(&self, cmd: &str) -> Result<(), ToolError> {
+        let protected = self.protected_paths();
+        if protected.is_empty() {
+            return Ok(());
+        }
+        let lower_cmd = cmd.to_lowercase();
+        let has_mutating_op = lower_cmd.contains('>')
+            || lower_cmd.contains("sed -i")
+            || lower_cmd.contains("rm ")
+            || lower_cmd.contains("del ")
+            || lower_cmd.contains("mv ")
+            || lower_cmd.contains("cp ")
+            || lower_cmd.contains("remove-item")
+            || lower_cmd.contains("set-content")
+            || lower_cmd.contains("out-file")
+            || lower_cmd.contains("add-content")
+            || lower_cmd.contains("move-item")
+            || lower_cmd.contains("copy-item")
+            || lower_cmd.contains("truncate ")
+            || lower_cmd.contains("tee ");
+
+        if !has_mutating_op {
+            return Ok(());
+        }
+
+        let norm_cmd = lower_cmd.replace('\\', "/");
+        for prot in protected {
+            let norm_prot = prot
+                .trim()
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_lowercase();
+            let base_prot = Path::new(&norm_prot)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if (!norm_prot.is_empty() && norm_cmd.contains(&norm_prot))
+                || (!base_prot.is_empty() && base_prot.contains('.') && norm_cmd.contains(&base_prot))
+            {
+                return Err(ToolError::Execution(format!(
+                    "Protected file constraint: shell command attempts to modify protected file '{}', which the user explicitly forbade modifying.",
+                    prot
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Translates unquoted `&&` operators into PowerShell 5.1-compatible conditional chains
+    /// (`; if ($? -and ($null -eq $LASTEXITCODE -or $LASTEXITCODE -eq 0)) { ... }`) while leaving
+    /// `&&` inside single or double quotes untouched.
+    pub fn translate_powershell_and_and(cmd: &str) -> String {
+        let chars: Vec<char> = cmd.chars().collect();
+        let mut segments: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut i = 0;
+
+        while i < chars.len() {
+            let c = chars[i];
+            if in_single {
+                current.push(c);
+                if c == '\'' {
+                    if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                        current.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    in_single = false;
+                }
+                i += 1;
+            } else if in_double {
+                current.push(c);
+                if c == '`' && i + 1 < chars.len() {
+                    current.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    in_double = false;
+                }
+                i += 1;
+            } else {
+                if c == '\'' {
+                    in_single = true;
+                    current.push(c);
+                    i += 1;
+                } else if c == '"' {
+                    in_double = true;
+                    current.push(c);
+                    i += 1;
+                } else if c == '&'
+                    && i + 1 < chars.len()
+                    && chars[i + 1] == '&'
+                    && (i + 2 >= chars.len() || chars[i + 2] != '&')
+                {
+                    segments.push(current.trim().to_string());
+                    current.clear();
+                    i += 2;
+                } else {
+                    current.push(c);
+                    i += 1;
+                }
+            }
+        }
+        segments.push(current.trim().to_string());
+
+        let non_empty: Vec<String> = segments.into_iter().filter(|s| !s.is_empty()).collect();
+        if non_empty.len() <= 1 {
+            return cmd.to_string();
+        }
+
+        let mut acc = non_empty.last().cloned().unwrap_or_default();
+        for seg in non_empty[..non_empty.len() - 1].iter().rev() {
+            acc = format!(
+                "$LASTEXITCODE = 0; {}; if ($? -and ($null -eq $LASTEXITCODE -or $LASTEXITCODE -eq 0)) {{ {} }}",
+                seg, acc
+            );
+        }
+        acc
+    }
+
+    /// Encodes a PowerShell script as UTF-16LE Base64 for `-EncodedCommand`.
+    pub fn encode_powershell_utf16le_base64(script: &str) -> String {
+        let mut bytes = Vec::with_capacity(script.len() * 2);
+        for unit in script.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(ALPHABET[(triple & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    /// Extracts `__UNJESS_STATE_PWD__` and `__UNJESS_STATE_ENV_BEGIN__` sentinels from stdout,
+    /// updates persistent `session_cwd` and `session_env`, and returns cleaned stdout.
+    fn extract_and_strip_shell_state(&self, raw_stdout: &str) -> String {
+        const PWD_MARKER: &str = "__UNJESS_STATE_PWD__";
+        const ENV_BEGIN: &str = "__UNJESS_STATE_ENV_BEGIN__";
+        const ENV_END: &str = "__UNJESS_STATE_ENV_END__";
+
+        let Some(pwd_pos) = raw_stdout.rfind(PWD_MARKER) else {
+            return raw_stdout.to_string();
+        };
+
+        let user_stdout = raw_stdout[..pwd_pos].trim_end_matches(['\r', '\n']);
+        let after_pwd = &raw_stdout[pwd_pos + PWD_MARKER.len()..];
+
+        if let Some(env_begin_rel) = after_pwd.find(ENV_BEGIN) {
+            let pwd_str = after_pwd[..env_begin_rel].trim();
+            if !pwd_str.is_empty() {
+                let candidate = PathBuf::from(pwd_str);
+                if candidate.is_dir() {
+                    if let Ok(mut cwd_guard) = self.session_cwd.lock() {
+                        *cwd_guard = candidate;
+                    }
+                }
+            }
+            let after_env_begin = &after_pwd[env_begin_rel + ENV_BEGIN.len()..];
+            let env_block = if let Some(env_end_rel) = after_env_begin.find(ENV_END) {
+                &after_env_begin[..env_end_rel]
+            } else {
+                after_env_begin
+            };
+
+            if let Ok(mut env_guard) = self.session_env.lock() {
+                for line in env_block.lines() {
+                    let trimmed = line.trim();
+                    if let Some((k, v)) = trimmed.split_once('=') {
+                        let key = k.trim();
+                        if !key.is_empty()
+                            && !matches!(
+                                key,
+                                "PWD" | "OLDPWD" | "_" | "SHLVL" | "__UNJESS_EC" | "PSExecutionPolicyPreference"
+                            )
+                        {
+                            env_guard.insert(key.to_string(), v.to_string());
+                        }
+                    }
+                }
+            }
+        } else {
+            let pwd_str = after_pwd.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+            if !pwd_str.is_empty() {
+                let candidate = PathBuf::from(pwd_str);
+                if candidate.is_dir() {
+                    if let Ok(mut cwd_guard) = self.session_cwd.lock() {
+                        *cwd_guard = candidate;
+                    }
+                }
+            }
+        }
+
+        user_stdout.to_string()
+    }
+
+    /// Analyzes shell command errors for common syntax/platform pitfalls, returns an actionable
+    /// `[SYNTAX AUTO-HINT]` string, and persists the learned hint to `~/.unjess-rust/memory/error_hints.json`.
+    pub fn analyze_syntax_error_and_learn(cmd: &str, output: &str, exit_code: i32) -> Option<String> {
+        let lower_out = output.to_lowercase();
+        let lower_cmd = cmd.to_lowercase();
+
+        let hint = if lower_out.contains("is not a valid statement separator") {
+            Some("[SYNTAX AUTO-HINT]: PowerShell 5.1 does not support raw '&&'. Separate commands with ';' or rely on automatic chaining.")
+        } else if (lower_cmd.contains("curl ") || lower_cmd.starts_with("curl"))
+            && (lower_out.contains("invoke-webrequest")
+                || lower_out.contains("parameterbindingexception")
+                || lower_out.contains("positional parameter cannot be found"))
+        {
+            Some("[SYNTAX AUTO-HINT]: In Windows PowerShell, 'curl' is an alias for Invoke-WebRequest. Use 'curl.exe' explicitly when passing standard curl flags (-s, -X, -H, -d).")
+        } else if lower_out.contains("remove-item")
+            && (lower_out.contains("cannot find a parameter with the name 'rf'")
+                || lower_out.contains("cannot find a parameter with the name 'fr'"))
+        {
+            Some("[SYNTAX AUTO-HINT]: In Windows PowerShell, 'rm -rf' fails because 'rm' aliases Remove-Item. Use 'Remove-Item -Recurse -Force <path>' or the 'delete_file' tool.")
+        } else if lower_out.contains("missingendcurlybrace")
+            || lower_out.contains("unexpectedtoken")
+            || lower_out.contains("parsererror")
+            || lower_out.contains("syntax error near unexpected token")
+            || lower_out.contains("unterminated quoted string")
+        {
+            Some("[SYNTAX AUTO-HINT]: Shell parser/quoting error detected. Avoid deeply nested quotes in inline one-liners; prefer writing a script file with write_file or using native tools (read_file, edit_file, grep_search).")
+        } else if exit_code != 0
+            && (lower_cmd.starts_with("sed ") || lower_cmd.contains(" sed "))
+            && lower_out.contains("is not recognized as the name of a cmdlet")
+        {
+            Some("[SYNTAX AUTO-HINT]: 'sed' is not available in Windows PowerShell. Use the 'edit_file' or 'multi_edit_file' tool instead.")
+        } else {
+            None
+        }?;
+
+        // Persist to ~/.unjess-rust/memory/error_hints.json
+        let hints_dir = Settings::config_dir().join("memory");
+        let _ = fs::create_dir_all(&hints_dir);
+        let hints_file = hints_dir.join("error_hints.json");
+        let mut stored: Vec<String> = fs::read_to_string(&hints_file)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if !stored.iter().any(|h| h == hint) {
+            stored.push(hint.to_string());
+            if stored.len() > 50 {
+                let drain_count = stored.len() - 50;
+                stored.drain(0..drain_count);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(&stored) {
+                let _ = fs::write(&hints_file, json);
+            }
+        }
+
+        Some(hint.to_string())
+    }
+
+    /// Loads previously learned shell error hints from `~/.unjess-rust/memory/error_hints.json`.
+    pub fn load_learned_error_hints() -> Vec<String> {
+        let hints_file = Settings::config_dir().join("memory").join("error_hints.json");
+        fs::read_to_string(hints_file)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Executes a shell command in the persistent session working directory with real timeout and abort enforcement,
     /// capping stdout/stderr pipes to 2 MiB and killing the child process tree if it exceeds the deadline.
     pub fn run_command(&self, cmd: &str, timeout_secs: u64) -> Result<String, ToolError> {
         self.run_command_with_code(cmd, timeout_secs)
             .map(|(out, _)| out)
     }
 
-    /// Executes a shell command in the workspace root and returns `(truncated_output, exit_code)`.
+    /// Executes a shell command in the persistent session working directory and returns `(truncated_output, exit_code)`.
     pub fn run_command_with_code(
         &self,
         cmd: &str,
         timeout_secs: u64,
     ) -> Result<(String, i32), ToolError> {
+        self.check_shell_command_protected_paths(cmd)?;
+
         let effective_timeout = Duration::from_secs(timeout_secs.clamp(1, 3600));
         const MAX_PIPE_BYTES: u64 = 2 * 1024 * 1024;
+
+        let mut active_cwd = self.session_cwd();
+        if !active_cwd.is_dir() {
+            active_cwd = self.workspace.root().to_path_buf();
+            if let Ok(mut guard) = self.session_cwd.lock() {
+                *guard = active_cwd.clone();
+            }
+        }
+        let active_env = self.session_env();
 
         #[cfg(target_os = "windows")]
         let mut child = {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let translated_cmd = Self::translate_powershell_and_and(cmd);
+            let wrapped_ps = format!(
+                "$LASTEXITCODE = 0\n{}\n$__unjess_ec = if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ $LASTEXITCODE }} elseif (-not $?) {{ 1 }} else {{ 0 }}\nWrite-Output \"\"\nWrite-Output \"__UNJESS_STATE_PWD__\"\nWrite-Output (Get-Location).Path\nWrite-Output \"__UNJESS_STATE_ENV_BEGIN__\"\nGet-ChildItem Env: | ForEach-Object {{ Write-Output \"$($_.Name)=$($_.Value)\" }}\nWrite-Output \"__UNJESS_STATE_ENV_END__\"\nexit $__unjess_ec",
+                translated_cmd
+            );
+            let encoded = Self::encode_powershell_utf16le_base64(&wrapped_ps);
             Command::new("powershell")
                 .args([
                     "-NoProfile",
                     "-NonInteractive",
                     "-WindowStyle",
                     "Hidden",
-                    "-Command",
-                    cmd,
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    &encoded,
                 ])
-                .current_dir(self.workspace.root())
+                .current_dir(&active_cwd)
+                .envs(&active_env)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -967,13 +1631,20 @@ impl ToolEngine {
                 .spawn()?
         };
         #[cfg(not(target_os = "windows"))]
-        let mut child = Command::new("sh")
-            .args(["-c", cmd])
-            .current_dir(self.workspace.root())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = {
+            let wrapped_sh = format!(
+                "{}\n__unjess_ec=$?\nprintf \"\\n__UNJESS_STATE_PWD__\\n\"\npwd\nprintf \"__UNJESS_STATE_ENV_BEGIN__\\n\"\nenv\nprintf \"__UNJESS_STATE_ENV_END__\\n\"\nexit $__unjess_ec",
+                cmd
+            );
+            Command::new("sh")
+                .args(["-c", &wrapped_sh])
+                .current_dir(&active_cwd)
+                .envs(&active_env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?
+        };
 
         let child_pid = child.id();
         let stdout_pipe = child.stdout.take();
@@ -1031,7 +1702,8 @@ impl ToolEngine {
 
         let stdout_bytes = stdout_handle.join().unwrap_or_default();
         let stderr_bytes = stderr_handle.join().unwrap_or_default();
-        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let raw_stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stdout = self.extract_and_strip_shell_state(&raw_stdout);
         let stderr = String::from_utf8_lossy(&stderr_bytes);
 
         let mut combined = String::new();
@@ -1062,6 +1734,11 @@ impl ToolEngine {
             combined = format!("(Command completed with exit code {})", exit_code);
         } else if exit_code != 0 {
             combined.push_str(&format!("\n[exit code: {}]", exit_code));
+        }
+
+        if let Some(auto_hint) = Self::analyze_syntax_error_and_learn(cmd, &combined, exit_code) {
+            combined.push_str("\n\n");
+            combined.push_str(&auto_hint);
         }
 
         Ok((Self::truncate_head_tail(&combined, 12000), exit_code))
@@ -1391,6 +2068,205 @@ impl ToolEngine {
         }
     }
 
+    fn format_post_edit_suffix(&self, rel_path: &str) -> String {
+        let check = run_post_edit_check(self.workspace.root(), rel_path);
+        if check.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", check)
+        }
+    }
+
+    fn custom_tools_dir() -> PathBuf {
+        let dir = Settings::config_dir().join("custom_tools");
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    pub fn load_synthesized_tools() -> Vec<SynthesizedToolDef> {
+        let manifest = Self::custom_tools_dir().join("tools.json");
+        fs::read_to_string(manifest)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_synthesized_tools(tools: &[SynthesizedToolDef]) -> Result<(), String> {
+        let manifest = Self::custom_tools_dir().join("tools.json");
+        let json = serde_json::to_string_pretty(tools).map_err(|e| e.to_string())?;
+        fs::write(manifest, json).map_err(|e| e.to_string())
+    }
+
+    fn shadow_sandbox_dir(&self) -> PathBuf {
+        let root_str = self.workspace.root().to_string_lossy();
+        let hash = Self::hash_content(&root_str);
+        std::env::temp_dir().join(format!("unjess-shadow-{:x}", hash))
+    }
+
+    fn copy_workspace_to_shadow(src: &Path, dst: &Path) -> Result<usize, String> {
+        fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+        let mut count = 0usize;
+        let entries = fs::read_dir(src).map_err(|e| e.to_string())?;
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if matches!(
+                file_name.as_str(),
+                ".git" | "target" | "node_modules" | ".venv" | "__pycache__" | "dist" | "build"
+            ) {
+                continue;
+            }
+            let src_path = entry.path();
+            let dst_path = dst.join(&file_name);
+            if src_path.is_dir() {
+                count += Self::copy_workspace_to_shadow(&src_path, &dst_path)?;
+            } else if src_path.is_file() {
+                if let Ok(meta) = src_path.metadata() {
+                    if meta.len() <= 10 * 1024 * 1024 {
+                        let _ = fs::copy(&src_path, &dst_path);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn execute_shadow_sandbox(&self, args: &serde_json::Value) -> (String, bool, Option<FileDiff>) {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("status")
+            .trim()
+            .to_lowercase();
+        let shadow_dir = self.shadow_sandbox_dir();
+
+        match action.as_str() {
+            "create" => {
+                if shadow_dir.exists() {
+                    let _ = fs::remove_dir_all(&shadow_dir);
+                }
+                match Self::copy_workspace_to_shadow(self.workspace.root(), &shadow_dir) {
+                    Ok(files) => (
+                        format!(
+                            "Created Copy-on-Write shadow sandbox at '{}' ({} files snapshotted).",
+                            shadow_dir.display(),
+                            files
+                        ),
+                        true,
+                        None,
+                    ),
+                    Err(e) => (format!("Error creating shadow sandbox: {}", e), false, None),
+                }
+            }
+            "diff" | "status" => {
+                if !shadow_dir.exists() {
+                    return (
+                        "No active shadow sandbox. Call shadow_sandbox with action: 'create' first."
+                            .to_string(),
+                        false,
+                        None,
+                    );
+                }
+                let Ok(shadow_ws) = Workspace::new(&shadow_dir) else {
+                    return ("Failed to open shadow workspace".to_string(), false, None);
+                };
+                let shadow_files = shadow_ws.list_all_files(2000);
+                let mut diffs = Vec::new();
+                for rel in shadow_files {
+                    let s_path = shadow_dir.join(&rel);
+                    let w_path = self.workspace.root().join(&rel);
+                    let s_txt = fs::read_to_string(&s_path).unwrap_or_default();
+                    let w_txt = fs::read_to_string(&w_path).unwrap_or_default();
+                    if s_txt != w_txt {
+                        let d = Self::compute_diff(&rel, if w_path.exists() { "modified" } else { "created" }, &w_txt, &s_txt);
+                        diffs.push(format!(
+                            "### {} ({}, +{} -{} lines)\n{}",
+                            d.path, d.status, d.additions, d.deletions, d.diff
+                        ));
+                    }
+                }
+                if diffs.is_empty() {
+                    ("Shadow sandbox matches main workspace (0 modified files).".to_string(), true, None)
+                } else {
+                    (diffs.join("\n\n"), true, None)
+                }
+            }
+            "promote" => {
+                if !shadow_dir.exists() {
+                    return ("No active shadow sandbox to promote.".to_string(), false, None);
+                }
+                let Ok(shadow_ws) = Workspace::new(&shadow_dir) else {
+                    return ("Failed to open shadow workspace".to_string(), false, None);
+                };
+                let shadow_files = shadow_ws.list_all_files(2000);
+                let mut promoted = 0usize;
+                for rel in shadow_files {
+                    if self.check_protected_path(&rel).is_err() {
+                        continue;
+                    }
+                    let s_path = shadow_dir.join(&rel);
+                    let w_path = self.workspace.root().join(&rel);
+                    let s_txt = fs::read_to_string(&s_path).unwrap_or_default();
+                    let w_txt = fs::read_to_string(&w_path).unwrap_or_default();
+                    if s_txt != w_txt {
+                        if let Some(p) = w_path.parent() {
+                            let _ = fs::create_dir_all(p);
+                        }
+                        if fs::write(&w_path, &s_txt).is_ok() {
+                            promoted += 1;
+                        }
+                    }
+                }
+                (
+                    format!("Promoted {} modified/created file(s) from shadow sandbox into main workspace.", promoted),
+                    true,
+                    None,
+                )
+            }
+            "discard" => {
+                if shadow_dir.exists() {
+                    let _ = fs::remove_dir_all(&shadow_dir);
+                    ("Discarded and removed shadow sandbox.".to_string(), true, None)
+                } else {
+                    ("Shadow sandbox was already clean/non-existent.".to_string(), true, None)
+                }
+            }
+            "revert_hunk" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                if path.trim().is_empty() {
+                    return ("Error: 'path' is required for revert_hunk".to_string(), false, None);
+                }
+                if shadow_dir.exists() {
+                    let s_path = shadow_dir.join(path.trim());
+                    let w_path = self.workspace.root().join(path.trim());
+                    if s_path.is_file() {
+                        if let Ok(orig) = fs::read_to_string(&s_path) {
+                            let _ = fs::write(&w_path, orig);
+                            return (
+                                format!("Reverted '{}' from shadow sandbox snapshot.", path),
+                                true,
+                                None,
+                            );
+                        }
+                    }
+                }
+                (
+                    format!("No shadow snapshot found for '{}'", path),
+                    false,
+                    None,
+                )
+            }
+            other => (
+                format!(
+                    "Unknown shadow_sandbox action '{}' (expected 'create', 'diff', 'promote', 'discard', or 'revert_hunk')",
+                    other
+                ),
+                false,
+                None,
+            ),
+        }
+    }
+
     /// Dispatches a tool call by `name` with JSON `args`, returning `(result_text, is_ok, optional_file_diff)`.
     pub fn execute_tool(
         &mut self,
@@ -1442,14 +2318,17 @@ impl ToolEngine {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
                 match self.write_file(&path, &content, overwrite) {
-                    Ok(diff) => (
-                        format!(
-                            "Successfully wrote '{}' (+{} -{} lines)",
-                            diff.path, diff.additions, diff.deletions
-                        ),
-                        true,
-                        Some(diff),
-                    ),
+                    Ok(diff) => {
+                        let verify_suffix = self.format_post_edit_suffix(&diff.path);
+                        (
+                            format!(
+                                "Successfully wrote '{}' (+{} -{} lines){}",
+                                diff.path, diff.additions, diff.deletions, verify_suffix
+                            ),
+                            true,
+                            Some(diff),
+                        )
+                    }
                     Err(e) => (format!("Error: {}", e), false, None),
                 }
             }
@@ -1504,14 +2383,17 @@ impl ToolEngine {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 match self.edit_file_ext(&path, &target, &replacement, replace_all) {
-                    Ok(diff) => (
-                        format!(
-                            "Successfully edited '{}' (+{} -{} lines)",
-                            diff.path, diff.additions, diff.deletions
-                        ),
-                        true,
-                        Some(diff),
-                    ),
+                    Ok(diff) => {
+                        let verify_suffix = self.format_post_edit_suffix(&diff.path);
+                        (
+                            format!(
+                                "Successfully edited '{}' (+{} -{} lines){}",
+                                diff.path, diff.additions, diff.deletions, verify_suffix
+                            ),
+                            true,
+                            Some(diff),
+                        )
+                    }
                     Err(e) => (format!("Error: {}", e), false, None),
                 }
             }
@@ -1545,17 +2427,21 @@ impl ToolEngine {
                     })
                     .unwrap_or_default();
                 match self.multi_edit_file(&path, &edits_vec) {
-                    Ok(diff) => (
-                        format!(
-                            "Successfully applied {} edits to '{}' (+{} -{} lines)",
-                            edits_vec.len(),
-                            diff.path,
-                            diff.additions,
-                            diff.deletions
-                        ),
-                        true,
-                        Some(diff),
-                    ),
+                    Ok(diff) => {
+                        let verify_suffix = self.format_post_edit_suffix(&diff.path);
+                        (
+                            format!(
+                                "Successfully applied {} edits to '{}' (+{} -{} lines){}",
+                                edits_vec.len(),
+                                diff.path,
+                                diff.additions,
+                                diff.deletions,
+                                verify_suffix
+                            ),
+                            true,
+                            Some(diff),
+                        )
+                    }
                     Err(e) => (format!("Error: {}", e), false, None),
                 }
             }
@@ -2309,6 +3195,251 @@ impl ToolEngine {
                     )
                 }
             }
+            "todo_write" => {
+                let items_val = args.get("todos").or_else(|| args.get("items"));
+                let mut parsed_items: Vec<TodoItem> = Vec::new();
+                if let Some(arr) = items_val.and_then(|v| v.as_array()) {
+                    for (idx, item) in arr.iter().enumerate() {
+                        let id = item
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("{}", idx + 1));
+                        let content = item
+                            .get("content")
+                            .or_else(|| item.get("task"))
+                            .or_else(|| item.get("title"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if content.trim().is_empty() {
+                            continue;
+                        }
+                        let status = item
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("pending")
+                            .to_string();
+                        let priority = item
+                            .get("priority")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("medium")
+                            .to_string();
+                        parsed_items.push(TodoItem {
+                            id,
+                            content,
+                            status,
+                            priority,
+                        });
+                    }
+                }
+                if let Ok(mut guard) = self.todo_items.lock() {
+                    *guard = parsed_items.clone();
+                }
+                let completed = parsed_items
+                    .iter()
+                    .filter(|t| t.status == "completed" || t.status == "done")
+                    .count();
+                let mut summary = vec![format!(
+                    "Updated Todo Checklist ({}/{} completed):",
+                    completed,
+                    parsed_items.len()
+                )];
+                for t in &parsed_items {
+                    let mark = match t.status.as_str() {
+                        "completed" | "done" => "[x]",
+                        "in_progress" | "active" => "[/]",
+                        "cancelled" => "[-]",
+                        _ => "[ ]",
+                    };
+                    summary.push(format!("  {} #{}: {} ({})", mark, t.id, t.content, t.status));
+                }
+                (summary.join("\n"), true, None)
+            }
+            "ast_edit_symbol" => {
+                let path = {
+                    let p = get_str("path");
+                    if p.is_empty() {
+                        get_str("file_path")
+                    } else {
+                        p
+                    }
+                };
+                let symbol = {
+                    let s = get_str("symbol");
+                    if s.is_empty() {
+                        get_str("symbol_name")
+                    } else {
+                        s
+                    }
+                };
+                let new_code = {
+                    let c = get_str("new_code");
+                    if c.is_empty() {
+                        get_str("replacement")
+                    } else {
+                        c
+                    }
+                };
+                if let Err(e) = self.check_protected_path(&path) {
+                    return (format!("Error: {}", e), false, None);
+                }
+                match edit_symbol(self.workspace.root(), &path, &symbol, &new_code) {
+                    Ok((old_content, new_content, callers_report)) => {
+                        self.record_file_snapshot(&path, &new_content);
+                        let diff =
+                            Self::compute_diff(&path, "modified", &old_content, &new_content);
+                        let verify_suffix = self.format_post_edit_suffix(&path);
+                        let msg = format!(
+                            "Successfully updated symbol `{}` in `{}`.{}\n\n### Cross-Repo Callers of `{}`:\n{}",
+                            symbol, path, verify_suffix, symbol, callers_report
+                        );
+                        (msg, true, Some(diff))
+                    }
+                    Err(e) => (format!("Error: {}", e), false, None),
+                }
+            }
+            "ast_rename_symbol" => {
+                let old_name = get_str("old_name");
+                let new_name = get_str("new_name");
+                if !self.protected_paths().is_empty() {
+                    return (
+                        "Error: ast_rename_symbol is disabled when protected file constraints are active; use edit_file on non-protected files instead.".to_string(),
+                        false,
+                        None,
+                    );
+                }
+                match rename_symbol_across_repo(self.workspace.root(), &old_name, &new_name) {
+                    Ok((files, count)) => {
+                        let file_list = if files.is_empty() {
+                            "None".to_string()
+                        } else {
+                            files.join(", ")
+                        };
+                        (
+                            format!(
+                                "Renamed `{}` -> `{}` ({} replacement(s) across {} file(s): {})",
+                                old_name,
+                                new_name,
+                                count,
+                                files.len(),
+                                file_list
+                            ),
+                            true,
+                            None,
+                        )
+                    }
+                    Err(e) => (format!("Error: {}", e), false, None),
+                }
+            }
+            "git_archeology" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let query = args
+                    .get("query")
+                    .or_else(|| args.get("symbol"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let start_line = args
+                    .get("start_line")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(0);
+                let end_line = args
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(0);
+                let out = git_archeology(self.workspace.root(), path, query, start_line, end_line);
+                (Self::truncate_head_tail(&out, 12000), true, None)
+            }
+            "debug_trace" => {
+                let command = {
+                    let c = get_str("command");
+                    if c.is_empty() {
+                        get_str("cmd")
+                    } else {
+                        c
+                    }
+                };
+                let out = debug_trace_command(self.workspace.root(), &command);
+                (Self::truncate_head_tail(&out, 12000), true, None)
+            }
+            "synthesize_tool" => {
+                let tool_name = get_str("name");
+                let description = get_str("description");
+                let script_lang = {
+                    let l = get_str("script_lang");
+                    if l.is_empty() {
+                        "python".to_string()
+                    } else {
+                        l.to_lowercase()
+                    }
+                };
+                let script_code = {
+                    let c = get_str("script_code");
+                    if c.is_empty() {
+                        get_str("code")
+                    } else {
+                        c
+                    }
+                };
+                let safe_name: String = tool_name
+                    .trim()
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                    .collect();
+                if safe_name.is_empty() || script_code.trim().is_empty() {
+                    return (
+                        "Error: synthesize_tool requires non-empty 'name' and 'script_code'"
+                            .to_string(),
+                        false,
+                        None,
+                    );
+                }
+                let ext = match script_lang.as_str() {
+                    "powershell" | "ps1" => "ps1",
+                    "node" | "js" | "javascript" => "js",
+                    "bash" | "sh" => "sh",
+                    _ => "py",
+                };
+                let script_path = Self::custom_tools_dir().join(format!("{}.{}", safe_name, ext));
+                if let Err(e) = fs::write(&script_path, &script_code) {
+                    return (
+                        format!("Error writing synthesized tool script: {}", e),
+                        false,
+                        None,
+                    );
+                }
+                let params = args
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
+                let mut tools = Self::load_synthesized_tools();
+                tools.retain(|t| !t.name.eq_ignore_ascii_case(&safe_name));
+                tools.push(SynthesizedToolDef {
+                    name: safe_name.clone(),
+                    description: if description.is_empty() {
+                        format!("Synthesized {} tool", script_lang)
+                    } else {
+                        description
+                    },
+                    script_lang,
+                    script_path: script_path.to_string_lossy().to_string(),
+                    parameters: params,
+                });
+                let _ = Self::save_synthesized_tools(&tools);
+                (
+                    format!(
+                        "Synthesized and registered custom tool '{}' at '{}'. You can now invoke '{}' directly.",
+                        safe_name,
+                        script_path.display(),
+                        safe_name
+                    ),
+                    true,
+                    None,
+                )
+            }
+            "shadow_sandbox" => self.execute_shadow_sandbox(args),
             "call_mcp_tool" => {
                 let server_name = get_str("server");
                 let tool_name = get_str("tool");
@@ -2332,12 +3463,37 @@ impl ToolEngine {
                     (format!("Unknown MCP tool '{}'", other), false, None)
                 }
             }
-            other => (format!("Unknown tool '{}'", other), false, None),
+            other => {
+                if let Some(synth) = Self::load_synthesized_tools()
+                    .into_iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(other))
+                {
+                    let args_json = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+                    if let Ok(mut env_guard) = self.session_env.lock() {
+                        env_guard.insert("UNJESS_TOOL_ARGS".to_string(), args_json);
+                    }
+                    let cmd_line = match synth.script_lang.as_str() {
+                        "powershell" | "ps1" => format!(
+                            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+                            synth.script_path
+                        ),
+                        "node" | "js" | "javascript" => format!("node \"{}\"", synth.script_path),
+                        "bash" | "sh" => format!("sh \"{}\"", synth.script_path),
+                        _ => format!("python \"{}\"", synth.script_path),
+                    };
+                    match self.run_command(&cmd_line, 120) {
+                        Ok(out) => (out, true, None),
+                        Err(e) => (format!("Synthesized tool error: {}", e), false, None),
+                    }
+                } else {
+                    (format!("Unknown tool '{}'", other), false, None)
+                }
+            }
         }
     }
 
     /// Returns OpenAI-compatible JSON function tool schemas for LLM tool-calling,
-    /// including dynamically discovered tools from enabled MCP servers.
+    /// including Frontier tools, synthesized custom tools, and dynamically discovered MCP tools.
     pub fn tool_schemas() -> serde_json::Value {
         let mut base = serde_json::json!([
             {
@@ -2532,8 +3688,128 @@ impl ToolEngine {
             {
                 "type": "function",
                 "function": {
+                    "name": "todo_write",
+                    "description": "Update the structured task checklist to track multi-step engineering progress.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "todos": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string" },
+                                        "content": { "type": "string" },
+                                        "status": { "type": "string", "description": "'pending', 'in_progress', 'completed', or 'cancelled'" },
+                                        "priority": { "type": "string", "description": "'high', 'medium', or 'low'" }
+                                    },
+                                    "required": ["content", "status"]
+                                }
+                            }
+                        },
+                        "required": ["todos"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "ast_edit_symbol",
+                    "description": "Surgically replace an entire AST symbol (function, struct, class, method) by name in a file without line-number drift.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Relative file path" },
+                            "symbol": { "type": "string", "description": "Exact symbol name to replace" },
+                            "new_code": { "type": "string", "description": "Complete replacement code for the symbol" }
+                        },
+                        "required": ["path", "symbol", "new_code"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "ast_rename_symbol",
+                    "description": "Rename an identifier across all source files in the workspace using word-boundary AST token matching.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "old_name": { "type": "string", "description": "Existing identifier name" },
+                            "new_name": { "type": "string", "description": "New identifier name" }
+                        },
+                        "required": ["old_name", "new_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "git_archeology",
+                    "description": "Inspect Git blame, pickaxe (`-S`) symbol history, or recent commit log for a file or symbol.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Optional relative file path" },
+                            "query": { "type": "string", "description": "Optional symbol or string for git log -S pickaxe search" },
+                            "start_line": { "type": "integer", "description": "Optional start line for git blame" },
+                            "end_line": { "type": "integer", "description": "Optional end line for git blame" }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "debug_trace",
+                    "description": "Execute a failing command or test with full stack/backtrace variables (`RUST_BACKTRACE=1`, `GOTRACEBACK=all`, `PYTHONFAULTHANDLER=1`) and automatically extract workspace source frames around the crash site.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": { "type": "string", "description": "Command or test to run and trace" }
+                        },
+                        "required": ["command"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "synthesize_tool",
+                    "description": "Synthesize and hot-register a reusable custom tool backed by a Python, PowerShell, Node.js, or Bash script.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Tool identifier (e.g. 'parse_binary_header')" },
+                            "description": { "type": "string", "description": "Description of what the tool does" },
+                            "script_lang": { "type": "string", "description": "'python', 'powershell', 'node', or 'bash'" },
+                            "script_code": { "type": "string", "description": "Executable script source code (reads JSON args from env UNJESS_TOOL_ARGS)" },
+                            "parameters": { "type": "object", "description": "Optional JSON schema for tool parameters" }
+                        },
+                        "required": ["name", "description", "script_code"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "shadow_sandbox",
+                    "description": "Manage a Copy-on-Write shadow workspace snapshot ('create', 'diff', 'promote', 'discard', 'revert_hunk') for safe speculative refactoring.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "description": "'create', 'diff', 'promote', 'discard', or 'revert_hunk'" },
+                            "path": { "type": "string", "description": "Optional relative file path for 'revert_hunk'" }
+                        },
+                        "required": ["action"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "run_command",
-                    "description": "Execute a shell command inside the workspace root with timeout enforcement.",
+                    "description": "Execute a shell command inside the stateful workspace session (persists working directory and environment variables across calls).",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -2836,6 +4112,17 @@ impl ToolEngine {
         ]);
 
         if let Some(arr) = base.as_array_mut() {
+            for synth in Self::load_synthesized_tools() {
+                arr.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": synth.name,
+                        "description": format!("[Synthesized Tool] {}", synth.description),
+                        "parameters": synth.parameters
+                    }
+                }));
+            }
+
             for srv in McpManager::load() {
                 if !srv.enabled {
                     continue;
@@ -2945,6 +4232,119 @@ mod tests {
             &serde_json::json!({ "query": "println", "path": "./src" }),
         );
         assert!(ok);
+    }
+
+    #[test]
+    fn test_stateful_shell_cwd_env_and_and_operator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(tmp.path()).unwrap();
+        let engine = ToolEngine::new(ws.clone());
+        fs::create_dir_all(ws.root().join("nested_dir")).unwrap();
+
+        // 1. Test `&&` operator + persistent `cd` across `run_command` calls
+        let out1 = engine
+            .run_command("cd nested_dir && Write-Output 'inside_nested'", 30)
+            .unwrap();
+        assert!(out1.contains("inside_nested"));
+        assert!(engine.session_cwd().ends_with("nested_dir"));
+
+        // 2. Next command runs inside `nested_dir` and sets a persistent env var
+        let _ = engine
+            .run_command("$env:UNJESS_TEST_STATE = 'persisted_ok'", 30)
+            .unwrap();
+        let out2 = engine
+            .run_command("Write-Output $env:UNJESS_TEST_STATE", 30)
+            .unwrap();
+        assert!(out2.contains("persisted_ok"));
+    }
+
+    #[test]
+    fn test_protected_paths_and_edit_precision_helpers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(tmp.path()).unwrap();
+        let mut engine = ToolEngine::new(ws.clone());
+
+        engine
+            .write_file(
+                "run_pretrain.sh",
+                "#!/bin/bash\necho 'training'\n",
+                true,
+            )
+            .unwrap();
+
+        let extracted = extract_protected_paths_from_prompt(
+            "Fix the model bug, but do not modify `/app/run_pretrain.sh` and leave `config.yaml` unchanged.",
+        );
+        assert!(extracted.iter().any(|p| p.contains("run_pretrain.sh")));
+        assert!(extracted.iter().any(|p| p.contains("config.yaml")));
+
+        engine.set_protected_paths(extracted);
+        assert!(engine.write_file("run_pretrain.sh", "hacked", true).is_err());
+        assert!(engine.delete_file("run_pretrain.sh").is_err());
+        assert!(engine
+            .run_command("echo 'bad' > run_pretrain.sh", 10)
+            .is_err());
+
+        // Test `strip_read_file_line_prefixes` and closest match preview
+        engine
+            .write_file(
+                "src/calc.rs",
+                "pub fn compute(a: i32) -> i32 {\n    let step = a + 1;\n    step * 2\n}\n",
+                true,
+            )
+            .unwrap();
+        let diff = engine
+            .edit_file(
+                "src/calc.rs",
+                "   2:     let step = a + 1;\n   3:     step * 2",
+                "   2:     let step = a + 10;\n   3:     step * 3",
+            )
+            .unwrap();
+        assert_eq!(diff.status, "modified");
+        assert!(fs::read_to_string(ws.root().join("src/calc.rs"))
+            .unwrap()
+            .contains("a + 10"));
+
+        let err = engine
+            .edit_file("src/calc.rs", "let step = a + 999;", "let step = 0;")
+            .unwrap_err();
+        assert!(err.to_string().contains("Closest match in file"));
+
+        // Test Frontier tools: `todo_write`, `ast_edit_symbol`, `shadow_sandbox`
+        let (todo_out, todo_ok, _) = engine.execute_tool(
+            "todo_write",
+            &serde_json::json!({
+                "todos": [
+                    { "id": "1", "content": "Audit symbols", "status": "completed" },
+                    { "id": "2", "content": "Patch calc.rs", "status": "in_progress" }
+                ]
+            }),
+        );
+        assert!(todo_ok);
+        assert!(todo_out.contains("1/2 completed"));
+
+        let (ast_out, ast_ok, ast_diff) = engine.execute_tool(
+            "ast_edit_symbol",
+            &serde_json::json!({
+                "path": "src/calc.rs",
+                "symbol": "compute",
+                "new_code": "pub fn compute(a: i32) -> i32 {\n    a * 42\n}"
+            }),
+        );
+        assert!(ast_ok);
+        assert!(ast_diff.is_some());
+        assert!(ast_out.contains("[Auto-Verify"));
+
+        let (_, sb_ok, _) = engine.execute_tool(
+            "shadow_sandbox",
+            &serde_json::json!({ "action": "create" }),
+        );
+        assert!(sb_ok);
+        let (_, sb_disc_ok, _) = engine.execute_tool(
+            "shadow_sandbox",
+            &serde_json::json!({ "action": "discard" }),
+        );
+        assert!(sb_disc_ok);
     }
 
     #[test]

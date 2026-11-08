@@ -1706,6 +1706,44 @@ impl UnjessDesktopApp {
                             });
                             ui.add_space(4.0);
                         }
+
+                        ui.add_space(14.0);
+                        ui.label(
+                            RichText::new("FRONTIER & AST TOOLS")
+                                .size(10.5)
+                                .strong()
+                                .color(theme::TEXT_MUTED),
+                        );
+                        ui.add_space(8.0);
+                        for tool_name in [
+                            "todo_write",
+                            "ast_edit_symbol",
+                            "ast_rename_symbol",
+                            "git_archeology",
+                            "debug_trace",
+                            "synthesize_tool",
+                            "shadow_sandbox",
+                        ] {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(tool_name)
+                                        .size(11.5)
+                                        .family(FontFamily::Monospace)
+                                        .color(theme::TEXT_SECONDARY),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("Active")
+                                                .size(10.5)
+                                                .color(theme::ACCENT_EMERALD),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.add_space(3.0);
+                        }
                     });
             });
     }

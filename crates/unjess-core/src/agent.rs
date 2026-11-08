@@ -944,6 +944,332 @@ impl HarnessManager {
         new_msgs
     }
 
+    /// Two-stage KV-cache-friendly intra-turn compaction:
+    /// 1. Deduplicates superseded `read_file` outputs that share the exact same `[File: ...]` header.
+    /// 2. Stage-1 (above 100,000 chars): prunes older tool outputs (>5,500 chars) to 4,096 head + 1,024 tail chars.
+    /// 3. Stage-2 (above 160,000 chars): summarizes older messages via `compact_messages`.
+    pub fn compact_messages_smartly(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        let mut msgs = messages.to_vec();
+
+        // Pass 1: Deduplicate superseded `read_file` outputs with identical `[File: ...]` headers
+        let mut latest_file_header_idx: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (idx, m) in msgs.iter().enumerate() {
+            if m.role == "tool" {
+                for line in m.content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("[File: ") && trimmed.ends_with(']') {
+                        latest_file_header_idx.insert(trimmed.to_string(), idx);
+                    }
+                }
+            }
+        }
+        for (idx, m) in msgs.iter_mut().enumerate() {
+            if m.role == "tool" {
+                let mut first_header = None;
+                for line in m.content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("[File: ") && trimmed.ends_with(']') {
+                        first_header = Some(trimmed.to_string());
+                        break;
+                    }
+                }
+                if let Some(hdr) = first_header {
+                    if let Some(&latest_idx) = latest_file_header_idx.get(&hdr) {
+                        if idx < latest_idx && m.content.len() > 240 {
+                            m.content = format!(
+                                "{}\n[Superseded read_file output — see newer read of this file in step #{}]",
+                                hdr, latest_idx
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: Stage-1 head+tail pruning when total context exceeds 100,000 chars
+        let total_chars: usize = msgs.iter().map(|m| m.content.len()).sum();
+        if total_chars > 100_000 && msgs.len() > 4 {
+            let protect_from = msgs.len().saturating_sub(4);
+            for m in &mut msgs[..protect_from] {
+                if m.role == "tool" && m.content.chars().count() > 5500 {
+                    let total_c = m.content.chars().count();
+                    let head: String = m.content.chars().take(4096).collect();
+                    let tail: String = m
+                        .content
+                        .chars()
+                        .rev()
+                        .take(1024)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    m.content = format!(
+                        "{}\n\n... [Stage-1 Intra-Turn Pruned {} chars (kept 4096 head + 1024 tail)] ...\n\n{}",
+                        head,
+                        total_c.saturating_sub(5120),
+                        tail
+                    );
+                }
+            }
+        }
+
+        // Pass 3: Stage-2 structural digest compaction when context still exceeds 160,000 chars
+        let post_stage1_chars: usize = msgs.iter().map(|m| m.content.len()).sum();
+        if (post_stage1_chars > 160_000 || msgs.len() > 40) && msgs.len() > 8 {
+            msgs = Self::compact_messages(&msgs, 8);
+        }
+
+        msgs
+    }
+
+    /// Returns `true` if `name` is a bookkeeping tool that should be transparent to stuck-loop detection.
+    pub fn is_transparent_bookkeeping_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "todo_write"
+                | "mcp_status"
+                | "manage_background_tasks"
+                | "recall_memory"
+                | "save_memory"
+        )
+    }
+
+    /// Computes a deterministic canonical signature for a tool call, normalizing path separators
+    /// and sorting JSON object keys so equivalent calls map to the exact same key.
+    pub fn canonicalize_tool_call_key(name: &str, args: &serde_json::Value) -> String {
+        fn norm_val(k_hint: &str, v: &serde_json::Value) -> String {
+            match v {
+                serde_json::Value::Object(map) => {
+                    let mut keys: Vec<&String> = map.keys().collect();
+                    keys.sort();
+                    let parts: Vec<String> = keys
+                        .into_iter()
+                        .map(|k| format!("{}:{}", k, norm_val(k, &map[k])))
+                        .collect();
+                    format!("{{{}}}", parts.join(","))
+                }
+                serde_json::Value::Array(arr) => {
+                    let parts: Vec<String> = arr.iter().map(|x| norm_val(k_hint, x)).collect();
+                    format!("[{}]", parts.join(","))
+                }
+                serde_json::Value::String(s) => {
+                    let trimmed = s.trim();
+                    if matches!(k_hint, "path" | "file_path" | "rel_path") {
+                        trimmed
+                            .replace('\\', "/")
+                            .trim_start_matches("./")
+                            .to_lowercase()
+                    } else {
+                        trimmed.to_string()
+                    }
+                }
+                other => other.to_string(),
+            }
+        }
+        format!("{}:{}", name.trim().to_lowercase(), norm_val("", args))
+    }
+
+    /// Escalating `[3, 5, 8]` `<mentor_analysis>` stuck-loop recovery reminder.
+    pub fn format_repeat_tool_reminder(tool_name: &str, repeat_count: usize) -> Option<String> {
+        if repeat_count == 3 {
+            Some(format!(
+                "<mentor_analysis>\nNotice: You have called `{}` with the exact same arguments 3 times. The output is already in your conversation history above. Do not repeat this identical call; use the existing output to proceed to your next implementation or verification step.\n</mentor_analysis>",
+                tool_name
+            ))
+        } else if repeat_count == 5 {
+            Some(format!(
+                "<mentor_analysis>\nWARNING (Escalation Level 2): You have repeated `{}` 5 times with identical arguments. You are in a reasoning loop. Change your strategy immediately: either edit the target code, run a diagnostic command, or synthesize your final answer.\n</mentor_analysis>",
+                tool_name
+            ))
+        } else if repeat_count >= 8 {
+            Some(format!(
+                "<mentor_analysis>\nCRITICAL CIRCUIT BREAKER (Level 3): `{}` was invoked {} times identically. Loop terminated. Summarize your current findings and stop.\n</mentor_analysis>",
+                tool_name, repeat_count
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Detects when an LLM outputs transitional narration ("I will now check...", "Let me inspect...")
+    /// without invoking any tool so the loop can auto-continue instead of terminating prematurely.
+    pub fn is_transitional_narration(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > 700
+            || trimmed.contains("<!-- GOAL_COMPLETE -->")
+            || trimmed.contains("```")
+        {
+            return false;
+        }
+        let lower = trimmed.to_lowercase();
+        if lower.ends_with(':') {
+            return true;
+        }
+        let phrases = [
+            "let me check",
+            "let's check",
+            "let me inspect",
+            "let's inspect",
+            "let me read",
+            "let's read",
+            "let me look",
+            "let's look",
+            "let me run",
+            "let's run",
+            "let me search",
+            "let's search",
+            "i will now",
+            "i'll now",
+            "now i will",
+            "now i'll",
+            "first, let's",
+            "first, i'll",
+            "first, i will",
+            "next, i'll",
+            "next, i will",
+            "let me examine",
+            "let me verify",
+        ];
+        phrases.iter().any(|p| lower.contains(p))
+    }
+
+    /// Fallback parser that extracts structured tool calls when a model emits `<tool_call>{...}</tool_call>`
+    /// or a ```tool_call / ```json block in plain text instead of native `tool_calls`.
+    pub fn extract_tool_calls_from_text(
+        text: &str,
+    ) -> Vec<(String, String, serde_json::Value)> {
+        let mut extracted = Vec::new();
+        let mut candidates = Vec::new();
+
+        if let Ok(xml_re) = regex::Regex::new(r"(?is)<tool_call>\s*(\{.*?\})\s*</tool_call>") {
+            for cap in xml_re.captures_iter(text) {
+                if let Some(m) = cap.get(1) {
+                    candidates.push(m.as_str().to_string());
+                }
+            }
+        }
+        if candidates.is_empty() {
+            if let Ok(fence_re) =
+                regex::Regex::new(r"(?is)```(?:tool_call|json)\s*(\{[\s\S]*?\})\s*```")
+            {
+                for cap in fence_re.captures_iter(text) {
+                    if let Some(m) = cap.get(1) {
+                        candidates.push(m.as_str().to_string());
+                    }
+                }
+            }
+        }
+
+        const KNOWN_TOOLS: &[&str] = &[
+            "read_file",
+            "write_file",
+            "edit_file",
+            "multi_edit_file",
+            "delete_file",
+            "list_dir",
+            "find_by_name",
+            "grep_search",
+            "find_symbol",
+            "outline_file",
+            "find_callers",
+            "repo_map",
+            "todo_write",
+            "ast_edit_symbol",
+            "ast_rename_symbol",
+            "git_archeology",
+            "debug_trace",
+            "synthesize_tool",
+            "shadow_sandbox",
+            "run_command",
+            "web_search",
+            "read_url",
+            "save_memory",
+            "recall_memory",
+            "delete_memory",
+            "git_status",
+            "git_diff",
+        ];
+
+        for raw_json in candidates {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw_json) {
+                let name_opt = val
+                    .get("name")
+                    .or_else(|| val.get("tool"))
+                    .and_then(|v| v.as_str());
+                if let Some(name) = name_opt {
+                    if KNOWN_TOOLS.contains(&name) || name.starts_with("mcp__") {
+                        let args = val
+                            .get("arguments")
+                            .or_else(|| val.get("args"))
+                            .or_else(|| val.get("parameters"))
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        extracted.push((
+                            format!("call_txt_{}", extracted.len() + 1),
+                            name.to_string(),
+                            args,
+                        ));
+                    }
+                }
+            }
+        }
+        extracted
+    }
+
+    /// Detects temporary debug/repro/scratch files left behind in the workspace at the end of a turn.
+    pub fn detect_leftover_scratch_files(
+        ws_root: &std::path::Path,
+        created_paths: &[String],
+        user_prompt: &str,
+    ) -> Vec<String> {
+        let lower_prompt = user_prompt.to_lowercase();
+        let mut leftovers = Vec::new();
+        let is_scratch_name = |fname: &str| -> bool {
+            let l = fname.to_lowercase();
+            l.starts_with("test_debug")
+                || l.starts_with("debug_")
+                || l.starts_with("repro_")
+                || l.starts_with("reproduce_")
+                || l.starts_with("scratch_")
+                || l.starts_with("tmp_")
+                || l.starts_with("temp_test")
+                || l.contains("_scratch.")
+                || l.contains("_debug_tmp.")
+        };
+
+        for rel in created_paths {
+            let norm = rel.replace('\\', "/");
+            let fname = std::path::Path::new(&norm)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if is_scratch_name(&fname)
+                && !lower_prompt.contains(&fname.to_lowercase())
+                && ws_root.join(&norm).is_file()
+                && !leftovers.contains(&norm)
+            {
+                leftovers.push(norm);
+            }
+        }
+
+        if let Ok(entries) = fs::read_dir(ws_root) {
+            for entry in entries.flatten() {
+                if entry.path().is_file() {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    if is_scratch_name(&fname)
+                        && !lower_prompt.contains(&fname.to_lowercase())
+                        && !leftovers.contains(&fname)
+                    {
+                        leftovers.push(fname);
+                    }
+                }
+            }
+        }
+        leftovers
+    }
+
     pub fn compact_active_conversation(&self) {
         if let Ok(mut g) = self.state.write() {
             let active_id = g.active_conversation_id.clone();
@@ -2191,6 +2517,13 @@ impl HarnessManager {
             .map(|m| m.content.clone())
             .unwrap_or_default();
 
+        // Extract negative file constraints from the user prompt and enforce them in ToolEngine
+        let protected_paths =
+            crate::tools::extract_protected_paths_from_prompt(&latest_user_query);
+        if !protected_paths.is_empty() {
+            tool_engine.set_protected_paths(protected_paths);
+        }
+
         let mut collected_tools: Vec<ToolCallRecord> = Vec::new();
         let mut collected_diffs: Vec<FileDiff> = Vec::new();
         let mut collected_thinking = String::new();
@@ -2200,7 +2533,10 @@ impl HarnessManager {
         let mut total_turn_out_tokens = 0usize;
         let mut total_turn_cost = 0.0f64;
         let mut recent_tool_signatures: Vec<String> = Vec::new();
-        let mut stuck_strikes = 0usize;
+        let mut tool_call_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut transitional_nudges = 0usize;
+        let mut scratch_cleanup_nudged = false;
         let mut system_prompt = self.build_system_prompt_for_query(&ws_path, &latest_user_query);
         let mut system_prompt_dirty = false;
 
@@ -2222,13 +2558,16 @@ impl HarnessManager {
                 break;
             }
 
-            // Automatic context compaction when conversation history grows large by message count OR character volume
-            let total_history_chars: usize = working_history.iter().map(|m| m.content.len()).sum();
-            if settings.enable_compaction
-                && (working_history.len() > 20 || total_history_chars > 48_000)
-                && working_history.len() > 6
-            {
-                working_history = Self::compact_messages(&working_history, 6);
+            // Two-stage KV-cache-friendly intra-turn compaction
+            if settings.enable_compaction {
+                working_history = Self::compact_messages_smartly(&working_history);
+                let total_history_chars: usize =
+                    working_history.iter().map(|m| m.content.len()).sum();
+                if (working_history.len() > 28 || total_history_chars > 140_000)
+                    && working_history.len() > 6
+                {
+                    working_history = Self::compact_messages(&working_history, 6);
+                }
             }
 
             if system_prompt_dirty {
@@ -2272,7 +2611,7 @@ impl HarnessManager {
             }
 
             match turn_result {
-                Ok(resp) => {
+                Ok(mut resp) => {
                     total_turn_tokens += resp.tokens;
                     total_turn_in_tokens += resp.input_tokens;
                     total_turn_out_tokens += resp.output_tokens;
@@ -2284,6 +2623,14 @@ impl HarnessManager {
                                 collected_thinking.push_str("\n\n");
                             }
                             collected_thinking.push_str(&t);
+                        }
+                    }
+
+                    // Fallback: if structured tool_calls are empty, check if the model emitted raw JSON/XML tool calls in text
+                    if resp.pending_tool_calls.is_empty() && enable_tools {
+                        let fallback_calls = Self::extract_tool_calls_from_text(&resp.content);
+                        if !fallback_calls.is_empty() {
+                            resp.pending_tool_calls = fallback_calls;
                         }
                     }
 
@@ -2305,44 +2652,137 @@ impl HarnessManager {
                     }
 
                     if resp.pending_tool_calls.is_empty() {
+                        // 1. Transitional narration auto-continuation (up to 2 nudges)
+                        if enable_tools
+                            && transitional_nudges < 2
+                            && iter < max_iters
+                            && Self::is_transitional_narration(&resp.content)
+                        {
+                            transitional_nudges += 1;
+                            working_history.push(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: resp.content.clone(),
+                                thinking: None,
+                                tool_calls: Vec::new(),
+                                diffs: Vec::new(),
+                                timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                model: Some(settings.model.clone()),
+                                tokens: 0,
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cost_usd: 0.0,
+                            });
+                            working_history.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: "[System Auto-Continue]: You stated what you are about to do without invoking a tool. Proceed and call the appropriate tool now.".to_string(),
+                                thinking: None,
+                                tool_calls: Vec::new(),
+                                diffs: Vec::new(),
+                                timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                model: None,
+                                tokens: 0,
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cost_usd: 0.0,
+                            });
+                            continue;
+                        }
+
+                        // 2. Pre-exit leftover scratch file detection
+                        if enable_tools && !scratch_cleanup_nudged && iter < max_iters {
+                            let created_paths: Vec<String> = collected_diffs
+                                .iter()
+                                .filter(|d| d.status == "created")
+                                .map(|d| d.path.clone())
+                                .collect();
+                            let leftovers = Self::detect_leftover_scratch_files(
+                                &ws_path,
+                                &created_paths,
+                                &latest_user_query,
+                            );
+                            if !leftovers.is_empty() {
+                                scratch_cleanup_nudged = true;
+                                working_history.push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: resp.content.clone(),
+                                    thinking: None,
+                                    tool_calls: Vec::new(),
+                                    diffs: Vec::new(),
+                                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                    model: Some(settings.model.clone()),
+                                    tokens: 0,
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cost_usd: 0.0,
+                                });
+                                working_history.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: format!(
+                                        "[System Pre-Exit Check]: Temporary scratch/debug file(s) were left in the workspace: `{}`. Please remove them with `delete_file` before concluding.",
+                                        leftovers.join("`, `")
+                                    ),
+                                    thinking: None,
+                                    tool_calls: Vec::new(),
+                                    diffs: Vec::new(),
+                                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                    model: None,
+                                    tokens: 0,
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cost_usd: 0.0,
+                                });
+                                continue;
+                            }
+                        }
+
                         break;
                     }
 
                     // Execute requested tool calls
                     let mut tool_results_summary = Vec::new();
-                    let mut stuck_detected = false;
+                    let mut hard_circuit_break = false;
 
                     for (tc_id, tc_name, tc_args) in resp.pending_tool_calls {
                         if self.abort_flag.load(Ordering::SeqCst) {
                             break;
                         }
 
-                        // Stuck-loop detection: check 3 identical calls in a row OR 2-step ping-pong cycle (A, B, A, B, A, B)
-                        let sig = format!("{}:{}", tc_name, tc_args);
-                        recent_tool_signatures.push(sig.clone());
-                        let sig_len = recent_tool_signatures.len();
-                        let same_three = sig_len >= 3
-                            && recent_tool_signatures[sig_len - 1] == sig
-                            && recent_tool_signatures[sig_len - 2] == sig
-                            && recent_tool_signatures[sig_len - 3] == sig;
-                        let ping_pong = sig_len >= 6
-                            && recent_tool_signatures[sig_len - 1]
-                                == recent_tool_signatures[sig_len - 3]
-                            && recent_tool_signatures[sig_len - 3]
-                                == recent_tool_signatures[sig_len - 5]
-                            && recent_tool_signatures[sig_len - 2]
-                                == recent_tool_signatures[sig_len - 4]
-                            && recent_tool_signatures[sig_len - 4]
-                                == recent_tool_signatures[sig_len - 6];
+                        // Bookkeeping-transparent canonical stuck-loop detection with escalating [3, 5, 8] <mentor_analysis>
+                        let mut mentor_reminder: Option<String> = None;
+                        if !Self::is_transparent_bookkeeping_tool(&tc_name) {
+                            let canonical_sig = Self::canonicalize_tool_call_key(&tc_name, &tc_args);
+                            recent_tool_signatures.push(canonical_sig.clone());
+                            let count = tool_call_counts
+                                .entry(canonical_sig.clone())
+                                .and_modify(|c| *c += 1)
+                                .or_insert(1);
+                            let repeat_count = *count;
 
-                        if same_three || ping_pong {
-                            stuck_detected = true;
-                            stuck_strikes += 1;
-                            tool_results_summary.push(format!(
-                                "[System Stuck-Loop Detector]: You have repeated `{}` in a loop. Stop repeating this call and either try a different approach or summarize your findings.",
-                                tc_name
-                            ));
-                            break;
+                            let sig_len = recent_tool_signatures.len();
+                            let ping_pong = sig_len >= 6
+                                && recent_tool_signatures[sig_len - 1]
+                                    == recent_tool_signatures[sig_len - 3]
+                                && recent_tool_signatures[sig_len - 3]
+                                    == recent_tool_signatures[sig_len - 5]
+                                && recent_tool_signatures[sig_len - 2]
+                                    == recent_tool_signatures[sig_len - 4]
+                                && recent_tool_signatures[sig_len - 4]
+                                    == recent_tool_signatures[sig_len - 6];
+
+                            if repeat_count >= 8 {
+                                if let Some(msg) = Self::format_repeat_tool_reminder(&tc_name, repeat_count) {
+                                    tool_results_summary.push(msg);
+                                }
+                                hard_circuit_break = true;
+                                break;
+                            } else if let Some(msg) = Self::format_repeat_tool_reminder(&tc_name, repeat_count) {
+                                mentor_reminder = Some(msg);
+                            } else if ping_pong {
+                                mentor_reminder = Some(format!(
+                                    "<mentor_analysis>\nAlternating ping-pong tool cycle detected involving `{}`. Break out of this cycle and try a different approach.\n</mentor_analysis>",
+                                    tc_name
+                                ));
+                            }
                         }
 
                         if let Ok(mut live) = self.live_turn.write() {
@@ -2354,11 +2794,14 @@ impl HarnessManager {
                             "write_file"
                                 | "edit_file"
                                 | "multi_edit_file"
+                                | "ast_edit_symbol"
+                                | "ast_rename_symbol"
                                 | "delete_file"
                                 | "save_memory"
                                 | "delete_memory"
                                 | "create_skill_plugin"
                                 | "register_mcp_plugin"
+                                | "synthesize_tool"
                                 | "delegate_subagent"
                                 | "delegate_parallel_subagents"
                         ) {
@@ -2550,7 +2993,11 @@ impl HarnessManager {
                             tool_engine.execute_tool(&tc_name, &tc_args)
                         };
                         let duration_ms = started.elapsed().as_millis() as u64;
-                        let clipped_result = ToolEngine::truncate_head_tail(&result_str, 12000);
+                        let mut clipped_result = ToolEngine::truncate_head_tail(&result_str, 12000);
+                        if let Some(rem) = mentor_reminder {
+                            clipped_result.push_str("\n\n");
+                            clipped_result.push_str(&rem);
+                        }
 
                         let record = ToolCallRecord {
                             id: tc_id,
@@ -2613,8 +3060,7 @@ impl HarnessManager {
                         cost_usd: 0.0,
                     });
 
-                    if stuck_detected && (stuck_strikes >= 2 || iter >= max_iters.saturating_sub(1))
-                    {
+                    if hard_circuit_break || iter >= max_iters {
                         break;
                     }
                 }
@@ -2730,6 +3176,22 @@ impl HarnessManager {
             prompt.push_str(
                 "PERSONA (PONYTAIL MODE): Bring high-energy, sharp systems-engineering enthusiasm and crystal-clear architectural insight.\n",
             );
+        }
+
+        let protected = crate::tools::extract_protected_paths_from_prompt(user_query);
+        if !protected.is_empty() {
+            prompt.push_str(&format!(
+                "\nPROTECTED FILE CONSTRAINTS (DO NOT MODIFY OR DELETE): `{}`\n",
+                protected.join("`, `")
+            ));
+        }
+
+        let learned_hints = ToolEngine::load_learned_error_hints();
+        if !learned_hints.is_empty() {
+            prompt.push_str("\nLearned Shell & Platform Hints:\n");
+            for h in learned_hints.into_iter().rev().take(5) {
+                prompt.push_str(&format!("- {}\n", h));
+            }
         }
 
         let repo_map = generate_repo_map(ws_path, 30, 3200);
@@ -2968,5 +3430,86 @@ mod tests {
         let sys = hm.build_system_prompt_for_query(tmp.path(), "Please inspect @pinned_note.txt");
         assert!(sys.contains("Pinned @file Context:"));
         assert!(sys.contains("PINNED_FILE_SECRET_MARKER_42"));
+    }
+
+    #[test]
+    fn test_smart_compaction_transitional_narration_and_loop_escalation() {
+        // 1. Superseded read_file deduplication in `compact_messages_smartly`
+        let msgs = vec![
+            ChatMessage {
+                role: "tool".to_string(),
+                content: format!(
+                    "[File: src/lib.rs (100 lines total, showing lines 1..=100)]\n{}",
+                    "line content\n".repeat(40)
+                ),
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                timestamp: "12:00:01".to_string(),
+                model: None,
+                tokens: 100,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: format!(
+                    "[File: src/lib.rs (100 lines total, showing lines 1..=100)]\n{}",
+                    "updated line content\n".repeat(40)
+                ),
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                timestamp: "12:00:02".to_string(),
+                model: None,
+                tokens: 100,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            },
+        ];
+        let smart = HarnessManager::compact_messages_smartly(&msgs);
+        assert!(smart[0].content.contains("[Superseded read_file output"));
+        assert!(smart[1].content.contains("updated line content"));
+
+        // 2. Canonical tool call key & transparent bookkeeping tools
+        assert!(HarnessManager::is_transparent_bookkeeping_tool("todo_write"));
+        assert!(!HarnessManager::is_transparent_bookkeeping_tool("read_file"));
+        let k1 = HarnessManager::canonicalize_tool_call_key(
+            "read_file",
+            &serde_json::json!({ "path": "./src\\main.rs", "start_line": 1 }),
+        );
+        let k2 = HarnessManager::canonicalize_tool_call_key(
+            "read_file",
+            &serde_json::json!({ "start_line": 1, "path": "src/main.rs" }),
+        );
+        assert_eq!(k1, k2);
+
+        // 3. Escalating [3, 5, 8] <mentor_analysis>
+        assert!(HarnessManager::format_repeat_tool_reminder("read_file", 2).is_none());
+        assert!(HarnessManager::format_repeat_tool_reminder("read_file", 3)
+            .unwrap()
+            .contains("<mentor_analysis>"));
+        assert!(HarnessManager::format_repeat_tool_reminder("read_file", 5)
+            .unwrap()
+            .contains("Escalation Level 2"));
+        assert!(HarnessManager::format_repeat_tool_reminder("read_file", 8)
+            .unwrap()
+            .contains("CRITICAL CIRCUIT BREAKER"));
+
+        // 4. Transitional narration & text tool call extraction
+        assert!(HarnessManager::is_transitional_narration(
+            "Let me inspect the configuration file first:"
+        ));
+        assert!(!HarnessManager::is_transitional_narration(
+            "All tests pass and the build is complete."
+        ));
+
+        let extracted = HarnessManager::extract_tool_calls_from_text(
+            "I will read the file now:\n<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"Cargo.toml\"}}</tool_call>",
+        );
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].1, "read_file");
     }
 }
