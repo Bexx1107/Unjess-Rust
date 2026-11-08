@@ -4145,7 +4145,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unjess-cli"
-version = "4.0.6"
+version = "4.0.7"
 dependencies = [
  "chrono",
  "clap",
@@ -4157,7 +4157,7 @@ dependencies = [
 
 [[package]]
 name = "unjess-core"
-version = "4.0.6"
+version = "4.0.7"
 dependencies = [
  "axum",
  "chrono",
@@ -4179,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "unjess-daemon"
-version = "4.0.6"
+version = "4.0.7"
 dependencies = [
  "clap",
  "serde_json",
@@ -4189,7 +4189,7 @@ dependencies = [
 
 [[package]]
 name = "unjess-desktop"
-version = "4.0.6"
+version = "4.0.7"
 dependencies = [
  "arboard",
  "chrono",
@@ -4205,7 +4205,7 @@ dependencies = [
 
 [[package]]
 name = "unjess-installer"
-version = "4.0.6"
+version = "4.0.7"
 dependencies = [
  "dirs",
  "reqwest",
@@ -4214,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "unjess-uninstaller"
-version = "4.0.6"
+version = "4.0.7"
 dependencies = [
  "dirs",
 ]

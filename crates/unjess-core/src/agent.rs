@@ -1579,8 +1579,16 @@ impl HarnessManager {
                 || l.starts_with("scratch_")
                 || l.starts_with("tmp_")
                 || l.starts_with("temp_test")
+                || l.starts_with("diag")
+                || l.starts_with("probe")
+                || l.starts_with("sweep")
+                || l.starts_with("c1_")
+                || l.starts_with("c2_")
+                || l.starts_with("inspect_")
                 || l.contains("_scratch.")
                 || l.contains("_debug_tmp.")
+                || l.contains("_probe.")
+                || l.contains("_diag.")
         };
 
         for rel in created_paths {
@@ -2944,6 +2952,7 @@ impl HarnessManager {
         let mut pre_exit_test_check_count = 0usize;
         let mut pre_exit_unverified_edit_count = 0usize;
         let mut scratch_cleanup_nudged = false;
+        let mut consecutive_probe_scripts = 0usize;
         let mut system_prompt = self.build_system_prompt_for_query(&ws_path, &latest_user_query);
         let mut system_prompt_dirty = false;
 
@@ -3623,6 +3632,19 @@ impl HarnessManager {
                         ));
                     }
 
+                    let is_probe_step = step_tools.iter().any(|st| {
+                        if st.name == "write_file" || st.name == "edit_file" {
+                            let p = st.arguments.get("path").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                            p.contains("diag") || p.contains("probe") || p.contains("sweep") || p.contains("c1_") || p.contains("c2_") || p.contains("inspect") || p.contains("scratch")
+                        } else if st.name == "run_command" {
+                            let c = st.arguments.get("command").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                            c.contains("diag") || c.contains("probe") || c.contains("sweep") || c.contains("c1_") || c.contains("c2_") || c.contains("inspect")
+                        } else {
+                            false
+                        }
+                    });
+                    let is_write_step = step_tools.iter().any(|st| st.name == "write_file" || st.name == "edit_file");
+
                     working_history.push(ChatMessage {
                         role: "assistant".to_string(),
                         content: resp.content.clone(),
@@ -3661,6 +3683,23 @@ impl HarnessManager {
                         if let Some(last_msg) = working_history.last_mut() {
                             if last_msg.role == "tool" {
                                 last_msg.content.push_str(&warning_msg);
+                            }
+                        }
+                    }
+
+                    // Anti-thrashing advisory: if agent executes 5 or more consecutive exploratory probe scripts without convergence,
+                    // inject an autonomous strategy pivot reminder to write a systematic solver script.
+                    if is_probe_step {
+                        consecutive_probe_scripts += 1;
+                    } else if is_write_step {
+                        consecutive_probe_scripts = consecutive_probe_scripts.saturating_sub(1);
+                    }
+
+                    if is_autonomous && consecutive_probe_scripts >= 5 && consecutive_probe_scripts % 3 == 2 {
+                        let advisory_msg = "\n\n<strategy_pivot_notice>\n[Autonomous Optimization Advisory]: Multiple exploratory probe scripts detected without convergence. Shift strategy: do not manually guess offsets or parameters across individual scripts. Write an automated parameter search or coordinate descent script that systematically fits permutations against the reference output in a single run.\n</strategy_pivot_notice>";
+                        if let Some(last_msg) = working_history.last_mut() {
+                            if last_msg.role == "tool" {
+                                last_msg.content.push_str(advisory_msg);
                             }
                         }
                     }
@@ -3781,6 +3820,9 @@ impl HarnessManager {
                 prompt.push_str(
                     "MODE DIRECTIVE (AUTONOMOUS): Use tools proactively to inspect, implement, test, and verify changes end-to-end.\n\
                      AUTONOMOUS ACTION & TASK CONTINUITY INVARIANT: NEVER output transitional narration or announce what you intend to do next without invoking the tool in the same turn. Before ending your turn, check your last paragraph: if it is a plan, a question, or a promise about work you have not done yet, execute that work immediately with tool calls. Finish the whole requested scope before producing your final answer.\n\
+                     DEDUCTIVE ARCHITECTURAL INGESTION FIRST: Before writing code, modifying files, or launching diagnostic scripts, always read the core specifications, framework definitions, configuration files, and reference implementations thoroughly. Deduce data structures, tensor layouts, mathematical sharding/pipeline mappings, and architectural invariants directly from code and schemas instead of guessing.\n\
+                     SYSTEMATIC OPTIMIZATION VS REPETITIVE PROBING: When debugging numerical differences, tensor mismatches, multi-parameter configurations, or complex bugs, NEVER generate endless individual ad-hoc diagnostic scripts guessing parameters or offsets one-by-one. Instead, write a modular, automated search or coordinate descent script that systematically iterates over permutations and fits parameters layer-by-layer directly against ground-truth outputs (reference outputs, test suites) in a single run.\n\
+                     WORKSPACE & CONTEXT HYGIENE: After running intermediate exploratory or parameter-search scripts, clean up scratch diagnostic files. Ensure the final deliverables and self-contained solution scripts remain clean, verified, and free of intermediate exploration clutter.\n\
                      ADVERSARIAL SELF-VERIFICATION PROTOCOL: Never assume generated artifacts or code are correct without empirical proof. Before declaring completion or stopping, you MUST write and execute an independent verification script (or compare against reference outputs/ground-truth files such as logits, expected keys, return codes, schemas) to verify that all invariants and requirements are 100% satisfied. If verification reveals discrepancies, iterate and fix them immediately.\n",
                 );
             }

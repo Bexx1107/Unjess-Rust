@@ -1,14 +1,14 @@
 {
-    "version":  "4.0.6",
-    "edition":  "native-rust",
-    "architecture":  "windows-x86_64",
-    "port":  9758,
-    "sha256":  "c76fd014e14ce2c1a42f2485b071e980fe1bde97dae127279c4949a3db07294b",
-    "binaries":  {
-                     "Unjess.exe":  "c76fd014e14ce2c1a42f2485b071e980fe1bde97dae127279c4949a3db07294b",
-                     "unjessd.exe":  "6d6166467d23881b7610edfc0234eb35396de630f63cd7ca0a0ecc154d5bd5ac",
-                     "unjess-cli.exe":  "d2db1a2185bf360fea40cb9c2f06b512b11d3e9cc0ec439837bd71ecae6759e8",
-                     "Unjess-Setup.exe":  "fe4aa703380114470f708727fc70a0c616efd15e92f5e499fd5dba91738482b9"
-                 },
-    "built_at":  "2026-11-08T21:03:09Z"
+    "version": "4.0.7",
+    "edition": "native-rust",
+    "architecture": "windows-x86_64",
+    "port": 9758,
+    "sha256": "cf1158fd00dd781921d17dc568b1b47bf46c2d7ec8767cdecc321334b11cc333",
+    "binaries": {
+        "Unjess.exe": "cf1158fd00dd781921d17dc568b1b47bf46c2d7ec8767cdecc321334b11cc333",
+        "Unjess-Setup.exe": "9253f9bec8d8ad274da7b3c3b11bd075812ccd73229277cf71025e3ee97510f6",
+        "unjess-cli.exe": "50b3681da0bc5685061337b62cc4fc0c9a5b2aef5b517732bebfe31217ef9447",
+        "unjessd.exe": "6d6166467d23881b7610edfc0234eb35396de630f63cd7ca0a0ecc154d5bd5ac"
+    },
+    "built_at": "2026-11-08T21:51:41Z"
 }

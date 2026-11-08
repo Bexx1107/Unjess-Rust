@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.0.6";
+pub const CURRENT_VERSION: &str = "4.0.7";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,22 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.0.7".to_string(),
+            date: "2026-11-08".to_string(),
+            title: "Unjess 4.0.7 — Deductive Ingestion, Autonomous Solver Protocol & Anti-Thrashing Guardrails".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Added Deductive Architectural Ingestion directive: agents must thoroughly inspect specs, configs, and models upfront rather than guessing.".to_string(),
+                "Added Systematic Optimization directive: forbids endless single-offset diagnostic probes in favor of modular automated solver scripts.".to_string(),
+                "Implemented Anti-Thrashing Runtime Guardrail: detects repetitive diagnostic probe loops and injects autonomous strategy pivot reminders.".to_string(),
+                "Expanded scratch file detector to clean up probe/diagnostic files and prevent in-context repetition thrashing.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.0.6".to_string(),
             date: "2026-11-08".to_string(),
             title: "Unjess 4.0.6 — Native Win32 Hotkey Image Paste & Sentinel Tag Cleanup".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Bypassed egui-winit event swallow via native Win32 GetAsyncKeyState hotkey detection so Ctrl+V and Shift+Insert reliably attach clipboard screenshots.".to_string(),
                 "Added multi-attempt retry loop for OS clipboard image reading to eliminate race conditions with Windows Snipping Tool.".to_string(),
@@ -139,9 +151,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.0.6");
+        assert_eq!(CURRENT_VERSION, "4.0.7");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.0.6");
+        assert_eq!(log[0].version, "4.0.7");
     }
 }
