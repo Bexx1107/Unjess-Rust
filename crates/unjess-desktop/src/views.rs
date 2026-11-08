@@ -2595,6 +2595,12 @@ impl UnjessDesktopApp {
                     });
                 });
 
+                if let Ok(mut slot) = self.update_download_progress.lock() {
+                    if let Some(msg) = slot.take() {
+                        self.status_toast = Some((msg, std::time::Instant::now()));
+                    }
+                }
+
                 let check_res_opt = self
                     .update_check_result
                     .lock()
@@ -2651,22 +2657,57 @@ impl UnjessDesktopApp {
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 if st.update_available {
+                                                    let is_dl = self.update_downloading.load(Ordering::Relaxed);
+                                                    if is_dl {
+                                                        let _ = dark_action_btn(
+                                                            ui,
+                                                            Some(Icon::Download),
+                                                            "◌ Installing...",
+                                                            false,
+                                                        );
+                                                    } else if white_cta_btn(
+                                                        ui,
+                                                        Some(Icon::Download),
+                                                        "Install Update Now",
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        let dl_url = st.download_url.clone();
+                                                        let sha = st.sha256.clone();
+                                                        let flag = Arc::clone(&self.update_downloading);
+                                                        let toast_slot = Arc::clone(&self.update_download_progress);
+                                                        flag.store(true, Ordering::Relaxed);
+                                                        self.status_toast = Some((
+                                                            "Downloading & installing Unjess update from GitHub...".to_string(),
+                                                            std::time::Instant::now(),
+                                                        ));
+                                                        std::thread::spawn(move || {
+                                                            let res = unjess_core::updater::download_and_launch_installer_blocking(&dl_url, &sha);
+                                                            flag.store(false, Ordering::Relaxed);
+                                                            if let Ok(mut slot) = toast_slot.lock() {
+                                                                match res {
+                                                                    Ok(msg) => *slot = Some(msg),
+                                                                    Err(e) => *slot = Some(format!("Update failed: {}", e)),
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+
                                                     if dark_action_btn(
                                                         ui,
                                                         Some(Icon::Globe),
-                                                        "Download Release",
-                                                        true,
+                                                        "Open in Browser",
+                                                        false,
                                                     )
                                                     .clicked()
                                                     {
                                                         let target = if st.download_url.is_empty() {
-                                                            "https://github.com/Bexx1107/Unjess-Rust/releases"
+                                                            "https://github.com/Bexx1107/Unjess-Rust/raw/main/dist/Unjess-Setup.exe"
                                                                 .to_string()
                                                         } else {
                                                             st.download_url.clone()
                                                         };
-                                                        self.browser_query_buf = target;
-                                                        self.active_tab = MainTab::Browser;
+                                                        ui.ctx().open_url(egui::OpenUrl::new_tab(&target));
                                                     }
                                                 }
                                                 if !st.sha256.is_empty() {

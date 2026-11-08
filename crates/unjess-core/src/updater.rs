@@ -251,7 +251,7 @@ pub fn check_for_updates_blocking(server_url: &str) -> Result<UpdateCheckResult,
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(6))
-        .user_agent("Unjess-Rust/4.0.0")
+        .user_agent("Unjess-Rust/4.0.1")
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -281,6 +281,65 @@ pub fn check_for_updates_blocking(server_url: &str) -> Result<UpdateCheckResult,
         .map_err(|e| format!("Invalid version.json manifest: {}", e))?;
 
     Ok(parse_update_manifest_json(&json, &fallback_manifest_url))
+}
+
+/// Downloads the latest `Unjess-Setup.exe` from GitHub, verifies its SHA-256 (if known),
+/// and spawns the installer to automatically upgrade the application.
+pub fn download_and_launch_installer_blocking(
+    download_url: &str,
+    expected_sha256: &str,
+) -> Result<String, String> {
+    let url = if download_url.is_empty() || download_url.contains("/releases") {
+        DEFAULT_SETUP_DOWNLOAD_URL
+    } else {
+        download_url
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .user_agent("Unjess-Rust/4.0.1")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("Failed to download update: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Download failed with HTTP {}", resp.status()));
+    }
+
+    let bytes = resp.bytes().map_err(|e| format!("Failed reading download body: {}", e))?;
+
+    if !expected_sha256.is_empty() {
+        if let Err(e) = verify_sha256_bytes(&bytes, expected_sha256) {
+            return Err(format!("Installer integrity check failed: {}", e));
+        }
+    }
+
+    let temp_installer = std::env::temp_dir().join("Unjess-Setup.exe");
+    fs::write(&temp_installer, &bytes)
+        .map_err(|e| format!("Failed writing installer to disk: {}", e))?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new(&temp_installer)
+            .creation_flags(0x08000000)
+            .spawn()
+            .map_err(|e| format!("Failed to spawn installer: {}", e))?;
+        std::thread::sleep(Duration::from_millis(500));
+        std::process::exit(0);
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(format!(
+            "Downloaded update installer to {}",
+            temp_installer.display()
+        ))
+    }
 }
 
 fn is_newer_semver(current: &str, candidate: &str) -> bool {

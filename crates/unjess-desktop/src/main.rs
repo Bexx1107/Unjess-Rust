@@ -162,6 +162,8 @@ pub struct UnjessDesktopApp {
     pub update_checking: Arc<std::sync::atomic::AtomicBool>,
     pub update_check_result:
         Arc<std::sync::Mutex<Option<Result<unjess_core::updater::UpdateCheckResult, String>>>>,
+    pub update_downloading: Arc<std::sync::atomic::AtomicBool>,
+    pub update_download_progress: Arc<std::sync::Mutex<Option<String>>>,
     pub slash_selected_idx: usize,
 }
 
@@ -269,6 +271,8 @@ impl UnjessDesktopApp {
             mcp_last_summary: Arc::new(std::sync::Mutex::new(None)),
             update_checking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             update_check_result: Arc::new(std::sync::Mutex::new(None)),
+            update_downloading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_download_progress: Arc::new(std::sync::Mutex::new(None)),
             slash_selected_idx: 0,
         }
     }
