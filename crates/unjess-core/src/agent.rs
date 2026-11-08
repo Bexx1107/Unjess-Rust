@@ -3058,9 +3058,10 @@ impl HarnessManager {
                             || lower_resp.contains("could you clarify")
                             || lower_resp.contains("please provide");
 
-                        // 1. Transitional narration auto-continuation & empty turn recovery (up to 5 nudges per phase)
+                        // 1. Autonomous Continuation Invariant & Execution Guard:
+                        // In autonomous mode (enable_tools), turns without tools CANNOT terminate unless explicit completion is declared.
+                        // Up to 15 progressive nudges are provided before treating it as an intractable stall.
                         if enable_tools
-                            && transitional_nudges < 5
                             && iter < max_iters
                             && !is_user_question
                             && !is_explicit_completion
@@ -3069,30 +3070,17 @@ impl HarnessManager {
                                 && step_thinking
                                     .as_ref()
                                     .map_or(false, |t| !t.trim().is_empty());
-                            let is_transitional = Self::is_transitional_narration(&resp.content)
-                                || !is_explicit_completion
-                                || (!resp.content.contains("<!-- GOAL_COMPLETE -->")
-                                    && resp.content.len() < 800
-                                    && (lower_resp.contains("start by")
-                                        || lower_resp.contains("proceed to")
-                                        || lower_resp.contains("next step")
-                                        || lower_resp.contains("continue by")
-                                        || lower_resp.contains("now let")
-                                        || lower_resp.contains("validate")
-                                        || lower_resp.contains("inspect")
-                                        || lower_resp.contains("examine")
-                                        || lower_resp.contains("double check")
-                                        || lower_resp.contains("need to")
-                                        || lower_resp.contains("will now")
-                                        || lower_resp.contains("let me")
-                                        || lower_resp.contains("let's")));
 
-                            if is_transitional || is_empty_turn {
+                            if transitional_nudges < 15 {
                                 transitional_nudges += 1;
                                 let nudge_msg = if is_empty_turn {
-                                    "[System Guidance]: You completed your reasoning but did not invoke any tools or output a final answer. Please invoke the appropriate tool to proceed with the task or provide your final response.".to_string()
+                                    "[System Guidance]: You completed your reasoning but did not invoke any tools or output a final answer. Please invoke the appropriate tool to proceed with the task or provide your final response with `<!-- GOAL_COMPLETE -->`.".to_string()
+                                } else if transitional_nudges <= 2 {
+                                    "[System Guidance]: You provided intermediate commentary without invoking any tools. In autonomous mode, you must not narrate your intent without acting. If you need to inspect files, execute commands, or edit code, CALL THE RELEVANT TOOL IMMEDIATELY now. If you are completely finished and have verified your solution, provide your final response summarizing what you accomplished and include `<!-- GOAL_COMPLETE -->`.".to_string()
+                                } else if transitional_nudges <= 6 {
+                                    "[Autonomous Execution Guard]: You must invoke an actionable tool (`run_command`, `write_file`, `edit_file`, or `read_file`) to advance the task. Do not output text without a tool call. If all requirements and verification steps are 100% satisfied, emit `<!-- GOAL_COMPLETE -->` alongside your final summary.".to_string()
                                 } else {
-                                    "[System Guidance]: You provided intermediate commentary without invoking any tools. In autonomous mode, you must not narrate your intent without acting. If you need to inspect files, execute commands, or edit code, CALL THE RELEVANT TOOL IMMEDIATELY now. If you are completely finished, provide your final response summarizing what you accomplished and stating the task is complete.".to_string()
+                                    "[Autonomous Execution Guard - Escalation]: Turn execution cannot terminate without invoking tools or completing verification. You have not submitted the final result. Call `run_command` now to verify your output against ground-truth files, or execute the next implementation step.".to_string()
                                 };
                                 working_history.push(ChatMessage {
                                     role: "assistant".to_string(),
@@ -3224,9 +3212,8 @@ impl HarnessManager {
                                 (None, _) => false,
                             };
 
-                            if pre_exit_unverified_edit_count < 2
+                            if pre_exit_unverified_edit_count < 3
                                 && edits_unverified
-                                && !is_explicit_completion
                             {
                                 pre_exit_unverified_edit_count += 1;
                                 let rejection_msg = "<pre_exit_verification_failure>\n[Pre-Exit Unverified Edit Guard]\nYou modified or created source files after your last command execution (or have not executed a verification command yet). Do not assume code works just because it was edited or generated — execute a verification/test command via `run_command` to confirm all tests and tolerance thresholds pass before concluding.\n</pre_exit_verification_failure>".to_string();
