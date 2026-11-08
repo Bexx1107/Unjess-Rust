@@ -57,6 +57,21 @@ fn create_shortcut(shortcut_path: &Path, target_exe: &Path, working_dir: &Path) 
     let _ = cmd.status();
 }
 
+fn download_file(url: &str, dst: &Path) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .user_agent("Unjess-Installer/4.0.1")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().map_err(|e| e.to_string())?;
+    fs::write(dst, &bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() {
     println!("====================================================");
     println!(
@@ -74,6 +89,7 @@ fn main() {
             target_dir.display(),
             e
         );
+        std::thread::sleep(std::time::Duration::from_secs(4));
         std::process::exit(1);
     }
     println!("[+] Created install directory: {}", target_dir.display());
@@ -101,8 +117,8 @@ fn main() {
             PathBuf::from("target").join("release").join(bin_name),
             PathBuf::from(bin_name),
         ];
+        let dst = target_dir.join(bin_name);
         if let Some(src) = candidates.iter().find(|p| p.exists()) {
-            let dst = target_dir.join(bin_name);
             if src != &dst {
                 match fs::copy(src, &dst) {
                     Ok(_) => {
@@ -115,18 +131,35 @@ fn main() {
                 installed_count += 1;
             }
         } else {
-            println!(
-                "[*] Note: {} not found next to installer (skipping copy)",
+            // Attempt to download directly from GitHub raw dist if not found locally
+            println!("[*] Downloading {} from GitHub...", bin_name);
+            let dl_url = format!(
+                "https://github.com/Bexx1107/Unjess-Rust/raw/main/dist/{}",
                 bin_name
             );
+            match download_file(&dl_url, &dst) {
+                Ok(_) => {
+                    installed_count += 1;
+                    println!("[+] Downloaded & installed {} -> {}", bin_name, dst.display());
+                }
+                Err(e) => {
+                    println!(
+                        "[*] Note: {} not found locally and download skipped ({})",
+                        bin_name, e
+                    );
+                }
+            }
         }
     }
 
     if installed_count == 0 && !target_dir.join("Unjess.exe").exists() {
         eprintln!(
-            "[!] Error: No Unjess binaries were found next to installer ({}). Run build-all.ps1 first.",
+            "[!] Error: No Unjess binaries were found next to installer ({}) and could not be fetched.",
             exe_dir.display()
         );
+        println!("\nPress Enter to exit...");
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_line(&mut buf);
         std::process::exit(1);
     }
 
@@ -211,4 +244,19 @@ fn main() {
         target_dir.display()
     );
     println!("====================================================");
+
+    if !env::args().any(|a| a == "--no-launch") {
+        println!("[+] Spawning Unjess GUI...");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = Command::new(&desktop_exe)
+                .creation_flags(0x08000000)
+                .spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = Command::new(&desktop_exe).spawn();
+        }
+    }
 }

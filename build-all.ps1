@@ -85,7 +85,7 @@ try {
     $setupHash = (Get-FileHash -Path (Join-Path $distDir "Unjess-Setup.exe") -Algorithm SHA256).Hash.ToLower()
 
     $manifest = [ordered]@{
-        version      = "4.0.0"
+        version      = "4.0.1"
         edition      = "native-rust"
         architecture = "windows-x86_64"
         port         = 9758

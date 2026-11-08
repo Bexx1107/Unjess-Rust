@@ -4195,6 +4195,7 @@ name = "unjess-installer"
 version = "4.0.1"
 dependencies = [
  "dirs",
+ "reqwest",
  "unjess-core",
 ]
 

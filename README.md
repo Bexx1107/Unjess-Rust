@@ -8,7 +8,7 @@
 
 # Unjess
 
-**Unjess** (`v4.0.0`) is a native **Rust** autonomous AI coding and security engineering harness built as a self-contained Cargo workspace.
+**Unjess** (`v4.0.1`) is a native **Rust** autonomous AI coding and security engineering harness built as a self-contained Cargo workspace.
 
 ---
 
