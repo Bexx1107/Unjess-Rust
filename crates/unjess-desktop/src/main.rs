@@ -1717,6 +1717,8 @@ impl UnjessDesktopApp {
                         ui.add_space(8.0);
                         for tool_name in [
                             "todo_write",
+                            "apply_patch",
+                            "lsp_diagnostics",
                             "ast_edit_symbol",
                             "ast_rename_symbol",
                             "git_archeology",

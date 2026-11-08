@@ -275,6 +275,174 @@ pub fn is_transient_llm_error(err: &str) -> bool {
         || lower.contains("timed out")
 }
 
+/// Returns the context window capacity (in tokens) for `model` to power dynamic context-budget compaction.
+pub fn model_context_window_tokens(model: &str) -> usize {
+    let m = model.trim().to_lowercase();
+    if m.starts_with("gemini-") || m.starts_with("antigravity-") || m.starts_with("learnlm-") {
+        1_000_000
+    } else if m.starts_with("claude-")
+        || m.starts_with("gpt-5")
+        || m == "o3"
+        || m.starts_with("o3-")
+        || m.starts_with("o4-")
+        || m.starts_with("kimi-")
+        || m.starts_with("moonshot-")
+        || m.starts_with("qwen3.")
+        || m.starts_with("grok-")
+    {
+        200_000
+    } else if m.starts_with("deepseek-")
+        || m.starts_with("glm-")
+        || m.starts_with("codestral")
+        || m.starts_with("mistral-")
+        || m.starts_with("llama-3.3")
+        || m.ends_with(":cloud")
+        || m.contains('/')
+    {
+        128_000
+    } else {
+        32_768
+    }
+}
+
+/// Serializes conversation history for OpenAI-compatible endpoints (`/v1/chat/completions`),
+/// preserving structured `tool_calls`, `reasoning_content`, and paired `role: "tool"` (`tool_call_id`)
+/// messages across multi-step reasoning turns.
+pub fn serialize_openai_messages(
+    system_prompt: &str,
+    history: &[ChatMessage],
+) -> Vec<serde_json::Value> {
+    let mut messages = vec![serde_json::json!({
+        "role": "system",
+        "content": system_prompt
+    })];
+    for idx in 0..history.len() {
+        let m = &history[idx];
+        let paired_with_next_tool = m.role == "assistant"
+            && !m.tool_calls.is_empty()
+            && idx + 1 < history.len()
+            && history[idx + 1].role == "tool"
+            && !history[idx + 1].tool_calls.is_empty();
+        let paired_with_prev_assistant = m.role == "tool"
+            && !m.tool_calls.is_empty()
+            && idx > 0
+            && history[idx - 1].role == "assistant"
+            && !history[idx - 1].tool_calls.is_empty();
+
+        if paired_with_next_tool {
+            let tc_json: Vec<serde_json::Value> = m
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments.to_string()
+                        }
+                    })
+                })
+                .collect();
+            let mut msg_obj = serde_json::json!({
+                "role": "assistant",
+                "content": if m.content.trim().is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(m.content.clone())
+                },
+                "tool_calls": tc_json
+            });
+            if let Some(ref th) = m.thinking {
+                if !th.trim().is_empty() {
+                    msg_obj["reasoning_content"] = serde_json::Value::String(th.clone());
+                }
+            }
+            messages.push(msg_obj);
+        } else if paired_with_prev_assistant {
+            for tc in &m.tool_calls {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tc.name,
+                    "content": tc.result
+                }));
+            }
+        } else {
+            messages.push(serde_json::json!({
+                "role": if m.role == "tool" { "user" } else { &m.role },
+                "content": m.content
+            }));
+        }
+    }
+    messages
+}
+
+/// Serializes conversation history for Ollama (`/api/chat`), preserving native `tool_calls`,
+/// `thinking`, and `role: "tool"` messages across multi-step reasoning turns.
+pub fn serialize_ollama_messages(
+    system_prompt: &str,
+    history: &[ChatMessage],
+) -> Vec<serde_json::Value> {
+    let mut messages = vec![serde_json::json!({
+        "role": "system",
+        "content": system_prompt
+    })];
+    for idx in 0..history.len() {
+        let m = &history[idx];
+        let paired_with_next_tool = m.role == "assistant"
+            && !m.tool_calls.is_empty()
+            && idx + 1 < history.len()
+            && history[idx + 1].role == "tool"
+            && !history[idx + 1].tool_calls.is_empty();
+        let paired_with_prev_assistant = m.role == "tool"
+            && !m.tool_calls.is_empty()
+            && idx > 0
+            && history[idx - 1].role == "assistant"
+            && !history[idx - 1].tool_calls.is_empty();
+
+        if paired_with_next_tool {
+            let tc_json: Vec<serde_json::Value> = m
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        }
+                    })
+                })
+                .collect();
+            let mut msg_obj = serde_json::json!({
+                "role": "assistant",
+                "content": m.content,
+                "tool_calls": tc_json
+            });
+            if let Some(ref th) = m.thinking {
+                if !th.trim().is_empty() {
+                    msg_obj["thinking"] = serde_json::Value::String(th.clone());
+                }
+            }
+            messages.push(msg_obj);
+        } else if paired_with_prev_assistant {
+            for tc in &m.tool_calls {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "name": tc.name,
+                    "content": tc.result
+                }));
+            }
+        } else {
+            messages.push(serde_json::json!({
+                "role": if m.role == "tool" { "user" } else { &m.role },
+                "content": m.content
+            }));
+        }
+    }
+    messages
+}
+
 /// Executes a single async completion turn against the resolved provider with connection pooling
 /// and up to 3 automatic retries on transient HTTP 503 (High Demand / Service Unavailable) and 429/5xx errors.
 pub async fn complete_llm_turn(
@@ -282,6 +450,17 @@ pub async fn complete_llm_turn(
     system_prompt: &str,
     history: &[ChatMessage],
     enable_tools: bool,
+) -> Result<LlmTurnResponse, String> {
+    complete_llm_turn_filtered(settings, system_prompt, history, enable_tools, None).await
+}
+
+/// Executes a single async completion turn with optional subagent tool-schema filtering (`allowed_tools`).
+pub async fn complete_llm_turn_filtered(
+    settings: &Settings,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    enable_tools: bool,
+    allowed_tools: Option<&[String]>,
 ) -> Result<LlmTurnResponse, String> {
     let model = if settings.model.trim().is_empty() {
         "qwen2.5-coder:7b".to_string()
@@ -302,13 +481,40 @@ pub async fn complete_llm_turn(
     for attempt in 1..=max_attempts {
         let res = match provider.as_str() {
             "google" | "gemini" => {
-                call_gemini(client, settings, &model, system_prompt, history, enable_tools).await
+                call_gemini(
+                    client,
+                    settings,
+                    &model,
+                    system_prompt,
+                    history,
+                    enable_tools,
+                    allowed_tools,
+                )
+                .await
             }
             "anthropic" | "claude" => {
-                call_anthropic(client, settings, &model, system_prompt, history, enable_tools).await
+                call_anthropic(
+                    client,
+                    settings,
+                    &model,
+                    system_prompt,
+                    history,
+                    enable_tools,
+                    allowed_tools,
+                )
+                .await
             }
             "ollama" => {
-                call_ollama(client, settings, &model, system_prompt, history, enable_tools).await
+                call_ollama(
+                    client,
+                    settings,
+                    &model,
+                    system_prompt,
+                    history,
+                    enable_tools,
+                    allowed_tools,
+                )
+                .await
             }
             other => {
                 call_openai_compatible(
@@ -319,6 +525,7 @@ pub async fn complete_llm_turn(
                     system_prompt,
                     history,
                     enable_tools,
+                    allowed_tools,
                 )
                 .await
             }
@@ -349,21 +556,13 @@ async fn call_ollama(
     system_prompt: &str,
     history: &[ChatMessage],
     enable_tools: bool,
+    allowed_tools: Option<&[String]>,
 ) -> Result<LlmTurnResponse, String> {
     let raw_base = settings.ollama_base_url.trim_end_matches('/');
     let primary_base = raw_base.replace("http://localhost:", "http://127.0.0.1:");
     let url = format!("{}/api/chat", primary_base);
 
-    let mut messages = vec![serde_json::json!({
-        "role": "system",
-        "content": system_prompt
-    })];
-    for m in history {
-        messages.push(serde_json::json!({
-            "role": if m.role == "tool" { "user" } else { &m.role },
-            "content": m.content
-        }));
-    }
+    let messages = serialize_ollama_messages(system_prompt, history);
 
     let mut body = serde_json::json!({
         "model": model,
@@ -376,7 +575,7 @@ async fn call_ollama(
         body["options"] = serde_json::json!({ "num_ctx": num_ctx });
     }
     if enable_tools {
-        body["tools"] = ToolEngine::tool_schemas();
+        body["tools"] = ToolEngine::tool_schemas_filtered(allowed_tools);
     }
 
     let timeout_secs = settings.llm_timeout.max(15.0) as u64;
@@ -474,6 +673,7 @@ async fn call_openai_compatible(
     system_prompt: &str,
     history: &[ChatMessage],
     enable_tools: bool,
+    allowed_tools: Option<&[String]>,
 ) -> Result<LlmTurnResponse, String> {
     let base_url = match provider {
         "openai" => "https://api.openai.com/v1".to_string(),
@@ -524,23 +724,14 @@ async fn call_openai_compatible(
     let url = format!("{}/chat/completions", base_url);
     let api_key = settings.get_api_key(provider).unwrap_or_default();
 
-    let mut messages = vec![serde_json::json!({
-        "role": "system",
-        "content": system_prompt
-    })];
-    for m in history {
-        messages.push(serde_json::json!({
-            "role": if m.role == "tool" { "user" } else { &m.role },
-            "content": m.content
-        }));
-    }
+    let messages = serialize_openai_messages(system_prompt, history);
 
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
     });
     if enable_tools {
-        body["tools"] = ToolEngine::tool_schemas();
+        body["tools"] = ToolEngine::tool_schemas_filtered(allowed_tools);
     }
     let m_lower = model.trim().to_lowercase();
     if (m_lower.starts_with("o1") || m_lower.starts_with("o3") || m_lower.starts_with("o4-"))
@@ -672,6 +863,7 @@ async fn call_anthropic(
     system_prompt: &str,
     history: &[ChatMessage],
     enable_tools: bool,
+    allowed_tools: Option<&[String]>,
 ) -> Result<LlmTurnResponse, String> {
     let api_key = settings
         .get_api_key("anthropic")
@@ -704,7 +896,7 @@ async fn call_anthropic(
 
     let mut tools_list = Vec::new();
     if enable_tools {
-        if let Some(arr) = ToolEngine::tool_schemas().as_array() {
+        if let Some(arr) = ToolEngine::tool_schemas_filtered(allowed_tools).as_array() {
             for item in arr {
                 if let Some(f) = item.get("function") {
                     tools_list.push(serde_json::json!({
@@ -865,6 +1057,7 @@ async fn call_gemini(
     system_prompt: &str,
     history: &[ChatMessage],
     enable_tools: bool,
+    allowed_tools: Option<&[String]>,
 ) -> Result<LlmTurnResponse, String> {
     let api_key = settings
         .get_api_key("google")
@@ -904,7 +1097,7 @@ async fn call_gemini(
 
     let mut func_decls = Vec::new();
     if enable_tools {
-        if let Some(arr) = ToolEngine::tool_schemas().as_array() {
+        if let Some(arr) = ToolEngine::tool_schemas_filtered(allowed_tools).as_array() {
             for item in arr {
                 if let Some(f) = item.get("function") {
                     func_decls.push(sanitize_gemini_schema(f));
@@ -1166,5 +1359,84 @@ mod tests {
         let (thinking2, clean2) = extract_think_tags(unclosed);
         assert_eq!(thinking2.as_deref(), Some("Trailing truncated thought"));
         assert_eq!(clean2, "Answer prefix");
+    }
+
+    #[test]
+    fn test_native_tool_call_and_reasoning_replay_serialization() {
+        assert_eq!(model_context_window_tokens("gemini-3.8-flash"), 1_000_000);
+        assert_eq!(model_context_window_tokens("kimi-k3"), 200_000);
+        assert_eq!(model_context_window_tokens("deepseek-v4.1-flash:cloud"), 128_000);
+        assert_eq!(model_context_window_tokens("qwen2.5-coder:7b"), 32_768);
+
+        let tc = ToolCallRecord {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "path": "src/main.rs" }),
+            result: "1: fn main() {}".to_string(),
+            status: "ok".to_string(),
+            duration_ms: 5,
+        };
+        let history = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Inspect main.rs".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                timestamp: "12:00:00".to_string(),
+                model: None,
+                tokens: 10,
+                input_tokens: 10,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                thinking: Some("I should read src/main.rs first.".to_string()),
+                tool_calls: vec![tc.clone()],
+                diffs: Vec::new(),
+                timestamp: "12:00:01".to_string(),
+                model: Some("kimi-k3".to_string()),
+                tokens: 20,
+                input_tokens: 10,
+                output_tokens: 10,
+                cost_usd: 0.0,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "[Tool `read_file` result]:\n1: fn main() {}".to_string(),
+                thinking: None,
+                tool_calls: vec![tc],
+                diffs: Vec::new(),
+                timestamp: "12:00:02".to_string(),
+                model: None,
+                tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            },
+        ];
+
+        let openai_msgs = serialize_openai_messages("sys", &history);
+        assert_eq!(openai_msgs.len(), 4);
+        assert_eq!(openai_msgs[2]["role"], "assistant");
+        assert_eq!(
+            openai_msgs[2]["reasoning_content"],
+            "I should read src/main.rs first."
+        );
+        assert_eq!(openai_msgs[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(openai_msgs[3]["role"], "tool");
+        assert_eq!(openai_msgs[3]["tool_call_id"], "call_1");
+
+        let ollama_msgs = serialize_ollama_messages("sys", &history);
+        assert_eq!(ollama_msgs.len(), 4);
+        assert_eq!(ollama_msgs[2]["role"], "assistant");
+        assert_eq!(
+            ollama_msgs[2]["thinking"],
+            "I should read src/main.rs first."
+        );
+        assert_eq!(ollama_msgs[3]["role"], "tool");
+        assert_eq!(ollama_msgs[3]["name"], "read_file");
     }
 }

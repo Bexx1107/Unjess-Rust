@@ -8,7 +8,9 @@
 
 use crate::codeintel::generate_repo_map;
 use crate::config::Settings;
-use crate::llm::{complete_llm_turn, ChatMessage};
+use crate::llm::{
+    complete_llm_turn, complete_llm_turn_filtered, model_context_window_tokens, ChatMessage,
+};
 use crate::mcp::McpManager;
 use crate::memory::MemoryStore;
 use crate::security::scan_workspace;
@@ -223,6 +225,8 @@ struct PersistedHarnessState {
     agent_mode: String,
     caveman_mode: bool,
     ponytail_mode: bool,
+    #[serde(default)]
+    tree_snapshots: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Thread-safe central state and autonomous execution manager for Unjess 4.0.
@@ -267,9 +271,69 @@ impl HarnessManager {
             wf.normalize();
         }
         // Reset any stale "running" subagent statuses left from a prior process exit
+        // and ensure built-in role-scoped subagents have their full tool allowlists.
         for sub in &mut state.subagents {
             if sub.status == "running" {
                 sub.status = "idle".to_string();
+            }
+            let default_role_tools: &[&str] = match sub.id.as_str() {
+                "sub-architect" => &[
+                    "read_file",
+                    "outline_file",
+                    "repo_map",
+                    "find_callers",
+                    "grep_search",
+                    "find_by_name",
+                    "list_dir",
+                    "git_archeology",
+                    "lsp_diagnostics",
+                    "run_skill_plugin",
+                    "call_mcp_tool",
+                    "probe_mcp_server",
+                    "mcp_status",
+                ],
+                "sub-coder" => &[
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "multi_edit_file",
+                    "apply_patch",
+                    "ast_edit_symbol",
+                    "ast_rename_symbol",
+                    "delete_file",
+                    "grep_search",
+                    "find_by_name",
+                    "list_dir",
+                    "outline_file",
+                    "find_callers",
+                    "lsp_diagnostics",
+                    "debug_trace",
+                    "shadow_sandbox",
+                    "run_command",
+                    "run_skill_plugin",
+                    "call_mcp_tool",
+                    "probe_mcp_server",
+                    "mcp_status",
+                ],
+                "sub-security" => &[
+                    "grep_search",
+                    "find_by_name",
+                    "list_dir",
+                    "read_file",
+                    "outline_file",
+                    "find_callers",
+                    "git_archeology",
+                    "lsp_diagnostics",
+                    "security_scan",
+                    "run_skill_plugin",
+                    "call_mcp_tool",
+                ],
+                _ => &[],
+            };
+            for &t in default_role_tools {
+                if !sub.tools.iter().any(|existing| existing == t) {
+                    sub.tools.push(t.to_string());
+                }
             }
         }
 
@@ -366,7 +430,21 @@ impl HarnessManager {
                     text: String::new(),
                     conv_id: conv_id.clone(),
                     current_task: String::new(),
-                    tools: vec!["read_file".to_string(), "outline_file".to_string(), "repo_map".to_string(), "find_callers".to_string(), "run_skill_plugin".to_string(), "call_mcp_tool".to_string(), "probe_mcp_server".to_string(), "mcp_status".to_string()],
+                    tools: vec![
+                        "read_file".to_string(),
+                        "outline_file".to_string(),
+                        "repo_map".to_string(),
+                        "find_callers".to_string(),
+                        "grep_search".to_string(),
+                        "find_by_name".to_string(),
+                        "list_dir".to_string(),
+                        "git_archeology".to_string(),
+                        "lsp_diagnostics".to_string(),
+                        "run_skill_plugin".to_string(),
+                        "call_mcp_tool".to_string(),
+                        "probe_mcp_server".to_string(),
+                        "mcp_status".to_string(),
+                    ],
                     tool_calls: Vec::new(),
                     diffs: Vec::new(),
                     logs: Vec::new(),
@@ -387,7 +465,29 @@ impl HarnessManager {
                     text: String::new(),
                     conv_id: conv_id.clone(),
                     current_task: String::new(),
-                    tools: vec!["read_file".to_string(), "write_file".to_string(), "edit_file".to_string(), "multi_edit_file".to_string(), "run_command".to_string(), "run_skill_plugin".to_string(), "call_mcp_tool".to_string(), "probe_mcp_server".to_string(), "mcp_status".to_string()],
+                    tools: vec![
+                        "read_file".to_string(),
+                        "write_file".to_string(),
+                        "edit_file".to_string(),
+                        "multi_edit_file".to_string(),
+                        "apply_patch".to_string(),
+                        "ast_edit_symbol".to_string(),
+                        "ast_rename_symbol".to_string(),
+                        "delete_file".to_string(),
+                        "grep_search".to_string(),
+                        "find_by_name".to_string(),
+                        "list_dir".to_string(),
+                        "outline_file".to_string(),
+                        "find_callers".to_string(),
+                        "lsp_diagnostics".to_string(),
+                        "debug_trace".to_string(),
+                        "shadow_sandbox".to_string(),
+                        "run_command".to_string(),
+                        "run_skill_plugin".to_string(),
+                        "call_mcp_tool".to_string(),
+                        "probe_mcp_server".to_string(),
+                        "mcp_status".to_string(),
+                    ],
                     tool_calls: Vec::new(),
                     diffs: Vec::new(),
                     logs: Vec::new(),
@@ -408,7 +508,19 @@ impl HarnessManager {
                     text: String::new(),
                     conv_id: conv_id,
                     current_task: String::new(),
-                    tools: vec!["grep_search".to_string(), "read_file".to_string(), "outline_file".to_string(), "find_callers".to_string(), "security_scan".to_string(), "run_skill_plugin".to_string(), "call_mcp_tool".to_string()],
+                    tools: vec![
+                        "grep_search".to_string(),
+                        "find_by_name".to_string(),
+                        "list_dir".to_string(),
+                        "read_file".to_string(),
+                        "outline_file".to_string(),
+                        "find_callers".to_string(),
+                        "git_archeology".to_string(),
+                        "lsp_diagnostics".to_string(),
+                        "security_scan".to_string(),
+                        "run_skill_plugin".to_string(),
+                        "call_mcp_tool".to_string(),
+                    ],
                     tool_calls: Vec::new(),
                     diffs: Vec::new(),
                     logs: Vec::new(),
@@ -420,6 +532,7 @@ impl HarnessManager {
             agent_mode: "Autonomous".to_string(),
             caveman_mode: false,
             ponytail_mode: false,
+            tree_snapshots: std::collections::HashMap::new(),
         }
     }
 
@@ -944,12 +1057,32 @@ impl HarnessManager {
         new_msgs
     }
 
-    /// Two-stage KV-cache-friendly intra-turn compaction:
+    /// Two-stage KV-cache-friendly intra-turn compaction (128K default baseline):
     /// 1. Deduplicates superseded `read_file` outputs that share the exact same `[File: ...]` header.
     /// 2. Stage-1 (above 100,000 chars): prunes older tool outputs (>5,500 chars) to 4,096 head + 1,024 tail chars.
     /// 3. Stage-2 (above 160,000 chars): summarizes older messages via `compact_messages`.
     pub fn compact_messages_smartly(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        Self::compact_messages_for_model(messages, "gpt-4o")
+    }
+
+    /// Model-aware dynamic context compaction with a 20% headroom buffer:
+    /// Scales Stage-1 and Stage-2 character thresholds to the active model's token context window
+    /// (e.g. 32K local GGUF vs. 128K/200K/1M cloud models) and prunes both `m.content` and
+    /// structured `m.tool_calls` outputs for native multi-turn tool replay.
+    pub fn compact_messages_for_model(messages: &[ChatMessage], model: &str) -> Vec<ChatMessage> {
         let mut msgs = messages.to_vec();
+        let ctx_tokens = model_context_window_tokens(model);
+        // Reserve 20% headroom for system prompt, tool schemas, and output generation
+        let usable_tokens = (ctx_tokens.saturating_mul(80)) / 100;
+        let (stage1_threshold, stage2_threshold) = if usable_tokens <= 30_000 {
+            (40_000usize, 72_000usize)
+        } else if usable_tokens <= 60_000 {
+            (70_000usize, 115_000usize)
+        } else if usable_tokens <= 120_000 {
+            (100_000usize, 160_000usize)
+        } else {
+            (160_000usize, 260_000usize)
+        };
 
         // Pass 1: Deduplicate superseded `read_file` outputs with identical `[File: ...]` headers
         let mut latest_file_header_idx: std::collections::HashMap<String, usize> =
@@ -960,6 +1093,14 @@ impl HarnessManager {
                     let trimmed = line.trim();
                     if trimmed.starts_with("[File: ") && trimmed.ends_with(']') {
                         latest_file_header_idx.insert(trimmed.to_string(), idx);
+                    }
+                }
+                for tc in &m.tool_calls {
+                    for line in tc.result.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("[File: ") && trimmed.ends_with(']') {
+                            latest_file_header_idx.insert(trimmed.to_string(), idx);
+                        }
                     }
                 }
             }
@@ -984,39 +1125,82 @@ impl HarnessManager {
                         }
                     }
                 }
-            }
-        }
-
-        // Pass 2: Stage-1 head+tail pruning when total context exceeds 100,000 chars
-        let total_chars: usize = msgs.iter().map(|m| m.content.len()).sum();
-        if total_chars > 100_000 && msgs.len() > 4 {
-            let protect_from = msgs.len().saturating_sub(4);
-            for m in &mut msgs[..protect_from] {
-                if m.role == "tool" && m.content.chars().count() > 5500 {
-                    let total_c = m.content.chars().count();
-                    let head: String = m.content.chars().take(4096).collect();
-                    let tail: String = m
-                        .content
-                        .chars()
-                        .rev()
-                        .take(1024)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                    m.content = format!(
-                        "{}\n\n... [Stage-1 Intra-Turn Pruned {} chars (kept 4096 head + 1024 tail)] ...\n\n{}",
-                        head,
-                        total_c.saturating_sub(5120),
-                        tail
-                    );
+                for tc in &mut m.tool_calls {
+                    let mut tc_hdr = None;
+                    for line in tc.result.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("[File: ") && trimmed.ends_with(']') {
+                            tc_hdr = Some(trimmed.to_string());
+                            break;
+                        }
+                    }
+                    if let Some(hdr) = tc_hdr {
+                        if let Some(&latest_idx) = latest_file_header_idx.get(&hdr) {
+                            if idx < latest_idx && tc.result.len() > 240 {
+                                tc.result = format!(
+                                    "{}\n[Superseded read_file output — see newer read of this file in step #{}]",
+                                    hdr, latest_idx
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Pass 3: Stage-2 structural digest compaction when context still exceeds 160,000 chars
+        // Pass 2: Stage-1 head+tail pruning when total context exceeds `stage1_threshold`
+        let total_chars: usize = msgs.iter().map(|m| m.content.len()).sum();
+        if total_chars > stage1_threshold && msgs.len() > 4 {
+            let protect_from = msgs.len().saturating_sub(4);
+            for m in &mut msgs[..protect_from] {
+                if m.role == "tool" {
+                    if m.content.chars().count() > 5500 {
+                        let total_c = m.content.chars().count();
+                        let head: String = m.content.chars().take(4096).collect();
+                        let tail: String = m
+                            .content
+                            .chars()
+                            .rev()
+                            .take(1024)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        m.content = format!(
+                            "{}\n\n... [Stage-1 Intra-Turn Pruned {} chars (kept 4096 head + 1024 tail)] ...\n\n{}",
+                            head,
+                            total_c.saturating_sub(5120),
+                            tail
+                        );
+                    }
+                    for tc in &mut m.tool_calls {
+                        if tc.result.chars().count() > 5500 {
+                            let total_c = tc.result.chars().count();
+                            let head: String = tc.result.chars().take(4096).collect();
+                            let tail: String = tc
+                                .result
+                                .chars()
+                                .rev()
+                                .take(1024)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect();
+                            tc.result = format!(
+                                "{}\n\n... [Stage-1 Intra-Turn Pruned {} chars (kept 4096 head + 1024 tail)] ...\n\n{}",
+                                head,
+                                total_c.saturating_sub(5120),
+                                tail
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 3: Stage-2 structural digest compaction when context still exceeds `stage2_threshold`
         let post_stage1_chars: usize = msgs.iter().map(|m| m.content.len()).sum();
-        if (post_stage1_chars > 160_000 || msgs.len() > 40) && msgs.len() > 8 {
+        if (post_stage1_chars > stage2_threshold || msgs.len() > 40) && msgs.len() > 8 {
             msgs = Self::compact_messages(&msgs, 8);
         }
 
@@ -1540,7 +1724,23 @@ impl HarnessManager {
                 break;
             }
 
-            let mut llm_res = complete_llm_turn(&settings, &sys_prompt, &history, true).await;
+            if settings.enable_compaction {
+                history = Self::compact_messages_for_model(&history, &settings.model);
+            }
+
+            let allowed_slice = if allowed_tools.is_empty() {
+                None
+            } else {
+                Some(allowed_tools.as_slice())
+            };
+            let mut llm_res = complete_llm_turn_filtered(
+                &settings,
+                &sys_prompt,
+                &history,
+                true,
+                allowed_slice,
+            )
+            .await;
             if llm_res.is_err() && !settings.fallback_models.is_empty() {
                 for fb_model in settings.fallback_models.clone() {
                     if fb_model.trim().is_empty() || fb_model == settings.model {
@@ -1548,8 +1748,14 @@ impl HarnessManager {
                     }
                     let mut fb_settings = settings.clone();
                     fb_settings.model = fb_model.trim().to_string();
-                    if let Ok(ok_resp) =
-                        complete_llm_turn(&fb_settings, &sys_prompt, &history, true).await
+                    if let Ok(ok_resp) = complete_llm_turn_filtered(
+                        &fb_settings,
+                        &sys_prompt,
+                        &history,
+                        true,
+                        allowed_slice,
+                    )
+                    .await
                     {
                         settings.model = fb_settings.model;
                         llm_res = Ok(ok_resp);
@@ -1559,11 +1765,18 @@ impl HarnessManager {
             }
 
             match llm_res {
-                Ok(resp) => {
+                Ok(mut resp) => {
                     sub_tokens += resp.tokens;
                     sub_in_tokens += resp.input_tokens;
                     sub_out_tokens += resp.output_tokens;
                     sub_cost += resp.cost_usd;
+
+                    if resp.pending_tool_calls.is_empty() {
+                        let fallback_calls = Self::extract_tool_calls_from_text(&resp.content);
+                        if !fallback_calls.is_empty() {
+                            resp.pending_tool_calls = fallback_calls;
+                        }
+                    }
 
                     if !resp.content.is_empty() {
                         final_output = resp.content.clone();
@@ -1572,15 +1785,25 @@ impl HarnessManager {
                         break;
                     }
                     let mut tool_outputs = Vec::new();
+                    let mut step_tools = Vec::new();
                     let mut stuck = false;
                     for (tc_id, tc_name, tc_args) in resp.pending_tool_calls {
                         if self.abort_flag.load(Ordering::SeqCst) {
                             break;
                         }
                         if tc_name == "delegate_subagent" || tc_name == "delegate_parallel_subagents" {
-                            tool_outputs.push(
-                                "[Tool `delegate_subagent` result]: Recursive subagent delegation is disabled inside subagents.".to_string(),
-                            );
+                            let msg = "[Tool `delegate_subagent` result]: Recursive subagent delegation is disabled inside subagents.".to_string();
+                            let rec = ToolCallRecord {
+                                id: tc_id,
+                                name: tc_name,
+                                arguments: tc_args,
+                                result: msg.clone(),
+                                status: "error".to_string(),
+                                duration_ms: 0,
+                            };
+                            step_tools.push(rec.clone());
+                            sub_tools.push(rec);
+                            tool_outputs.push(msg);
                             continue;
                         }
                         if !allowed_tools.is_empty()
@@ -1596,18 +1819,20 @@ impl HarnessManager {
                                 resolved_id,
                                 allowed_tools.join(", ")
                             );
-                            sub_tools.push(ToolCallRecord {
+                            let rec = ToolCallRecord {
                                 id: tc_id,
                                 name: tc_name,
                                 arguments: tc_args,
                                 result: blocked_msg.clone(),
                                 status: "error".to_string(),
                                 duration_ms: 0,
-                            });
+                            };
+                            step_tools.push(rec.clone());
+                            sub_tools.push(rec);
                             tool_outputs.push(blocked_msg);
                             continue;
                         }
-                        let sig = format!("{}:{}", tc_name, tc_args);
+                        let sig = Self::canonicalize_tool_call_key(&tc_name, &tc_args);
                         recent_sigs.push(sig.clone());
                         let slen = recent_sigs.len();
                         if slen >= 3
@@ -1638,7 +1863,7 @@ impl HarnessManager {
                         if let Some(d) = diff_opt {
                             sub_diffs.push(d);
                         }
-                        sub_tools.push(ToolCallRecord {
+                        let rec = ToolCallRecord {
                             id: tc_id,
                             name: tc_name.clone(),
                             arguments: tc_args,
@@ -1649,18 +1874,16 @@ impl HarnessManager {
                                 "error".to_string()
                             },
                             duration_ms,
-                        });
+                        };
+                        step_tools.push(rec.clone());
+                        sub_tools.push(rec);
                         tool_outputs.push(format!("[Tool `{}` result]:\n{}", tc_name, clipped));
                     }
                     history.push(ChatMessage {
                         role: "assistant".to_string(),
-                        content: if final_output.is_empty() {
-                            "Executing subagent tools...".to_string()
-                        } else {
-                            final_output.clone()
-                        },
-                        thinking: None,
-                        tool_calls: Vec::new(),
+                        content: resp.content.clone(),
+                        thinking: resp.thinking.clone(),
+                        tool_calls: step_tools.clone(),
                         diffs: Vec::new(),
                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                         model: Some(settings.model.clone()),
@@ -1673,7 +1896,7 @@ impl HarnessManager {
                         role: "tool".to_string(),
                         content: tool_outputs.join("\n\n"),
                         thinking: None,
-                        tool_calls: Vec::new(),
+                        tool_calls: step_tools,
                         diffs: Vec::new(),
                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                         model: None,
@@ -1844,6 +2067,7 @@ impl HarnessManager {
         let mut restored = Vec::new();
         let mut deleted = Vec::new();
         let ws_root = self.active_workspace_path();
+        let mut tree_snapshot_to_restore: Option<String> = None;
 
         if let Ok(mut g) = self.state.write() {
             let target_id = if conv_id.is_empty() {
@@ -1851,6 +2075,9 @@ impl HarnessManager {
             } else {
                 conv_id.to_string()
             };
+            if let Some(stack) = g.tree_snapshots.get_mut(&target_id) {
+                tree_snapshot_to_restore = stack.pop();
+            }
             if let Some(conv) = g.conversations.iter_mut().find(|c| c.id == target_id) {
                 if let Some(last_assistant_idx) =
                     conv.messages.iter().rposition(|m| m.role != "user")
@@ -1882,6 +2109,15 @@ impl HarnessManager {
                         conv.total_cost_usd = (conv.total_cost_usd - removed.cost_usd).max(0.0);
                     }
                     conv.messages.truncate(cut_from);
+                }
+            }
+        }
+        if let Some(tree_hash) = tree_snapshot_to_restore {
+            if let Ok(ws) = Workspace::new(&ws_root) {
+                if let Ok(restored_count) = ws.restore_git_tree_snapshot(&tree_hash) {
+                    if restored_count > 0 && restored.is_empty() {
+                        restored.push(format!("{} git-tracked file(s)", restored_count));
+                    }
                 }
             }
         }
@@ -2501,6 +2737,15 @@ impl HarnessManager {
         let workspace = Workspace::new(&ws_path).unwrap_or_else(|_| {
             Workspace::new(".").expect("Fallback workspace must resolve")
         });
+        if let Some(tree_hash) = workspace.capture_git_tree_snapshot() {
+            if let Ok(mut g) = self.state.write() {
+                let stack = g.tree_snapshots.entry(conv_id.to_string()).or_default();
+                stack.push(tree_hash);
+                if stack.len() > 20 {
+                    stack.remove(0);
+                }
+            }
+        }
         let mut tool_engine =
             ToolEngine::new(workspace).with_abort_flag(Arc::clone(&self.abort_flag));
 
@@ -2558,9 +2803,10 @@ impl HarnessManager {
                 break;
             }
 
-            // Two-stage KV-cache-friendly intra-turn compaction
+            // Model-aware dynamic context compaction with 20% headroom buffer
             if settings.enable_compaction {
-                working_history = Self::compact_messages_smartly(&working_history);
+                working_history =
+                    Self::compact_messages_for_model(&working_history, &settings.model);
                 let total_history_chars: usize =
                     working_history.iter().map(|m| m.content.len()).sum();
                 if (working_history.len() > 28 || total_history_chars > 140_000)
@@ -2617,13 +2863,12 @@ impl HarnessManager {
                     total_turn_out_tokens += resp.output_tokens;
                     total_turn_cost += resp.cost_usd;
 
-                    if let Some(t) = resp.thinking {
-                        if !t.is_empty() {
-                            if !collected_thinking.is_empty() {
-                                collected_thinking.push_str("\n\n");
-                            }
-                            collected_thinking.push_str(&t);
+                    let step_thinking = resp.thinking.clone().filter(|t| !t.is_empty());
+                    if let Some(ref t) = step_thinking {
+                        if !collected_thinking.is_empty() {
+                            collected_thinking.push_str("\n\n");
                         }
+                        collected_thinking.push_str(t);
                     }
 
                     // Fallback: if structured tool_calls are empty, check if the model emitted raw JSON/XML tool calls in text
@@ -2635,13 +2880,7 @@ impl HarnessManager {
                     }
 
                     if !resp.content.trim().is_empty() {
-                        let chunk = resp.content.trim();
-                        if final_text.is_empty() {
-                            final_text = chunk.to_string();
-                        } else if !final_text.contains(chunk) {
-                            final_text.push_str("\n\n");
-                            final_text.push_str(chunk);
-                        }
+                        final_text = resp.content.trim().to_string();
                     }
 
                     if let Ok(mut live) = self.live_turn.write() {
@@ -2662,7 +2901,7 @@ impl HarnessManager {
                             working_history.push(ChatMessage {
                                 role: "assistant".to_string(),
                                 content: resp.content.clone(),
-                                thinking: None,
+                                thinking: step_thinking,
                                 tool_calls: Vec::new(),
                                 diffs: Vec::new(),
                                 timestamp: Utc::now().format("%H:%M:%S").to_string(),
@@ -2705,7 +2944,7 @@ impl HarnessManager {
                                 working_history.push(ChatMessage {
                                     role: "assistant".to_string(),
                                     content: resp.content.clone(),
-                                    thinking: None,
+                                    thinking: step_thinking,
                                     tool_calls: Vec::new(),
                                     diffs: Vec::new(),
                                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
@@ -2740,6 +2979,7 @@ impl HarnessManager {
 
                     // Execute requested tool calls
                     let mut tool_results_summary = Vec::new();
+                    let mut step_tools: Vec<ToolCallRecord> = Vec::new();
                     let mut hard_circuit_break = false;
 
                     for (tc_id, tc_name, tc_args) in resp.pending_tool_calls {
@@ -2771,7 +3011,15 @@ impl HarnessManager {
 
                             if repeat_count >= 8 {
                                 if let Some(msg) = Self::format_repeat_tool_reminder(&tc_name, repeat_count) {
-                                    tool_results_summary.push(msg);
+                                    tool_results_summary.push(msg.clone());
+                                    step_tools.push(ToolCallRecord {
+                                        id: tc_id,
+                                        name: tc_name,
+                                        arguments: tc_args,
+                                        result: msg,
+                                        status: "error".to_string(),
+                                        duration_ms: 0,
+                                    });
                                 }
                                 hard_circuit_break = true;
                                 break;
@@ -2794,6 +3042,7 @@ impl HarnessManager {
                             "write_file"
                                 | "edit_file"
                                 | "multi_edit_file"
+                                | "apply_patch"
                                 | "ast_edit_symbol"
                                 | "ast_rename_symbol"
                                 | "delete_file"
@@ -3011,6 +3260,7 @@ impl HarnessManager {
                             },
                             duration_ms,
                         };
+                        step_tools.push(record.clone());
                         collected_tools.push(record);
                         if let Some(d) = diff_opt {
                             collected_diffs.push(d);
@@ -3031,13 +3281,9 @@ impl HarnessManager {
 
                     working_history.push(ChatMessage {
                         role: "assistant".to_string(),
-                        content: if final_text.is_empty() {
-                            "Executing workspace tools...".to_string()
-                        } else {
-                            final_text.clone()
-                        },
-                        thinking: None,
-                        tool_calls: Vec::new(),
+                        content: resp.content.clone(),
+                        thinking: step_thinking,
+                        tool_calls: step_tools.clone(),
                         diffs: Vec::new(),
                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                         model: Some(settings.model.clone()),
@@ -3050,7 +3296,7 @@ impl HarnessManager {
                         role: "tool".to_string(),
                         content: tool_results_summary.join("\n\n"),
                         thinking: None,
-                        tool_calls: Vec::new(),
+                        tool_calls: step_tools,
                         diffs: Vec::new(),
                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                         model: None,
@@ -3361,6 +3607,13 @@ mod tests {
         assert!(!hm.workspaces().is_empty());
         assert!(!hm.subagents().is_empty());
         assert!(!hm.workflows().is_empty());
+        let subs = hm.subagents();
+        let arch = subs.iter().find(|s| s.id == "sub-architect").unwrap();
+        assert!(arch.tools.contains(&"grep_search".to_string()));
+        assert!(arch.tools.contains(&"lsp_diagnostics".to_string()));
+        let coder = subs.iter().find(|s| s.id == "sub-coder").unwrap();
+        assert!(coder.tools.contains(&"apply_patch".to_string()));
+        assert!(coder.tools.contains(&"ast_edit_symbol".to_string()));
 
         let conv_id = hm.new_conversation_with_mode(Some("Rust GPU Test"), Some("quick"));
         assert_eq!(hm.active_conversation().title, "Rust GPU Test");

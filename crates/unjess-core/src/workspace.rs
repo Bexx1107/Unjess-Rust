@@ -213,6 +213,93 @@ impl Workspace {
         }
     }
 
+    /// Captures a lightweight, non-destructive Git tree-object snapshot of the workspace
+    /// using an isolated `GIT_INDEX_FILE` without modifying `.git/index`, `HEAD`, or `git stash`.
+    pub fn capture_git_tree_snapshot(&self) -> Option<String> {
+        let dot_git = self.root.join(".git");
+        if !dot_git.exists() {
+            return None;
+        }
+        let temp_index = std::env::temp_dir().join(format!(
+            "unjess-tree-idx-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let real_index = dot_git.join("index");
+        if real_index.is_file() {
+            let _ = fs::copy(&real_index, &temp_index);
+        }
+
+        let run_git_idx = |args: &[&str]| -> Option<String> {
+            let mut cmd = Command::new("git");
+            cmd.args(args)
+                .current_dir(&self.root)
+                .env("GIT_INDEX_FILE", &temp_index);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            let out = cmd.output().ok()?;
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        };
+
+        let _ = run_git_idx(&["add", "-A"]);
+        let tree_hash = run_git_idx(&["write-tree"]);
+        let _ = fs::remove_file(&temp_index);
+
+        tree_hash.filter(|h| h.len() >= 40 && h.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    /// Restores workspace files from a previously captured Git tree-object snapshot (`tree_hash`)
+    /// without altering the user's real `.git/index` staging area.
+    pub fn restore_git_tree_snapshot(&self, tree_hash: &str) -> Result<usize, String> {
+        let clean_hash = tree_hash.trim();
+        if clean_hash.len() < 40 || !clean_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Invalid git tree snapshot hash".to_string());
+        }
+        let temp_index = std::env::temp_dir().join(format!(
+            "unjess-restore-idx-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let run_git_idx = |args: &[&str]| -> Result<String, String> {
+            let mut cmd = Command::new("git");
+            cmd.args(args)
+                .current_dir(&self.root)
+                .env("GIT_INDEX_FILE", &temp_index);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            let out = cmd.output().map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+            }
+        };
+
+        let read_res = run_git_idx(&["read-tree", clean_hash]);
+        if let Err(e) = read_res {
+            let _ = fs::remove_file(&temp_index);
+            return Err(format!("git read-tree failed: {}", e));
+        }
+
+        let files_out = run_git_idx(&["ls-tree", "-r", "--name-only", clean_hash]).unwrap_or_default();
+        let file_count = files_out.lines().filter(|l| !l.trim().is_empty()).count();
+
+        let checkout_res = run_git_idx(&["checkout-index", "-a", "-f"]);
+        let _ = fs::remove_file(&temp_index);
+        checkout_res.map_err(|e| format!("git checkout-index failed: {}", e))?;
+
+        Ok(file_count)
+    }
+
     /// Recursively lists relative file paths in the workspace up to `max_files`,
     /// skipping build/VCS directories (`.git`, `target`, `node_modules`, `.venv`, `dist`).
     pub fn list_all_files(&self, max_files: usize) -> Vec<String> {
@@ -274,5 +361,29 @@ mod tests {
         assert!(ws.resolve("src/main.rs").is_ok());
         assert!(ws.resolve("../../outside.txt").is_err());
         assert!(ws.resolve("../../../../../../../../../../nonexistent_root_escape.txt").is_err());
+    }
+
+    #[test]
+    fn test_git_tree_snapshot_and_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init_status = Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output();
+        if init_status.map(|o| o.status.success()).unwrap_or(false) {
+            let file_a = tmp.path().join("hello.txt");
+            fs::write(&file_a, "original_snapshot_text").unwrap();
+            let ws = Workspace::new(tmp.path()).unwrap();
+            if let Some(tree_hash) = ws.capture_git_tree_snapshot() {
+                assert_eq!(tree_hash.len(), 40);
+                // Mutate file as if a shell command modified it
+                fs::write(&file_a, "corrupted_by_shell_script").unwrap();
+                assert_eq!(fs::read_to_string(&file_a).unwrap(), "corrupted_by_shell_script");
+                // Restore snapshot
+                let restored_count = ws.restore_git_tree_snapshot(&tree_hash).unwrap();
+                assert!(restored_count >= 1);
+                assert_eq!(fs::read_to_string(&file_a).unwrap(), "original_snapshot_text");
+            }
+        }
     }
 }

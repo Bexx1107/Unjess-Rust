@@ -40,10 +40,10 @@ pub use agent::{
 pub use api::start_api_server;
 pub use codeintel::{
     debug_trace_command, edit_symbol, find_callers, git_archeology, outline_file,
-    rename_symbol_across_repo, run_post_edit_check, AstSymbol,
+    rename_symbol_across_repo, run_post_edit_check, run_workspace_diagnostics, AstSymbol,
 };
 pub use config::{CustomProvider, ModelInfo, Settings};
-pub use llm::ChatMessage;
+pub use llm::{model_context_window_tokens, ChatMessage};
 pub use mcp::{McpManager, McpServerConfig};
 pub use memory::{MemoryEntry, MemoryStore};
 pub use scheduler::{LiveBackgroundTask, ScheduledTask, SchedulerManager};

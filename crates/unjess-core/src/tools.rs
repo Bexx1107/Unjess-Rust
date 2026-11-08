@@ -9,7 +9,7 @@
 use crate::codeintel::{
     debug_trace_command, edit_symbol, extract_imports, find_callers, find_symbol_definitions,
     generate_repo_map, git_archeology, outline_file, rename_symbol_across_repo,
-    run_post_edit_check,
+    run_post_edit_check, run_workspace_diagnostics,
 };
 use crate::config::Settings;
 use crate::mcp::{McpManager, McpServerConfig};
@@ -269,6 +269,67 @@ impl ToolEngine {
         Ok(())
     }
 
+    /// Enforces the Granular Tool Policy Matrix on sensitive credential/secret files
+    /// (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `id_ed25519`, `credentials.json`).
+    pub fn check_sensitive_file_policy(&self, candidate_path: &str) -> Result<(), ToolError> {
+        let norm = candidate_path
+            .trim()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_lowercase();
+        let base = Path::new(&norm)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        // Allow `.env.example` / `.env.sample` / `.env.template`
+        if base.ends_with(".example") || base.ends_with(".sample") || base.ends_with(".template") {
+            return Ok(());
+        }
+
+        let is_sensitive_secret = base == ".env"
+            || base.starts_with(".env.")
+            || base == "id_rsa"
+            || base == "id_ed25519"
+            || base.ends_with(".pem")
+            || base.ends_with(".key")
+            || base == "credentials.json"
+            || base == ".npmrc"
+            || base == ".pypirc";
+
+        if is_sensitive_secret {
+            // Only block if the file already exists on disk (preventing accidental secret destruction)
+            if let Ok(abs) = self.workspace.resolve(candidate_path) {
+                if abs.exists() {
+                    return Err(ToolError::Execution(format!(
+                        "Tool Policy Guard: Modifying or deleting existing sensitive credential file '{}' is blocked by default to protect secrets.",
+                        candidate_path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforces the Granular Command Policy Matrix on high-impact destructive or external-publish commands.
+    pub fn check_command_policy_matrix(&self, cmd: &str) -> Result<(), ToolError> {
+        let lower = cmd.trim().to_lowercase();
+        let high_risk_patterns = [
+            ("git push --force", "Force-pushing to remote repositories (`git push --force`) is blocked by the Tool Policy Matrix."),
+            ("git push -f", "Force-pushing to remote repositories (`git push -f`) is blocked by the Tool Policy Matrix."),
+            ("git reset --hard", "Destructive working-tree reset (`git reset --hard`) is blocked by the Tool Policy Matrix; use `edit_file` or `git checkout -- <file>` on specific files."),
+            ("git clean -fd", "Destructive untracked file wipe (`git clean -fd`) is blocked by the Tool Policy Matrix; use `delete_file` on specific scratch files."),
+            ("npm publish", "Publishing packages (`npm publish`) is blocked by the Tool Policy Matrix without manual user execution."),
+            ("cargo publish", "Publishing crates (`cargo publish`) is blocked by the Tool Policy Matrix without manual user execution."),
+        ];
+        for (pat, reason) in high_risk_patterns {
+            if lower.contains(pat) {
+                return Err(ToolError::Execution(format!("Tool Policy Guard: {}", reason)));
+            }
+        }
+        Ok(())
+    }
+
     fn hash_content(content: &str) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         content.hash(&mut hasher);
@@ -427,6 +488,7 @@ impl ToolEngine {
         overwrite: bool,
     ) -> Result<FileDiff, ToolError> {
         self.check_protected_path(rel_path)?;
+        self.check_sensitive_file_policy(rel_path)?;
         let abs_path = self.workspace.resolve(rel_path)?;
         let existed = abs_path.exists();
 
@@ -460,6 +522,7 @@ impl ToolEngine {
     /// so it can be reverted with 1 click.
     pub fn delete_file(&self, rel_path: &str) -> Result<FileDiff, ToolError> {
         self.check_protected_path(rel_path)?;
+        self.check_sensitive_file_policy(rel_path)?;
         let abs_path = self.workspace.resolve(rel_path)?;
         if !abs_path.is_file() {
             return Err(ToolError::Execution(format!(
@@ -498,6 +561,7 @@ impl ToolEngine {
         replace_all: bool,
     ) -> Result<FileDiff, ToolError> {
         self.check_protected_path(rel_path)?;
+        self.check_sensitive_file_policy(rel_path)?;
         let abs_path = self.workspace.resolve(rel_path)?;
         let original_content = fs::read_to_string(&abs_path)?;
         let new_content = Self::apply_replacement(
@@ -525,6 +589,7 @@ impl ToolEngine {
         edits: &[(String, String)],
     ) -> Result<FileDiff, ToolError> {
         self.check_protected_path(rel_path)?;
+        self.check_sensitive_file_policy(rel_path)?;
         if edits.is_empty() {
             return Err(ToolError::Execution("edits array cannot be empty".to_string()));
         }
@@ -542,6 +607,262 @@ impl ToolEngine {
             &original_content,
             &working,
         ))
+    }
+
+    /// Applies a multi-file or single-file patch supporting both structured patch headers
+    /// (`*** Begin Patch`, `*** Add File:`, `*** Update File:`, `*** Delete File:`, `*** Move to:`)
+    /// and standard unified diff headers (`--- a/...`, `+++ b/...`, `@@ ... @@`).
+    pub fn apply_patch(
+        &self,
+        patch_text: &str,
+        default_path: Option<&str>,
+    ) -> Result<(String, Vec<FileDiff>), ToolError> {
+        let norm_patch = patch_text.replace("\r\n", "\n");
+        let lines: Vec<&str> = norm_patch.lines().collect();
+        if lines.is_empty() {
+            return Err(ToolError::Execution("Patch content cannot be empty".to_string()));
+        }
+
+        #[derive(Debug)]
+        enum PatchOp {
+            Add { path: String, content_lines: Vec<String> },
+            Delete { path: String },
+            Update {
+                path: String,
+                move_to: Option<String>,
+                hunks: Vec<(Vec<String>, Vec<String>)>, // (old_block_lines, new_block_lines)
+            },
+        }
+
+        let mut ops: Vec<PatchOp> = Vec::new();
+        let mut idx = 0usize;
+
+        let parse_hunks = |slice: &[&str], cursor: &mut usize| -> Vec<(Vec<String>, Vec<String>)> {
+            let mut hunks = Vec::new();
+            let mut cur_old: Vec<String> = Vec::new();
+            let mut cur_new: Vec<String> = Vec::new();
+            let mut in_hunk = false;
+
+            while *cursor < slice.len() {
+                let l = slice[*cursor];
+                if l.starts_with("*** Add File:")
+                    || l.starts_with("*** Update File:")
+                    || l.starts_with("*** Delete File:")
+                    || l.starts_with("*** End Patch")
+                    || l.starts_with("--- a/")
+                    || l.starts_with("diff --git ")
+                {
+                    break;
+                }
+                if l.starts_with("@@") {
+                    if in_hunk && (!cur_old.is_empty() || !cur_new.is_empty()) {
+                        hunks.push((std::mem::take(&mut cur_old), std::mem::take(&mut cur_new)));
+                    }
+                    in_hunk = true;
+                    *cursor += 1;
+                    continue;
+                }
+                if l.starts_with("\\ No newline") {
+                    *cursor += 1;
+                    continue;
+                }
+                if let Some(added) = l.strip_prefix('+') {
+                    in_hunk = true;
+                    cur_new.push(added.to_string());
+                } else if let Some(removed) = l.strip_prefix('-') {
+                    in_hunk = true;
+                    cur_old.push(removed.to_string());
+                } else if let Some(ctx) = l.strip_prefix(' ') {
+                    if in_hunk {
+                        cur_old.push(ctx.to_string());
+                        cur_new.push(ctx.to_string());
+                    }
+                } else if in_hunk && l.trim().is_empty() {
+                    cur_old.push(String::new());
+                    cur_new.push(String::new());
+                }
+                *cursor += 1;
+            }
+            if in_hunk && (!cur_old.is_empty() || !cur_new.is_empty()) {
+                hunks.push((cur_old, cur_new));
+            }
+            hunks
+        };
+
+        while idx < lines.len() {
+            let line = lines[idx].trim_end();
+            if line.starts_with("*** Begin Patch")
+                || line.starts_with("*** End Patch")
+                || line.starts_with("diff --git ")
+                || line.starts_with("index ")
+                || line.trim().is_empty()
+            {
+                idx += 1;
+                continue;
+            }
+            if let Some(p) = line.strip_prefix("*** Add File:") {
+                let path = p.trim().to_string();
+                idx += 1;
+                let mut content_lines = Vec::new();
+                while idx < lines.len() {
+                    let nl = lines[idx];
+                    if nl.starts_with("*** ") || nl.starts_with("--- a/") || nl.starts_with("diff --git ") {
+                        break;
+                    }
+                    if let Some(stripped) = nl.strip_prefix('+') {
+                        content_lines.push(stripped.to_string());
+                    } else {
+                        content_lines.push(nl.to_string());
+                    }
+                    idx += 1;
+                }
+                ops.push(PatchOp::Add { path, content_lines });
+                continue;
+            }
+            if let Some(p) = line.strip_prefix("*** Delete File:") {
+                let path = p.trim().to_string();
+                idx += 1;
+                ops.push(PatchOp::Delete { path });
+                continue;
+            }
+            if let Some(p) = line.strip_prefix("*** Update File:") {
+                let path = p.trim().to_string();
+                idx += 1;
+                let mut move_to = None;
+                if idx < lines.len() {
+                    if let Some(mv) = lines[idx].trim_end().strip_prefix("*** Move to:") {
+                        move_to = Some(mv.trim().to_string());
+                        idx += 1;
+                    }
+                }
+                let hunks = parse_hunks(&lines, &mut idx);
+                ops.push(PatchOp::Update { path, move_to, hunks });
+                continue;
+            }
+            if line.starts_with("--- ") {
+                let old_hdr = line.trim_start_matches("--- ").trim();
+                let old_path = old_hdr.strip_prefix("a/").unwrap_or(old_hdr).trim();
+                idx += 1;
+                let mut new_path = old_path.to_string();
+                if idx < lines.len() && lines[idx].starts_with("+++ ") {
+                    let new_hdr = lines[idx].trim_start_matches("+++ ").trim();
+                    new_path = new_hdr.strip_prefix("b/").unwrap_or(new_hdr).trim().to_string();
+                    idx += 1;
+                }
+                let hunks = parse_hunks(&lines, &mut idx);
+                if old_path == "/dev/null" {
+                    let mut content_lines = Vec::new();
+                    for (_, new_b) in hunks {
+                        content_lines.extend(new_b);
+                    }
+                    ops.push(PatchOp::Add {
+                        path: new_path,
+                        content_lines,
+                    });
+                } else if new_path == "/dev/null" {
+                    ops.push(PatchOp::Delete {
+                        path: old_path.to_string(),
+                    });
+                } else {
+                    let move_to = if !new_path.is_empty() && new_path != old_path {
+                        Some(new_path)
+                    } else {
+                        None
+                    };
+                    ops.push(PatchOp::Update {
+                        path: old_path.to_string(),
+                        move_to,
+                        hunks,
+                    });
+                }
+                continue;
+            }
+            if line.starts_with("@@") {
+                if let Some(def_p) = default_path.filter(|s| !s.trim().is_empty()) {
+                    let hunks = parse_hunks(&lines, &mut idx);
+                    ops.push(PatchOp::Update {
+                        path: def_p.trim().to_string(),
+                        move_to: None,
+                        hunks,
+                    });
+                    continue;
+                }
+            }
+            idx += 1;
+        }
+
+        if ops.is_empty() {
+            return Err(ToolError::Execution(
+                "No valid patch operations (`*** Add/Update/Delete File:` or unified `--- a/ +++ b/ @@` hunks) found in patch.".to_string(),
+            ));
+        }
+
+        let mut diffs = Vec::new();
+        let mut summary_lines = Vec::new();
+
+        for op in ops {
+            match op {
+                PatchOp::Add { path, content_lines } => {
+                    let content = content_lines.join("\n");
+                    let d = self.write_file(&path, &content, true)?;
+                    let suffix = self.format_post_edit_suffix(&path);
+                    summary_lines.push(format!("+ Added `{}` ({} lines){}", path, content_lines.len(), suffix));
+                    diffs.push(d);
+                }
+                PatchOp::Delete { path } => {
+                    let d = self.delete_file(&path)?;
+                    summary_lines.push(format!("- Deleted `{}`", path));
+                    diffs.push(d);
+                }
+                PatchOp::Update { path, move_to, hunks } => {
+                    self.check_protected_path(&path)?;
+                    self.check_sensitive_file_policy(&path)?;
+                    let abs_path = self.workspace.resolve(&path)?;
+                    let orig_content = fs::read_to_string(&abs_path)?;
+                    let mut working = orig_content.clone();
+                    for (old_b, new_b) in &hunks {
+                        let target = old_b.join("\n");
+                        let replacement = new_b.join("\n");
+                        if target.trim().is_empty() {
+                            if !working.is_empty() && !working.ends_with('\n') {
+                                working.push('\n');
+                            }
+                            working.push_str(&replacement);
+                        } else {
+                            working = Self::apply_replacement(&path, &working, &target, &replacement, false)?;
+                        }
+                    }
+                    let final_rel = if let Some(ref dest) = move_to {
+                        self.check_protected_path(dest)?;
+                        self.check_sensitive_file_policy(dest)?;
+                        let dest_abs = self.workspace.resolve(dest)?;
+                        if let Some(p) = dest_abs.parent() {
+                            fs::create_dir_all(p)?;
+                        }
+                        fs::write(&dest_abs, &working)?;
+                        let _ = fs::remove_file(&abs_path);
+                        dest.clone()
+                    } else {
+                        fs::write(&abs_path, &working)?;
+                        path.clone()
+                    };
+                    self.record_file_snapshot(&final_rel, &working);
+                    let d = Self::compute_diff(&final_rel, "modified", &orig_content, &working);
+                    let suffix = self.format_post_edit_suffix(&final_rel);
+                    summary_lines.push(format!(
+                        "~ Updated `{}` ({} hunk(s), +{} -{}){}",
+                        final_rel,
+                        hunks.len(),
+                        d.additions,
+                        d.deletions,
+                        suffix
+                    ));
+                    diffs.push(d);
+                }
+            }
+        }
+
+        Ok((summary_lines.join("\n"), diffs))
     }
 
     fn match_line_numbers(content: &str, needle: &str) -> String {
@@ -682,56 +1003,271 @@ impl ToolEngine {
         if target_lines.is_empty() || target_lines.len() > content_lines.len() {
             return None;
         }
+        let is_crlf = content.contains("\r\n");
+
+        let splice_window = |idx: usize, win_len: usize, rep_str: &str| -> String {
+            let first_non_empty_offset = (0..target_raw_lines.len())
+                .find(|&o| !target_raw_lines[o].trim().is_empty())
+                .unwrap_or(0);
+            let file_anchor_line =
+                content_lines[(idx + first_non_empty_offset).min(content_lines.len() - 1)];
+            let target_anchor_line = target_raw_lines[first_non_empty_offset];
+
+            let file_indent: String = file_anchor_line
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            let target_indent: String = target_anchor_line
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+
+            let shifted_replacement =
+                Self::shift_replacement_indentation(rep_str, &target_indent, &file_indent);
+
+            let mut out_lines: Vec<String> = content_lines[..idx]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            for r_line in shifted_replacement.lines() {
+                out_lines.push(r_line.to_string());
+            }
+            out_lines.extend(
+                content_lines[idx + win_len..]
+                    .iter()
+                    .map(|s| (*s).to_string()),
+            );
+            let sep = if is_crlf { "\r\n" } else { "\n" };
+            out_lines.join(sep)
+        };
+
+        // Stage 3: Line-trimmed exact match
         let mut match_idx = None;
+        let mut ambiguous = false;
         for start in 0..=(content_lines.len() - target_lines.len()) {
             let window_matches = (0..target_lines.len())
                 .all(|offset| content_lines[start + offset].trim() == target_lines[offset]);
             if window_matches {
                 if match_idx.is_some() {
-                    return None; // ambiguous
+                    ambiguous = true;
+                    break;
                 }
                 match_idx = Some(start);
             }
         }
-        let idx = match_idx?;
-
-        // Find the first non-empty line in target & matched window to compute relative indentation shift
-        let first_non_empty_offset = (0..target_raw_lines.len())
-            .find(|&o| !target_raw_lines[o].trim().is_empty())
-            .unwrap_or(0);
-        let file_anchor_line = content_lines[idx + first_non_empty_offset];
-        let target_anchor_line = target_raw_lines[first_non_empty_offset];
-
-        let file_indent: String = file_anchor_line
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect();
-        let target_indent: String = target_anchor_line
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect();
-
-        let shifted_replacement =
-            Self::shift_replacement_indentation(replacement, &target_indent, &file_indent);
-
-        let mut out_lines: Vec<String> = content_lines[..idx]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        for r_line in shifted_replacement.lines() {
-            out_lines.push(r_line.to_string());
+        if !ambiguous {
+            if let Some(idx) = match_idx {
+                return Some(splice_window(idx, target_lines.len(), replacement));
+            }
         }
-        out_lines.extend(
-            content_lines[idx + target_lines.len()..]
+
+        // Stage 4: Internal whitespace-normalized line match (collapses runs of spaces/tabs)
+        let norm_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
+        let target_ws: Vec<String> = target_lines.iter().map(|l| norm_ws(l)).collect();
+        let mut ws_idx = None;
+        let mut ws_ambiguous = false;
+        for start in 0..=(content_lines.len() - target_ws.len()) {
+            let ok = (0..target_ws.len())
+                .all(|o| norm_ws(content_lines[start + o]) == target_ws[o]);
+            if ok {
+                if ws_idx.is_some() {
+                    ws_ambiguous = true;
+                    break;
+                }
+                ws_idx = Some(start);
+            }
+        }
+        if !ws_ambiguous {
+            if let Some(idx) = ws_idx {
+                return Some(splice_window(idx, target_ws.len(), replacement));
+            }
+        }
+
+        // Stage 5: Blank-line tolerant match (matches non-empty trimmed lines across optional blank lines)
+        let target_non_empty: Vec<&str> = target_lines
+            .iter()
+            .copied()
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !target_non_empty.is_empty() {
+            let non_empty_positions: Vec<(usize, &str)> = content_lines
                 .iter()
-                .map(|s| (*s).to_string()),
-        );
-        let sep = if content.contains("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
+                .enumerate()
+                .map(|(i, l)| (i, l.trim()))
+                .filter(|(_, l)| !l.is_empty())
+                .collect();
+            if non_empty_positions.len() >= target_non_empty.len() {
+                let mut blank_match: Option<(usize, usize)> = None;
+                let mut blank_ambig = false;
+                for n_start in 0..=(non_empty_positions.len() - target_non_empty.len()) {
+                    let ok = (0..target_non_empty.len()).all(|o| {
+                        non_empty_positions[n_start + o].1 == target_non_empty[o]
+                    });
+                    if ok {
+                        let first_line_idx = non_empty_positions[n_start].0;
+                        let last_line_idx =
+                            non_empty_positions[n_start + target_non_empty.len() - 1].0;
+                        let span_len = last_line_idx - first_line_idx + 1;
+                        if span_len <= target_lines.len() + 6 {
+                            if blank_match.is_some() {
+                                blank_ambig = true;
+                                break;
+                            }
+                            blank_match = Some((first_line_idx, span_len));
+                        }
+                    }
+                }
+                if !blank_ambig {
+                    if let Some((idx, span_len)) = blank_match {
+                        return Some(splice_window(idx, span_len, replacement));
+                    }
+                }
+            }
+        }
+
+        // Stage 6: Escape-normalized match (handles over-escaped `\"` or `\\n` in tool JSON)
+        if target.contains("\\\"") || target.contains("\\n") || target.contains("\\t") {
+            let unescaped_target = target
+                .replace("\\\"", "\"")
+                .replace("\\'", "'")
+                .replace("\\t", "\t");
+            let unescaped_rep = replacement
+                .replace("\\\"", "\"")
+                .replace("\\'", "'")
+                .replace("\\t", "\t");
+            if unescaped_target != target {
+                if let Some(res) =
+                    Self::flexible_line_replace(content, &unescaped_target, &unescaped_rep)
+                {
+                    return Some(res);
+                }
+            }
+        }
+
+        // Stage 7: Context-trimmed diff hunk prefix stripper (if target lines start with `+`/`-`/` `)
+        let looks_like_diff = target_raw_lines.len() >= 2
+            && target_raw_lines
+                .iter()
+                .all(|l| l.is_empty() || l.starts_with(' ') || l.starts_with('-'));
+        if looks_like_diff {
+            let stripped_t: Vec<String> = target_raw_lines
+                .iter()
+                .map(|l| {
+                    l.strip_prefix('-')
+                        .or_else(|| l.strip_prefix(' '))
+                        .unwrap_or(l)
+                        .to_string()
+                })
+                .collect();
+            let joined_t = stripped_t.join("\n");
+            if joined_t != target {
+                if let Some(res) = Self::flexible_line_replace(content, &joined_t, replacement) {
+                    return Some(res);
+                }
+            }
+        }
+
+        // Helper: line similarity in [0.0, 1.0] using character bigrams (Dice coefficient)
+        let line_similarity = |a: &str, b: &str| -> f64 {
+            let ta = a.trim();
+            let tb = b.trim();
+            if ta == tb {
+                return 1.0;
+            }
+            if ta.is_empty() || tb.is_empty() {
+                return 0.0;
+            }
+            let ca: Vec<char> = ta.chars().collect();
+            let cb: Vec<char> = tb.chars().collect();
+            if ca.len() < 2 || cb.len() < 2 {
+                return if ca == cb { 1.0 } else { 0.0 };
+            }
+            let mut bigrams_a: Vec<(char, char)> = ca.windows(2).map(|w| (w[0], w[1])).collect();
+            let mut bigrams_b: Vec<(char, char)> = cb.windows(2).map(|w| (w[0], w[1])).collect();
+            bigrams_a.sort_unstable();
+            bigrams_b.sort_unstable();
+            let (mut i, mut j, mut matches) = (0usize, 0usize, 0usize);
+            while i < bigrams_a.len() && j < bigrams_b.len() {
+                if bigrams_a[i] == bigrams_b[j] {
+                    matches += 1;
+                    i += 1;
+                    j += 1;
+                } else if bigrams_a[i] < bigrams_b[j] {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            (2.0 * matches as f64) / ((bigrams_a.len() + bigrams_b.len()) as f64)
         };
-        Some(out_lines.join(sep))
+
+        // Stage 8: Block-anchor match (matches first & last non-empty anchor lines + interior similarity >= 0.70)
+        if target_lines.len() >= 3 {
+            let first_ne = target_lines.iter().position(|l| !l.is_empty());
+            let last_ne = target_lines.iter().rposition(|l| !l.is_empty());
+            if let (Some(f_off), Some(l_off)) = (first_ne, last_ne) {
+                if l_off > f_off && target_lines[f_off].len() >= 4 && target_lines[l_off].len() >= 2
+                {
+                    let anchor_span = l_off - f_off + 1;
+                    let mut anchor_cand: Option<(usize, f64)> = None;
+                    let mut anchor_ambig = false;
+                    for start in 0..=(content_lines.len() - target_lines.len()) {
+                        if content_lines[start + f_off].trim() == target_lines[f_off]
+                            && content_lines[start + l_off].trim() == target_lines[l_off]
+                        {
+                            let mut sum_sim = 0.0;
+                            for o in f_off..=l_off {
+                                sum_sim += line_similarity(content_lines[start + o], target_lines[o]);
+                            }
+                            let avg_sim = sum_sim / (anchor_span as f64);
+                            if avg_sim >= 0.70 {
+                                if anchor_cand.is_some() {
+                                    anchor_ambig = true;
+                                    break;
+                                }
+                                anchor_cand = Some((start, avg_sim));
+                            }
+                        }
+                    }
+                    if !anchor_ambig {
+                        if let Some((idx, _)) = anchor_cand {
+                            return Some(splice_window(idx, target_lines.len(), replacement));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stage 9: High-threshold fuzzy similarity match (average line similarity >= 0.92, unique best window)
+        if target_lines.len() >= 2 {
+            let mut best_start = None;
+            let mut best_sim = 0.0f64;
+            let mut second_best = 0.0f64;
+            for start in 0..=(content_lines.len() - target_lines.len()) {
+                if line_similarity(content_lines[start], target_lines[0]) < 0.75 {
+                    continue;
+                }
+                let mut sum = 0.0;
+                for o in 0..target_lines.len() {
+                    sum += line_similarity(content_lines[start + o], target_lines[o]);
+                }
+                let avg = sum / (target_lines.len() as f64);
+                if avg > best_sim {
+                    second_best = best_sim;
+                    best_sim = avg;
+                    best_start = Some(start);
+                } else if avg > second_best {
+                    second_best = avg;
+                }
+            }
+            if best_sim >= 0.92 && (best_sim - second_best) >= 0.05 {
+                if let Some(idx) = best_start {
+                    return Some(splice_window(idx, target_lines.len(), replacement));
+                }
+            }
+        }
+
+        None
     }
 
     /// Shifts the indentation of `replacement` lines from `target_indent` to `file_indent`
@@ -1588,6 +2124,7 @@ impl ToolEngine {
         timeout_secs: u64,
     ) -> Result<(String, i32), ToolError> {
         self.check_shell_command_protected_paths(cmd)?;
+        self.check_command_policy_matrix(cmd)?;
 
         let effective_timeout = Duration::from_secs(timeout_secs.clamp(1, 3600));
         const MAX_PIPE_BYTES: u64 = 2 * 1024 * 1024;
@@ -3364,6 +3901,32 @@ impl ToolEngine {
                 let out = debug_trace_command(self.workspace.root(), &command);
                 (Self::truncate_head_tail(&out, 12000), true, None)
             }
+            "apply_patch" | "patch" => {
+                let patch_text = {
+                    let p = get_str("patch");
+                    if p.is_empty() {
+                        get_str("diff")
+                    } else {
+                        p
+                    }
+                };
+                let default_path = args.get("path").and_then(|v| v.as_str());
+                match self.apply_patch(&patch_text, default_path) {
+                    Ok((summary, mut diffs)) => {
+                        let first_diff = diffs.drain(..).next();
+                        (summary, true, first_diff)
+                    }
+                    Err(e) => (format!("Error: {}", e), false, None),
+                }
+            }
+            "lsp_diagnostics" | "workspace_diagnostics" => {
+                let filter_file = args
+                    .get("path")
+                    .or_else(|| args.get("file"))
+                    .and_then(|v| v.as_str());
+                let out = run_workspace_diagnostics(self.workspace.root(), filter_file);
+                (Self::truncate_head_tail(&out, 12000), true, None)
+            }
             "synthesize_tool" => {
                 let tool_name = get_str("name");
                 let description = get_str("description");
@@ -4088,6 +4651,34 @@ impl ToolEngine {
             {
                 "type": "function",
                 "function": {
+                    "name": "apply_patch",
+                    "description": "Apply a multi-file or single-file patch (`*** Begin Patch`, `*** Add File:`, `*** Update File:`, `*** Delete File:`, `*** Move to:` or unified `--- a/ +++ b/ @@ ... @@` diff hunks).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "patch": { "type": "string", "description": "Full patch or unified diff text" },
+                            "path": { "type": "string", "description": "Optional fallback relative path when applying bare @@ hunks to a single file" }
+                        },
+                        "required": ["patch"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "lsp_diagnostics",
+                    "description": "Run incremental workspace compiler and type diagnostics (`cargo check`, `tsc --noEmit`, `go vet`, syntax checks) and return errors/warnings.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Optional relative file path to filter compiler diagnostics" }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "delegate_parallel_subagents",
                     "description": "Fan out up to 4 subagent tasks concurrently in parallel and collect their combined outputs and diffs.",
                     "parameters": {
@@ -4162,6 +4753,38 @@ impl ToolEngine {
         }
 
         base
+    }
+
+    /// Returns OpenAI-compatible JSON function tool schemas filtered to `allowed` tool names
+    /// (used for role-scoped Explorer/Auditor/Worker subagents).
+    pub fn tool_schemas_filtered(allowed: Option<&[String]>) -> serde_json::Value {
+        let all = Self::tool_schemas();
+        let Some(allow_list) = allowed.filter(|a| !a.is_empty()) else {
+            return all;
+        };
+        let Some(arr) = all.as_array() else {
+            return all;
+        };
+        let filtered: Vec<serde_json::Value> = arr
+            .iter()
+            .filter(|item| {
+                let name = item
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                allow_list.iter().any(|a| {
+                    a.eq_ignore_ascii_case(name)
+                        || (a.eq_ignore_ascii_case("ast_outline") && name == "outline_file")
+                        || (a.eq_ignore_ascii_case("outline_file") && name == "ast_outline")
+                        || (a.eq_ignore_ascii_case("ast_find_callers") && name == "find_callers")
+                        || (a.eq_ignore_ascii_case("find_callers") && name == "ast_find_callers")
+                        || (a.eq_ignore_ascii_case("call_mcp_tool") && name.starts_with("mcp__"))
+                })
+            })
+            .cloned()
+            .collect();
+        serde_json::Value::Array(filtered)
     }
 }
 
@@ -4355,5 +4978,52 @@ mod tests {
         assert!(ToolEngine::validate_url_against_ssrf("http://[::ffff:169.254.169.254]/latest/meta-data/").is_err());
         assert!(ToolEngine::validate_url_against_ssrf("http://169.254.169.254/latest/meta-data/").is_err());
         assert!(ToolEngine::validate_url_against_ssrf("file:///C:/Windows/win.ini").is_err());
+    }
+
+    #[test]
+    fn test_apply_patch_fuzzy_replacer_and_policy_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(tmp.path()).unwrap();
+        let engine = ToolEngine::new(ws.clone());
+
+        // 1. Test multi-file `apply_patch` (`*** Add File:` and `*** Update File:`)
+        let patch_create = "*** Begin Patch\n*** Add File: src/lib.rs\n+pub fn greet() -> &'static str {\n+    \"hello\"\n+}\n*** End Patch\n";
+        let (sum1, diffs1) = engine.apply_patch(patch_create, None).unwrap();
+        assert!(sum1.contains("Added `src/lib.rs`"));
+        assert_eq!(diffs1.len(), 1);
+
+        let patch_update = "*** Begin Patch\n*** Update File: src/lib.rs\n@@ -1,3 +1,3 @@\n pub fn greet() -> &'static str {\n-    \"hello\"\n+    \"hello from patch\"\n }\n*** End Patch\n";
+        let (sum2, diffs2) = engine.apply_patch(patch_update, None).unwrap();
+        assert!(sum2.contains("Updated `src/lib.rs`"));
+        assert_eq!(diffs2.len(), 1);
+        assert!(fs::read_to_string(ws.root().join("src/lib.rs"))
+            .unwrap()
+            .contains("hello from patch"));
+
+        // 2. Test 9-stage fuzzy block replacer (Stage 4 whitespace-normalized & Stage 8 block-anchor match)
+        engine
+            .write_file(
+                "src/fuzzy.rs",
+                "pub fn complex_block(a: i32, b: i32) -> i32 {\n    let alpha   =   a + 1;\n    let beta = b + 2;\n    let gamma = alpha * beta;\n    gamma\n}\n",
+                true,
+            )
+            .unwrap();
+        let _ = engine
+            .edit_file(
+                "src/fuzzy.rs",
+                "pub fn complex_block(a: i32, b: i32) -> i32 {\n    let alpha = a + 1;\n    let beta = b + 2;\n    let gamma = alpha * beta;\n    gamma\n}",
+                "pub fn complex_block(a: i32, b: i32) -> i32 {\n    (a + 1) * (b + 20)\n}",
+            )
+            .unwrap();
+        assert!(fs::read_to_string(ws.root().join("src/fuzzy.rs"))
+            .unwrap()
+            .contains("b + 20"));
+
+        // 3. Test Granular Tool & Command Policy Matrix
+        fs::write(ws.root().join(".env"), "SECRET_KEY=topsecret\n").unwrap();
+        assert!(engine.write_file(".env", "OVERWRITTEN=1", true).is_err());
+        assert!(engine.delete_file(".env").is_err());
+        assert!(engine.run_command("git push --force origin main", 10).is_err());
+        assert!(engine.run_command("git reset --hard HEAD~1", 10).is_err());
     }
 }

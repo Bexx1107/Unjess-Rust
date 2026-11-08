@@ -634,6 +634,32 @@ pub fn run_post_edit_check(ws: &Path, rel_path: &str) -> String {
             }
             if let Ok(out) = cmd.output() {
                 if out.status.success() {
+                    if ws.join("go.mod").is_file() {
+                        let mut vet = std::process::Command::new("go");
+                        vet.args(["vet", "./..."]).current_dir(ws);
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::process::CommandExt;
+                            vet.creation_flags(0x08000000);
+                        }
+                        if let Ok(vout) = vet.output() {
+                            if !vout.status.success() {
+                                let stderr = String::from_utf8_lossy(&vout.stderr);
+                                let filtered: Vec<&str> = stderr
+                                    .lines()
+                                    .filter(|l| l.contains(rel_path) || !l.starts_with('#'))
+                                    .take(25)
+                                    .collect();
+                                if !filtered.is_empty() {
+                                    return format!(
+                                        "\n<post_edit_error file=\"{}\">\n{}\n</post_edit_error>",
+                                        rel_path,
+                                        filtered.join("\n")
+                                    );
+                                }
+                            }
+                        }
+                    }
                     return "[Auto-Verify: Syntax & linter check PASSED]".to_string();
                 } else {
                     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -647,10 +673,160 @@ pub fn run_post_edit_check(ws: &Path, rel_path: &str) -> String {
             }
             check_brace_balance(&abs_path, rel_path)
         }
-        "rs" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "h" | "hpp" => {
+        "ts" | "tsx" => {
+            let brace_res = check_brace_balance(&abs_path, rel_path);
+            if brace_res.contains("<post_edit_error") {
+                return brace_res;
+            }
+            if ws.join("tsconfig.json").is_file() {
+                let mut tsc = std::process::Command::new(if cfg!(windows) { "tsc.cmd" } else { "tsc" });
+                tsc.args(["--noEmit", "--pretty", "false"]).current_dir(ws);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    tsc.creation_flags(0x08000000);
+                }
+                if let Ok(tout) = tsc.output() {
+                    if !tout.status.success() {
+                        let combined = format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&tout.stdout),
+                            String::from_utf8_lossy(&tout.stderr)
+                        );
+                        let norm_rel = rel_path.replace('\\', "/");
+                        let relevant: Vec<&str> = combined
+                            .lines()
+                            .filter(|l| l.replace('\\', "/").contains(&norm_rel))
+                            .take(20)
+                            .collect();
+                        if !relevant.is_empty() {
+                            return format!(
+                                "\n<post_edit_error file=\"{}\">\n{}\n</post_edit_error>",
+                                rel_path,
+                                relevant.join("\n")
+                            );
+                        }
+                    }
+                }
+            }
+            brace_res
+        }
+        "rs" | "jsx" | "c" | "cpp" | "h" | "hpp" => {
             check_brace_balance(&abs_path, rel_path)
         }
         _ => String::new(),
+    }
+}
+
+/// Runs workspace-wide incremental compiler and type diagnostics (`cargo check`, `tsc --noEmit`,
+/// `go vet`, `ruff` / `py_compile`) and optionally filters diagnostics to `filter_file`.
+pub fn run_workspace_diagnostics(ws: &Path, filter_file: Option<&str>) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    let norm_filter = filter_file
+        .map(|f| f.trim().replace('\\', "/"))
+        .filter(|f| !f.is_empty());
+
+    let run_diag_cmd = |bin: &str, args: &[&str]| -> Option<(bool, String)> {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(args).current_dir(ws);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let out = cmd.output().ok()?;
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some((out.status.success(), combined.trim().to_string()))
+    };
+
+    if ws.join("Cargo.toml").is_file() {
+        if let Some((ok, out)) = run_diag_cmd("cargo", &["check", "--message-format=short", "-q"]) {
+            let lines: Vec<&str> = out
+                .lines()
+                .filter(|l| {
+                    if let Some(ref nf) = norm_filter {
+                        l.replace('\\', "/").contains(nf)
+                    } else {
+                        true
+                    }
+                })
+                .take(40)
+                .collect();
+            if ok && lines.is_empty() {
+                sections.push("[Rust / cargo check]: 0 errors".to_string());
+            } else if !lines.is_empty() {
+                sections.push(format!("[Rust / cargo check]:\n{}", lines.join("\n")));
+            }
+        }
+    }
+
+    if ws.join("tsconfig.json").is_file() {
+        let tsc_bin = if cfg!(windows) { "tsc.cmd" } else { "tsc" };
+        if let Some((ok, out)) = run_diag_cmd(tsc_bin, &["--noEmit", "--pretty", "false"]) {
+            let lines: Vec<&str> = out
+                .lines()
+                .filter(|l| {
+                    if let Some(ref nf) = norm_filter {
+                        l.replace('\\', "/").contains(nf)
+                    } else {
+                        true
+                    }
+                })
+                .take(40)
+                .collect();
+            if ok && lines.is_empty() {
+                sections.push("[TypeScript / tsc --noEmit]: 0 errors".to_string());
+            } else if !lines.is_empty() {
+                sections.push(format!("[TypeScript / tsc --noEmit]:\n{}", lines.join("\n")));
+            }
+        }
+    }
+
+    if ws.join("go.mod").is_file() {
+        if let Some((ok, out)) = run_diag_cmd("go", &["vet", "./..."]) {
+            let lines: Vec<&str> = out
+                .lines()
+                .filter(|l| {
+                    if let Some(ref nf) = norm_filter {
+                        l.replace('\\', "/").contains(nf)
+                    } else {
+                        true
+                    }
+                })
+                .take(40)
+                .collect();
+            if ok && lines.is_empty() {
+                sections.push("[Go / go vet]: 0 errors".to_string());
+            } else if !lines.is_empty() {
+                sections.push(format!("[Go / go vet]:\n{}", lines.join("\n")));
+            }
+        }
+    }
+
+    if let Some(ref nf) = norm_filter {
+        if let Ok(w) = Workspace::new(ws) {
+            if let Ok(abs) = w.resolve(nf) {
+                if abs.is_file() {
+                    let brace = check_brace_balance(&abs, nf);
+                    if brace.contains("<post_edit_error") {
+                        sections.push(brace.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        "<workspace_diagnostics>\nNo compiler or syntax errors detected in workspace.\n</workspace_diagnostics>".to_string()
+    } else {
+        format!(
+            "<workspace_diagnostics>\n{}\n</workspace_diagnostics>",
+            sections.join("\n\n")
+        )
     }
 }
 
