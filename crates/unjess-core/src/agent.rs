@@ -1347,9 +1347,36 @@ impl HarnessManager {
         if lower.ends_with(':') {
             return true;
         }
+
+        if lower.starts_with("let me ")
+            || lower.starts_with("let's ")
+            || lower.contains(". let me ")
+            || lower.contains(". let's ")
+            || lower.contains("\nlet me ")
+            || lower.contains("\nlet's ")
+        {
+            return true;
+        }
+
         let phrases = [
             "let me check",
             "let's check",
+            "let me build",
+            "let's build",
+            "let me write",
+            "let's write",
+            "let me create",
+            "let's create",
+            "let me implement",
+            "let's implement",
+            "let me compare",
+            "let's compare",
+            "let me construct",
+            "let's construct",
+            "let me fit",
+            "let's fit",
+            "let me try",
+            "let's try",
             "let me inspect",
             "let's inspect",
             "let me read",
@@ -1418,6 +1445,16 @@ impl HarnessManager {
             "i'll test",
             "i will investigate",
             "i'll investigate",
+            "i will build",
+            "i'll build",
+            "i will write",
+            "i'll write",
+            "i will create",
+            "i'll create",
+            "i will implement",
+            "i'll implement",
+            "i will compare",
+            "i'll compare",
             "i should check",
             "i should verify",
             "i should test",
@@ -3033,6 +3070,7 @@ impl HarnessManager {
                                     .as_ref()
                                     .map_or(false, |t| !t.trim().is_empty());
                             let is_transitional = Self::is_transitional_narration(&resp.content)
+                                || !is_explicit_completion
                                 || (!resp.content.contains("<!-- GOAL_COMPLETE -->")
                                     && resp.content.len() < 800
                                     && (lower_resp.contains("start by")
@@ -3045,7 +3083,9 @@ impl HarnessManager {
                                         || lower_resp.contains("examine")
                                         || lower_resp.contains("double check")
                                         || lower_resp.contains("need to")
-                                        || lower_resp.contains("will now")));
+                                        || lower_resp.contains("will now")
+                                        || lower_resp.contains("let me")
+                                        || lower_resp.contains("let's")));
 
                             if is_transitional || is_empty_turn {
                                 transitional_nudges += 1;
@@ -3703,7 +3743,8 @@ impl HarnessManager {
             _ => {
                 prompt.push_str(
                     "MODE DIRECTIVE (AUTONOMOUS): Use tools proactively to inspect, implement, test, and verify changes end-to-end.\n\
-                     AUTONOMOUS ACTION & TASK CONTINUITY INVARIANT: NEVER output transitional narration or announce what you intend to do next without invoking the tool in the same turn. Before ending your turn, check your last paragraph: if it is a plan, a question, or a promise about work you have not done yet, execute that work immediately with tool calls. Finish the whole requested scope before producing your final answer.\n",
+                     AUTONOMOUS ACTION & TASK CONTINUITY INVARIANT: NEVER output transitional narration or announce what you intend to do next without invoking the tool in the same turn. Before ending your turn, check your last paragraph: if it is a plan, a question, or a promise about work you have not done yet, execute that work immediately with tool calls. Finish the whole requested scope before producing your final answer.\n\
+                     ADVERSARIAL SELF-VERIFICATION PROTOCOL: Never assume generated artifacts or code are correct without empirical proof. Before declaring completion or stopping, you MUST write and execute an independent verification script (or compare against reference outputs/ground-truth files such as logits, expected keys, return codes, schemas) to verify that all invariants and requirements are 100% satisfied. If verification reveals discrepancies, iterate and fix them immediately.\n",
                 );
             }
         }
