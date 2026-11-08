@@ -2856,7 +2856,7 @@ impl HarnessManager {
         let mut tool_engine =
             ToolEngine::new(workspace).with_abort_flag(Arc::clone(&self.abort_flag));
 
-        let max_iters = settings.max_iterations.clamp(1, 300);
+        let max_iters = settings.max_iterations.clamp(1, 600);
         let enable_tools = self.agent_mode() != "Plan";
 
         let active_conv = self.conversation_by_id(conv_id);

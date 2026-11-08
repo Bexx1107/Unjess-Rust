@@ -89,7 +89,7 @@ impl Default for Settings {
             mashina_url: String::new(),
             mashina_collab_token: String::new(),
             workspace: cwd,
-            max_iterations: 200,
+            max_iterations: 300,
             subagent_max_turns: 300,
             subagent_model: "inherit".to_string(),
             ask_before_subagent_spawn: false,

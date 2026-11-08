@@ -2540,7 +2540,10 @@ impl UnjessDesktopApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    let btn_reserve_width = 300.0;
+                    let text_width = (ui.available_width() - btn_reserve_width).max(200.0);
                     ui.vertical(|ui| {
+                        ui.set_max_width(text_width);
                         ui.label(
                             RichText::new(format!(
                                 "Unjess v{} — 100% Native Rust GPU Edition",

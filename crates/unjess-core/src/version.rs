@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.0.0";
+pub const CURRENT_VERSION: &str = "4.0.1";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,21 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.0.1".to_string(),
+            date: "2026-11-08".to_string(),
+            title: "Unjess 4.0.1 — Deep Reasoning Max Steps & GUI Polish".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Extended autonomous agent loop max steps up to 600 with new --max-steps CLI flag.".to_string(),
+                "Fixed header text layout overlap under action buttons in Updates & Changelog GUI tab.".to_string(),
+                "Permanent anchor context retention preventing task prompt amnesia during deep reasoning runs.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.0.0".to_string(),
             date: "2026-11-08".to_string(),
             title: "Unjess 4.0 — Native Rust Engine & Multi-File Skills".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Complete Rust workspace architecture across unjess-core, unjess-desktop (eframe/egui GPU), unjess-daemon (Tokio/Axum), unjess-cli, and native installer.".to_string(),
                 "In-process Arc<HarnessManager> execution loop with real-time live turn streaming, reasoning effort controls, and instant file diff revert.".to_string(),
@@ -74,9 +85,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.0.0");
+        assert_eq!(CURRENT_VERSION, "4.0.1");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.0.0");
+        assert_eq!(log[0].version, "4.0.1");
     }
 }

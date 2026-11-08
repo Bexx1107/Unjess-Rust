@@ -123,6 +123,10 @@ struct CliArgs {
     #[arg(short = 'y', long = "yes", global = true)]
     yes: bool,
 
+    /// Override maximum autonomous loop iterations (default 300, max 600)
+    #[arg(long = "max-steps", alias = "max-iterations", global = true)]
+    max_steps: Option<usize>,
+
     /// Enable ultra-dense Caveman persona mode
     #[arg(long, global = true)]
     caveman: bool,
@@ -221,7 +225,7 @@ async fn main() {
     hm.set_active_workspace(&id);
 
     // Apply CLI flag overrides in-memory without mutating persistent config.yaml on disk
-    if args.model.is_some() || args.provider.is_some() || args.effort.is_some() || args.yes {
+    if args.model.is_some() || args.provider.is_some() || args.effort.is_some() || args.yes || args.max_steps.is_some() {
         let mut s = hm.settings();
         if let Some(m) = &args.model {
             s.model = m.clone();
@@ -231,6 +235,9 @@ async fn main() {
         }
         if let Some(eff) = &args.effort {
             s.reasoning_effort = eff.clone();
+        }
+        if let Some(steps) = args.max_steps {
+            s.max_iterations = steps;
         }
         if args.yes {
             s.confirm_commands = false;
