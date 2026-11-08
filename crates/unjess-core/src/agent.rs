@@ -1281,13 +1281,39 @@ impl HarnessManager {
     pub fn is_transitional_narration(text: &str) -> bool {
         let trimmed = text.trim();
         if trimmed.is_empty()
-            || trimmed.len() > 700
+            || trimmed.len() > 800
             || trimmed.contains("<!-- GOAL_COMPLETE -->")
             || trimmed.contains("```")
         {
             return false;
         }
         let lower = trimmed.to_lowercase();
+
+        // If it asks a question to the user, it is not an uncalled action
+        if trimmed.ends_with('?')
+            || lower.contains("could you clarify")
+            || lower.contains("please provide")
+        {
+            return false;
+        }
+
+        // If it explicitly states the task is complete, it is not transitional
+        let completion_markers = [
+            "task is complete",
+            "task is completed",
+            "all requirements have been met",
+            "i have completed",
+            "here is the final",
+            "completed the task",
+            "all tests pass",
+            "finished the implementation",
+            "work is complete",
+            "successfully completed",
+        ];
+        if completion_markers.iter().any(|m| lower.contains(m)) {
+            return false;
+        }
+
         if lower.ends_with(':') {
             return true;
         }
@@ -1308,12 +1334,25 @@ impl HarnessManager {
             "let's examine",
             "let me verify",
             "let's verify",
+            "let me validate",
+            "let's validate",
+            "let me test",
+            "let's test",
             "let me explore",
             "let's explore",
+            "let me see",
+            "let me make sure",
+            "let's make sure",
+            "let me double check",
+            "let's double check",
             "i will now",
             "i'll now",
             "now i will",
             "now i'll",
+            "now let's",
+            "now let me",
+            "now we need to",
+            "now i need to",
             "i'll start by",
             "i will start by",
             "i'll begin by",
@@ -1341,8 +1380,18 @@ impl HarnessManager {
             "i need to examine",
             "i need to read",
             "i need to run",
+            "i need to test",
+            "i need to verify",
+            "i will validate",
+            "i'll validate",
+            "i will test",
+            "i'll test",
             "i will investigate",
             "i'll investigate",
+            "i should check",
+            "i should verify",
+            "i should test",
+            "i should run",
         ];
         phrases.iter().any(|p| lower.contains(p))
     }
@@ -2809,6 +2858,8 @@ impl HarnessManager {
         let mut tool_call_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut transitional_nudges = 0usize;
+        let mut pre_exit_test_check_count = 0usize;
+        let mut pre_exit_unverified_edit_count = 0usize;
         let mut scratch_cleanup_nudged = false;
         let mut system_prompt = self.build_system_prompt_for_query(&ws_path, &latest_user_query);
         let mut system_prompt_dirty = false;
@@ -2919,49 +2970,227 @@ impl HarnessManager {
                     }
 
                     if resp.pending_tool_calls.is_empty() {
-                        // 1. Transitional narration auto-continuation (up to 5 nudges per phase)
+                        let lower_resp = resp.content.to_lowercase();
+                        let is_explicit_completion = [
+                            "task is complete",
+                            "task is completed",
+                            "all requirements have been met",
+                            "i have completed",
+                            "here is the final",
+                            "completed the task",
+                            "all tests pass",
+                            "finished the implementation",
+                            "work is complete",
+                            "successfully completed",
+                            "<!-- goal_complete -->",
+                        ]
+                        .iter()
+                        .any(|m| lower_resp.contains(m));
+
+                        let is_user_question = resp.content.trim().ends_with('?')
+                            || lower_resp.contains("could you clarify")
+                            || lower_resp.contains("please provide");
+
+                        // 1. Transitional narration auto-continuation & empty turn recovery (up to 5 nudges per phase)
                         if enable_tools
                             && transitional_nudges < 5
                             && iter < max_iters
-                            && (Self::is_transitional_narration(&resp.content)
-                                || (!resp.content.contains("<!-- GOAL_COMPLETE -->")
-                                    && resp.content.len() < 600
-                                    && (resp.content.to_lowercase().contains("start by")
-                                        || resp.content.to_lowercase().contains("proceed to")
-                                        || resp.content.to_lowercase().contains("next step")
-                                        || resp.content.to_lowercase().contains("continue by"))))
+                            && !is_user_question
+                            && !is_explicit_completion
                         {
-                            transitional_nudges += 1;
-                            working_history.push(ChatMessage {
-                                role: "assistant".to_string(),
-                                content: resp.content.clone(),
-                                thinking: step_thinking,
-                                tool_calls: Vec::new(),
-                                diffs: Vec::new(),
-                                timestamp: Utc::now().format("%H:%M:%S").to_string(),
-                                model: Some(settings.model.clone()),
-                                tokens: 0,
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                cost_usd: 0.0,
-                            });
-                            working_history.push(ChatMessage {
-                                role: "user".to_string(),
-                                content: "[System Auto-Continue]: You stated what you are about to do without invoking a tool. Proceed and call the appropriate tool now.".to_string(),
-                                thinking: None,
-                                tool_calls: Vec::new(),
-                                diffs: Vec::new(),
-                                timestamp: Utc::now().format("%H:%M:%S").to_string(),
-                                model: None,
-                                tokens: 0,
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                cost_usd: 0.0,
-                            });
-                            continue;
+                            let is_empty_turn = resp.content.trim().is_empty()
+                                && step_thinking
+                                    .as_ref()
+                                    .map_or(false, |t| !t.trim().is_empty());
+                            let is_transitional = Self::is_transitional_narration(&resp.content)
+                                || (!resp.content.contains("<!-- GOAL_COMPLETE -->")
+                                    && resp.content.len() < 800
+                                    && (lower_resp.contains("start by")
+                                        || lower_resp.contains("proceed to")
+                                        || lower_resp.contains("next step")
+                                        || lower_resp.contains("continue by")
+                                        || lower_resp.contains("now let")
+                                        || lower_resp.contains("validate")
+                                        || lower_resp.contains("inspect")
+                                        || lower_resp.contains("examine")
+                                        || lower_resp.contains("double check")
+                                        || lower_resp.contains("need to")
+                                        || lower_resp.contains("will now")));
+
+                            if is_transitional || is_empty_turn {
+                                transitional_nudges += 1;
+                                let nudge_msg = if is_empty_turn {
+                                    "[System Guidance]: You completed your reasoning but did not invoke any tools or output a final answer. Please invoke the appropriate tool to proceed with the task or provide your final response.".to_string()
+                                } else {
+                                    "[System Guidance]: You provided intermediate commentary without invoking any tools. In autonomous mode, you must not narrate your intent without acting. If you need to inspect files, execute commands, or edit code, CALL THE RELEVANT TOOL IMMEDIATELY now. If you are completely finished, provide your final response summarizing what you accomplished and stating the task is complete.".to_string()
+                                };
+                                working_history.push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: resp.content.clone(),
+                                    thinking: step_thinking,
+                                    tool_calls: Vec::new(),
+                                    diffs: Vec::new(),
+                                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                    model: Some(settings.model.clone()),
+                                    tokens: 0,
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cost_usd: 0.0,
+                                });
+                                working_history.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: nudge_msg,
+                                    thinking: None,
+                                    tool_calls: Vec::new(),
+                                    diffs: Vec::new(),
+                                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                    model: None,
+                                    tokens: 0,
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cost_usd: 0.0,
+                                });
+                                continue;
+                            }
                         }
 
-                        // 2. Pre-exit leftover scratch file detection
+                        // 2. Pre-Exit Verification & Pass@k Trajectory Pivot Protocol (Ported from Go agent.go:5550-5620)
+                        if enable_tools && iter < max_iters && !is_user_question {
+                            // Check (a): Did the most recent test/verification command fail?
+                            if pre_exit_test_check_count < 3 && !collected_diffs.is_empty() {
+                                let mut has_failed_test = false;
+                                let mut last_failed_output = String::new();
+                                for tc in collected_tools.iter().rev() {
+                                    if tc.name == "run_command" {
+                                        let cmd_str = tc
+                                            .arguments
+                                            .get("command")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let lower_cmd = cmd_str.to_lowercase();
+                                        if lower_cmd.contains("test")
+                                            || lower_cmd.contains("pytest")
+                                            || lower_cmd.contains("check")
+                                            || lower_cmd.contains("verify")
+                                            || lower_cmd.contains("cargo test")
+                                            || lower_cmd.contains("npm test")
+                                        {
+                                            let res_str = &tc.result;
+                                            if tc.status == "error"
+                                                || res_str.contains("FAILED")
+                                                || res_str.contains("AssertionError")
+                                                || res_str.contains("FAIL:")
+                                                || res_str.contains("[FAIL]")
+                                                || res_str.contains("error:")
+                                            {
+                                                has_failed_test = true;
+                                                last_failed_output = res_str.clone();
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if has_failed_test {
+                                    pre_exit_test_check_count += 1;
+                                    let pivot_advice = if pre_exit_test_check_count >= 2 {
+                                        "\n\n<trajectory_pivot_recovery>\n[Pass@k Trajectory Pivot Activated]\nYour previous fix attempt still left tests failing. Do NOT repeat minor surface tweaks on a flawed hypothesis:\n1. Re-read the exact failing test and traceback above.\n2. Identify what assumption in your current approach is wrong.\n3. Implement a clean alternative root-cause fix.\n</trajectory_pivot_recovery>"
+                                    } else {
+                                        ""
+                                    };
+                                    let max_snip = if last_failed_output.len() > 1500 {
+                                        &last_failed_output[..1500]
+                                    } else {
+                                        &last_failed_output
+                                    };
+                                    let rejection_msg = format!(
+                                        "<pre_exit_verification_failure>\n[Pre-Exit Test Verification FAILED (Attempt {}/3)]\nYour last verification/test command failed with errors:\n{}\nPlease resolve the root cause and re-run verification before declaring task completion.{}\n</pre_exit_verification_failure>",
+                                        pre_exit_test_check_count, max_snip, pivot_advice
+                                    );
+                                    working_history.push(ChatMessage {
+                                        role: "assistant".to_string(),
+                                        content: resp.content.clone(),
+                                        thinking: step_thinking,
+                                        tool_calls: Vec::new(),
+                                        diffs: Vec::new(),
+                                        timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                        model: Some(settings.model.clone()),
+                                        tokens: 0,
+                                        input_tokens: 0,
+                                        output_tokens: 0,
+                                        cost_usd: 0.0,
+                                    });
+                                    working_history.push(ChatMessage {
+                                        role: "user".to_string(),
+                                        content: rejection_msg,
+                                        thinking: None,
+                                        tool_calls: Vec::new(),
+                                        diffs: Vec::new(),
+                                        timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                        model: None,
+                                        tokens: 0,
+                                        input_tokens: 0,
+                                        output_tokens: 0,
+                                        cost_usd: 0.0,
+                                    });
+                                    continue;
+                                }
+                            }
+
+                            // Check (b): Pre-Exit Unverified Edit Guard
+                            // If files were created or modified after the last run_command, do not allow exit without running verification!
+                            let last_edit_idx = collected_tools.iter().rposition(|tc| {
+                                tc.name == "write_file"
+                                    || tc.name == "edit_file"
+                                    || tc.name == "apply_patch"
+                            });
+                            let last_run_cmd_idx = collected_tools
+                                .iter()
+                                .rposition(|tc| tc.name == "run_command");
+
+                            let edits_unverified = match (last_edit_idx, last_run_cmd_idx) {
+                                (Some(e_idx), Some(c_idx)) => e_idx > c_idx,
+                                (Some(_), None) => true,
+                                (None, _) => false,
+                            };
+
+                            if pre_exit_unverified_edit_count < 2
+                                && edits_unverified
+                                && !is_explicit_completion
+                            {
+                                pre_exit_unverified_edit_count += 1;
+                                let rejection_msg = "<pre_exit_verification_failure>\n[Pre-Exit Unverified Edit Guard]\nYou modified or created source files after your last command execution (or have not executed a verification command yet). Do not assume code works just because it was edited or generated — execute a verification/test command via `run_command` to confirm all tests and tolerance thresholds pass before concluding.\n</pre_exit_verification_failure>".to_string();
+                                working_history.push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: resp.content.clone(),
+                                    thinking: step_thinking,
+                                    tool_calls: Vec::new(),
+                                    diffs: Vec::new(),
+                                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                    model: Some(settings.model.clone()),
+                                    tokens: 0,
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cost_usd: 0.0,
+                                });
+                                working_history.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: rejection_msg,
+                                    thinking: None,
+                                    tool_calls: Vec::new(),
+                                    diffs: Vec::new(),
+                                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                    model: None,
+                                    tokens: 0,
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cost_usd: 0.0,
+                                });
+                                continue;
+                            }
+                        }
+
+                        // 3. Pre-exit leftover scratch file detection
                         if enable_tools && !scratch_cleanup_nudged && iter < max_iters {
                             let created_paths: Vec<String> = collected_diffs
                                 .iter()
