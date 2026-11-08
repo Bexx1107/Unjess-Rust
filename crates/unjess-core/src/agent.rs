@@ -23,7 +23,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2921,6 +2921,8 @@ impl HarnessManager {
         let mut total_turn_in_tokens = 0usize;
         let mut total_turn_out_tokens = 0usize;
         let mut total_turn_cost = 0.0f64;
+        let is_autonomous = self.agent_mode() == "Autonomous";
+        let mut turn_retries = 0usize;
         let mut recent_tool_signatures: Vec<String> = Vec::new();
         let mut transitional_nudges = 0usize;
         let mut pre_exit_test_check_count = 0usize;
@@ -3002,6 +3004,7 @@ impl HarnessManager {
 
             match turn_result {
                 Ok(mut resp) => {
+                    turn_retries = 0;
                     total_turn_tokens += resp.tokens;
                     total_turn_in_tokens += resp.input_tokens;
                     total_turn_out_tokens += resp.output_tokens;
@@ -3638,6 +3641,16 @@ impl HarnessManager {
                     }
                 }
                 Err(err) => {
+                    if is_autonomous && turn_retries < 5 {
+                        turn_retries += 1;
+                        let backoff_secs = (2 * turn_retries as u64).min(10);
+                        eprintln!(
+                            "⚠️ Transient LLM failure on step {}/{} ({}), retrying attempt {}/5 in {}s...",
+                            iter, max_iters, err, turn_retries, backoff_secs
+                        );
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        continue;
+                    }
                     final_text = format!(
                         "**LLM Provider Error (`{}`)**:\n```\n{}\n```\n\n*Tip: Verify that Ollama / llama.cpp / LM Studio is running locally or configure a cloud API key in the **Settings** tab.*",
                         settings.model, err

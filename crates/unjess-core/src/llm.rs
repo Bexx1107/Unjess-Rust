@@ -259,6 +259,7 @@ fn estimate_output_tokens(
 pub fn is_transient_llm_error(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("http 429")
+        || lower.contains("http 500")
         || lower.contains("http 502")
         || lower.contains("http 503")
         || lower.contains("http 504")
@@ -272,7 +273,12 @@ pub fn is_transient_llm_error(err: &str) -> bool {
         || lower.contains("resource_exhausted")
         || lower.contains("rate limit")
         || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("connection error")
+        || lower.contains("error sending request")
         || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("broken pipe")
 }
 
 /// Returns the context window capacity (in tokens) for `model` to power dynamic context-budget compaction.
