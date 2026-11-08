@@ -11,6 +11,7 @@ use unjess_core::config::Settings;
 use unjess_core::llm::resolve_provider_for_model;
 use unjess_core::mcp::McpManager;
 use unjess_core::memory::MemoryStore;
+use unjess_core::scheduler::SchedulerManager;
 use unjess_core::security::scan_workspace;
 use unjess_core::skills::SkillsManager;
 use unjess_core::tools::ToolEngine;
@@ -508,14 +509,18 @@ fn print_slash_command_palette() {
             ],
         ),
         (
-            "Workspace, Files & Git",
+            "Workspace, Files, Shell & Watchers",
             &[
+                ("/run <cmd>", "Execute a shell command directly in the workspace (alias: !<cmd>)"),
+                ("/timer <sec> <task>", "Schedule a background countdown timer (e.g. /timer 10 !cargo check)"),
+                ("/watch <path|!cmd>", "Start a live background file or command watcher (e.g. /watch src)"),
+                ("/tasks", "List active background timers, file watchers & cron schedules"),
+                ("/stop-tasks [id]", "Cancel running background timers & watchers"),
                 ("/cd <path>", "Switch active workspace directory (alias: /workspace)"),
                 ("/files [filter]", "List tracked files in the active workspace"),
                 ("/git", "Show workspace git branch, working tree status, and recent commits"),
                 ("/diff", "Render colorized unified diffs from the most recent turn"),
                 ("/undo", "Revert file modifications from the last turn (alias: /revert)"),
-                ("!<command>", "Run a shell command directly in the active workspace"),
             ],
         ),
         (
@@ -2317,7 +2322,149 @@ async fn handle_repl_line(hm: &Arc<HarnessManager>, raw_input: &str) -> bool {
                 hm.clear_active_conversation();
                 println!("  {}✓ Cleared active conversation.{}", C_GREEN, C_RESET);
             }
-            "/version" => run_version(false),
+            "/version" | "/v" | "/changelog" => run_version(false),
+            "/run" => {
+                if arg.is_empty() {
+                    println!(
+                        "  {}Usage: /run <shell_command> (or !<shell_command>){}",
+                        C_YELLOW, C_RESET
+                    );
+                } else {
+                    let ws_path = hm.active_workspace_path();
+                    if let Ok(ws) = Workspace::new(&ws_path) {
+                        let te = ToolEngine::new(ws);
+                        println!(
+                            "  {}⚡ Running `{}` in {}...{}",
+                            C_CYAN,
+                            arg,
+                            ws_path.display(),
+                            C_RESET
+                        );
+                        match te.run_command(arg, 60) {
+                            Ok(out) => println!("\n{}\n", out.trim_end()),
+                            Err(e) => eprintln!("  {}[!] Command error: {}{}", C_RED, e, C_RESET),
+                        }
+                    }
+                }
+            }
+            "/timer" => {
+                if arg.is_empty() {
+                    println!(
+                        "  {}Usage: /timer <seconds> <prompt_or_!command>  (e.g. `/timer 10 !cargo check`){}",
+                        C_YELLOW, C_RESET
+                    );
+                } else {
+                    let mut tparts = arg.splitn(2, char::is_whitespace);
+                    let sec_str = tparts.next().unwrap_or("10").trim_end_matches('s');
+                    let secs = sec_str.parse::<u64>().unwrap_or(10).max(1);
+                    let payload = tparts.next().unwrap_or("!echo Timer done").trim();
+                    let ws_str = hm.active_workspace_path().to_string_lossy().to_string();
+                    let action = if payload.starts_with('!') {
+                        "command"
+                    } else {
+                        "prompt"
+                    };
+                    let task = SchedulerManager::start_timer(
+                        secs,
+                        action,
+                        payload,
+                        &ws_str,
+                        Some(Arc::clone(hm)),
+                    );
+                    println!(
+                        "  {}⏰ Started {}s background timer ({}) -> {}{}{}",
+                        C_GREEN, secs, task.id, C_CYAN, payload, C_RESET
+                    );
+                }
+            }
+            "/watch" => {
+                let target = if arg.is_empty() { "." } else { arg };
+                let mut wparts = target.splitn(2, "->");
+                let watch_target = wparts.next().unwrap_or(".").trim();
+                let on_change = wparts.next().unwrap_or("").trim();
+                let ws_str = hm.active_workspace_path().to_string_lossy().to_string();
+                let task = SchedulerManager::start_watcher(
+                    if watch_target.is_empty() {
+                        "."
+                    } else {
+                        watch_target
+                    },
+                    4,
+                    on_change,
+                    &ws_str,
+                    Some(Arc::clone(hm)),
+                );
+                println!(
+                    "  {}👁 Started live background watcher ({}) on `{}`{}",
+                    C_GREEN, task.id, task.label, C_RESET
+                );
+            }
+            "/tasks" | "/schedules" | "/schedule" => {
+                let live = SchedulerManager::list_live_tasks();
+                let cron = SchedulerManager::load();
+                println!(
+                    "\n  {}{}╭─ Active Background Timers, Watchers & Schedules ─────────────────────────────╮{}",
+                    C_BOLD, C_CYAN, C_RESET
+                );
+                if live.is_empty() && cron.is_empty() {
+                    println!(
+                        "  {}│{}  {}No active background tasks. Start one with `/timer 10 !cmd` or `/watch src`.{}",
+                        C_BORDER, C_RESET, C_GRAY, C_RESET
+                    );
+                }
+                for t in &live {
+                    let badge_col = if t.status == "running" {
+                        C_GREEN
+                    } else if t.status == "completed" {
+                        C_CYAN
+                    } else {
+                        C_YELLOW
+                    };
+                    println!(
+                        "  {}│{}  {}[{:<9}]{} {}{:<14}{} {:<32} {}{}{}",
+                        C_BORDER,
+                        C_RESET,
+                        badge_col,
+                        t.status,
+                        C_RESET,
+                        C_BOLD,
+                        t.id,
+                        C_RESET,
+                        t.label,
+                        C_GRAY,
+                        t.last_event,
+                        C_RESET
+                    );
+                }
+                for s in &cron {
+                    println!(
+                        "  {}│{}  {}[cron     ]{} {}{:<14}{} {:<32} {}({}){}",
+                        C_BORDER,
+                        C_RESET,
+                        if s.enabled { C_GREEN } else { C_GRAY },
+                        C_RESET,
+                        C_BOLD,
+                        s.id,
+                        C_RESET,
+                        s.title,
+                        C_GRAY,
+                        s.cron_expression,
+                        C_RESET
+                    );
+                }
+                println!(
+                    "  {}{}╰──────────────────────────────────────────────────────────────────────────────╯{}\n",
+                    C_BOLD, C_CYAN, C_RESET
+                );
+            }
+            "/stop-tasks" | "/cancel" => {
+                let target = if arg.is_empty() { "all" } else { arg };
+                let n = SchedulerManager::cancel_live_task(target);
+                println!(
+                    "  {}✓ Cancelled {} running background task(s).{}",
+                    C_GREEN, n, C_RESET
+                );
+            }
             "/caveman" | "/ponytail" | "/goal" | "/budget" | "/plan" | "/auto"
             | "/autonomous" | "/supervised" | "/skill" => {
                 execute_turn_and_wait(hm, input.to_string(), false, false).await;
@@ -2388,10 +2535,307 @@ async fn handle_repl_line(hm: &Arc<HarnessManager>, raw_input: &str) -> bool {
     true
 }
 
+fn cli_slash_catalog() -> &'static [(&'static str, &'static str, &'static str, bool)] {
+    &[
+        ("/help", "/help", "Show all slash commands, timers, watchers & shortcuts", false),
+        ("/context", "/context", "Show token usage bar, message count & session USD cost", false),
+        ("/status", "/status", "Display session, model, workspace, and git status card", false),
+        ("/timer", "/timer <sec> <cmd|prompt>", "Schedule a background countdown timer (e.g. /timer 10 !cargo check)", true),
+        ("/watch", "/watch <path|!cmd>", "Start a live background file or command watcher (e.g. /watch src)", true),
+        ("/tasks", "/tasks", "List active background timers, file watchers & cron schedules", false),
+        ("/stop-tasks", "/stop-tasks", "Cancel running background timers & watchers", false),
+        ("/run", "/run <cmd>", "Execute a shell command directly in the workspace (or !<cmd>)", true),
+        ("/model", "/model [id]", "Show or switch active LLM model", true),
+        ("/models", "/models [filter]", "Discover & list all available local and cloud models", false),
+        ("/mode", "/mode <auto|plan|supervised|duel>", "Switch agent execution mode", true),
+        ("/effort", "/effort <low|medium|high|max>", "Switch reasoning effort level", true),
+        ("/caveman", "/caveman", "Toggle ultra-concise Caveman token-saving mode", false),
+        ("/ponytail", "/ponytail", "Toggle expressive Ponytail pair-programming mode", false),
+        ("/compact", "/compact", "Compress conversation context to free up token window", false),
+        ("/new", "/new [title]", "Start a fresh conversation", false),
+        ("/convs", "/convs [num]", "List or switch conversations", false),
+        ("/clear", "/clear", "Clear active conversation messages", false),
+        ("/files", "/files [filter]", "List tracked files in the active workspace", false),
+        ("/git", "/git", "Show workspace git branch, working tree status & commits", false),
+        ("/diff", "/diff", "Show colorized unified diffs from the last turn", false),
+        ("/undo", "/undo", "Revert file modifications from the last turn", false),
+        ("/duel", "/duel", "Run Red Team vs. White Team Security Duel scanner", false),
+        ("/skills", "/skills [filter]", "List installed SKILL.md agent skills (47 skills)", false),
+        ("/mcp", "/mcp [probe]", "List or live-probe configured MCP servers", false),
+        ("/agents", "/agents", "List autonomous subagent fleet", false),
+        ("/gui", "/gui", "Launch the native Rust GPU Desktop application (Unjess.exe)", false),
+        ("/exit", "/exit", "Exit the CLI REPL", false),
+    ]
+}
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _kbhit() -> i32;
+    fn _getwch() -> u16;
+}
+
+/// Interactive TUI line reader on Windows consoles:
+/// - Immediately displays a live floating Slash Command Dropdown below the prompt the instant `/` is typed!
+/// - Supports `↑`/`↓` arrow keys to highlight a slash command, `Tab` to complete, and `Enter` to execute.
+/// - Polls background timers and watchers every 80ms while idle so notifications appear live!
+fn read_interactive_tui_line() -> Option<String> {
+    if !io::stdin().is_terminal() {
+        let mut line = String::new();
+        return match io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line),
+        };
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut line = String::new();
+        return match io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line),
+        };
+    }
+
+    #[cfg(windows)]
+    {
+        let mut buf = String::new();
+        let mut sel_idx: usize = 0;
+        let mut menu_lines_drawn: usize = 0;
+
+        let clear_menu = |drawn: &mut usize| {
+            if *drawn > 0 {
+                // Save cursor, move down 1 line, clear to end of screen, restore cursor
+                print!("\x1b[s\r\n\x1b[J\x1b[u");
+                let _ = io::stdout().flush();
+                *drawn = 0;
+            }
+        };
+
+        let render_menu = |current: &str, sel: &mut usize, drawn: &mut usize| {
+            let trimmed = current.trim_start();
+            if !trimmed.starts_with('/') || trimmed.contains(' ') {
+                clear_menu(drawn);
+                return;
+            }
+            let q = trimmed.to_lowercase();
+            let matches: Vec<_> = cli_slash_catalog()
+                .iter()
+                .filter(|(cmd, _, _, _)| {
+                    q == "/" || cmd.starts_with(&q) || cmd.contains(q.trim_start_matches('/'))
+                })
+                .take(8)
+                .collect();
+
+            if matches.is_empty() {
+                clear_menu(drawn);
+                return;
+            }
+            if *sel >= matches.len() {
+                *sel = 0;
+            }
+
+            let mut out = String::from("\x1b[s\r\n\x1b[J");
+            out.push_str(&format!(
+                "  {}╭─ {}Slash Commands{} {}(↑/↓ select · Tab complete · Enter run){} ─╮{}\r\n",
+                C_BORDER, C_GREEN, C_RESET, C_GRAY, C_BORDER, C_RESET
+            ));
+            for (i, (_, usage, desc, _)) in matches.iter().enumerate() {
+                if i == *sel {
+                    out.push_str(&format!(
+                        "  {}│{} {}▸ {:<26}{} {}{}{}\r\n",
+                        C_BORDER, C_RESET, C_GREEN, usage, C_RESET, C_WHITE, desc, C_RESET
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  {}│{}   {}{:<26}{} {}{}{}\r\n",
+                        C_BORDER, C_RESET, C_CYAN, usage, C_RESET, C_GRAY, desc, C_RESET
+                    ));
+                }
+            }
+            out.push_str(&format!(
+                "  {}╰────────────────────────────────────────────────────────────╯{}\x1b[u",
+                C_BORDER, C_RESET
+            ));
+            print!("{}", out);
+            let _ = io::stdout().flush();
+            *drawn = matches.len() + 2;
+        };
+
+        loop {
+            // Check for background timer / watcher notifications while waiting for keystrokes
+            let notes = SchedulerManager::drain_notifications();
+            if !notes.is_empty() {
+                clear_menu(&mut menu_lines_drawn);
+                for note in notes {
+                    print!(
+                        "\r\x1b[K  {}{}{}\r\n{}╰─{}❯{} {}",
+                        C_GREEN, note, C_RESET, C_BORDER, C_GREEN, C_RESET, buf
+                    );
+                }
+                let _ = io::stdout().flush();
+                render_menu(&buf, &mut sel_idx, &mut menu_lines_drawn);
+            }
+
+            let has_key = unsafe { _kbhit() != 0 };
+            if !has_key {
+                std::thread::sleep(Duration::from_millis(40));
+                continue;
+            }
+
+            let ch = unsafe { _getwch() };
+            // Ctrl+C (3) or Ctrl+D (4)
+            if ch == 3 {
+                clear_menu(&mut menu_lines_drawn);
+                println!("^C");
+                return Some(String::new());
+            }
+            if ch == 4 {
+                clear_menu(&mut menu_lines_drawn);
+                println!();
+                return None;
+            }
+
+            // Extended / Arrow key prefix (0 or 0xE0)
+            if ch == 0 || ch == 0xE0 {
+                let ext = unsafe { _getwch() };
+                let trimmed = buf.trim_start();
+                if trimmed.starts_with('/') && !trimmed.contains(' ') {
+                    let q = trimmed.to_lowercase();
+                    let count = cli_slash_catalog()
+                        .iter()
+                        .filter(|(cmd, _, _, _)| {
+                            q == "/"
+                                || cmd.starts_with(&q)
+                                || cmd.contains(q.trim_start_matches('/'))
+                        })
+                        .take(8)
+                        .count();
+                    if count > 0 {
+                        if ext == 72 {
+                            // Up arrow
+                            sel_idx = if sel_idx == 0 { count - 1 } else { sel_idx - 1 };
+                            render_menu(&buf, &mut sel_idx, &mut menu_lines_drawn);
+                        } else if ext == 80 {
+                            // Down arrow
+                            sel_idx = (sel_idx + 1) % count;
+                            render_menu(&buf, &mut sel_idx, &mut menu_lines_drawn);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Enter (\r = 13 or \n = 10)
+            if ch == 13 || ch == 10 {
+                clear_menu(&mut menu_lines_drawn);
+                let trimmed = buf.trim();
+                if trimmed.starts_with('/') && !trimmed.contains(' ') && trimmed != "/" {
+                    let q = trimmed.to_lowercase();
+                    let matches: Vec<_> = cli_slash_catalog()
+                        .iter()
+                        .filter(|(cmd, _, _, _)| {
+                            cmd.starts_with(&q) || cmd.contains(q.trim_start_matches('/'))
+                        })
+                        .take(8)
+                        .collect();
+                    if let Some(&(sel_cmd, _, _, takes_args)) =
+                        matches.get(sel_idx).or_else(|| matches.first())
+                    {
+                        if *takes_args && trimmed != *sel_cmd {
+                            buf = format!("{} ", sel_cmd);
+                            print!(
+                                "\r\x1b[K{}╰─{}❯{} {}",
+                                C_BORDER, C_GREEN, C_RESET, buf
+                            );
+                            let _ = io::stdout().flush();
+                            continue;
+                        } else {
+                            buf = sel_cmd.to_string();
+                            print!(
+                                "\r\x1b[K{}╰─{}❯{} {}",
+                                C_BORDER, C_GREEN, C_RESET, buf
+                            );
+                        }
+                    }
+                }
+                println!();
+                return Some(buf);
+            }
+
+            // Tab (9) -> Autocomplete highlighted slash command
+            if ch == 9 {
+                let trimmed = buf.trim_start();
+                if trimmed.starts_with('/') && !trimmed.contains(' ') {
+                    let q = trimmed.to_lowercase();
+                    let matches: Vec<_> = cli_slash_catalog()
+                        .iter()
+                        .filter(|(cmd, _, _, _)| {
+                            q == "/"
+                                || cmd.starts_with(&q)
+                                || cmd.contains(q.trim_start_matches('/'))
+                        })
+                        .take(8)
+                        .collect();
+                    if let Some(&(sel_cmd, _, _, takes_args)) =
+                        matches.get(sel_idx).or_else(|| matches.first())
+                    {
+                        buf = if *takes_args {
+                            format!("{} ", sel_cmd)
+                        } else {
+                            sel_cmd.to_string()
+                        };
+                        sel_idx = 0;
+                        print!(
+                            "\r\x1b[K{}╰─{}❯{} {}",
+                            C_BORDER, C_GREEN, C_RESET, buf
+                        );
+                        let _ = io::stdout().flush();
+                        render_menu(&buf, &mut sel_idx, &mut menu_lines_drawn);
+                    }
+                }
+                continue;
+            }
+
+            // Escape (27) -> Clear menu or input
+            if ch == 27 {
+                clear_menu(&mut menu_lines_drawn);
+                buf.clear();
+                sel_idx = 0;
+                print!("\r\x1b[K{}╰─{}❯{} ", C_BORDER, C_GREEN, C_RESET);
+                let _ = io::stdout().flush();
+                continue;
+            }
+
+            // Backspace (8 or 127)
+            if ch == 8 || ch == 127 {
+                if buf.pop().is_some() {
+                    sel_idx = 0;
+                    print!(
+                        "\r\x1b[K{}╰─{}❯{} {}",
+                        C_BORDER, C_GREEN, C_RESET, buf
+                    );
+                    let _ = io::stdout().flush();
+                    render_menu(&buf, &mut sel_idx, &mut menu_lines_drawn);
+                }
+                continue;
+            }
+
+            if let Some(c) = char::from_u32(ch as u32) {
+                if !c.is_control() {
+                    buf.push(c);
+                    sel_idx = 0;
+                    print!("{}", c);
+                    let _ = io::stdout().flush();
+                    render_menu(&buf, &mut sel_idx, &mut menu_lines_drawn);
+                }
+            }
+        }
+    }
+}
+
 async fn run_repl(hm: Arc<HarnessManager>) {
     print_banner(&hm);
 
-    let stdin = io::stdin();
     loop {
         let settings = hm.settings();
         let ws_path = hm.active_workspace_path();
@@ -2409,14 +2853,25 @@ async fn run_repl(hm: Arc<HarnessManager>) {
             format!(" {}({}{}){}", C_YELLOW, git_info.branch, dirty, C_RESET)
         };
 
+        let running_tasks = SchedulerManager::list_live_tasks()
+            .into_iter()
+            .filter(|t| t.status == "running")
+            .count();
+        let tasks_badge = if running_tasks > 0 {
+            format!(" {}[⏰ {} active]{}", C_GREEN, running_tasks, C_RESET)
+        } else {
+            String::new()
+        };
+
         print!(
-            "\n{}╭─{} {}[📂 {}]{}{} {}[{} │ {}{}{} │ {}{}{}]{}\n{}╰─{}❯{} ",
+            "\n{}╭─{} {}[📂 {}]{}{}{} {}[{} │ {}{}{} │ {}{}{}]{}\n{}╰─{}❯{} ",
             C_BORDER,
             C_RESET,
             C_BLUE,
             ws_name,
             C_RESET,
             git_badge,
+            tasks_badge,
             C_GRAY,
             mode_badge(&hm.agent_mode()),
             C_CYAN,
@@ -2432,12 +2887,9 @@ async fn run_repl(hm: Arc<HarnessManager>) {
         );
         let _ = io::stdout().flush();
 
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
+        let Some(line) = read_interactive_tui_line() else {
+            break;
+        };
         if !handle_repl_line(&hm, &line).await {
             break;
         }

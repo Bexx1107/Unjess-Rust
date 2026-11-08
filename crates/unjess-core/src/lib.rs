@@ -41,7 +41,7 @@ pub use config::{CustomProvider, ModelInfo, Settings};
 pub use llm::ChatMessage;
 pub use mcp::{McpManager, McpServerConfig};
 pub use memory::{MemoryEntry, MemoryStore};
-pub use scheduler::{ScheduledTask, SchedulerManager};
+pub use scheduler::{LiveBackgroundTask, ScheduledTask, SchedulerManager};
 pub use security::{scan_workspace, SecurityDuelReport, SecurityFinding};
 pub use skills::{SkillInfo, SkillsManager};
 pub use tools::{DirEntryInfo, FileDiff, ToolCallRecord, ToolEngine, ToolError};

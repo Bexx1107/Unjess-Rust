@@ -11,6 +11,24 @@ use std::sync::{Arc, Mutex};
 
 static TICKER_STARTED: AtomicBool = AtomicBool::new(false);
 static SCHEDULES_LOCK: Mutex<()> = Mutex::new(());
+static LIVE_TASKS: Mutex<Vec<LiveBackgroundTask>> = Mutex::new(Vec::new());
+static LIVE_NOTIFICATIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Live in-memory background timer or file/command watcher (`AGY`-style reactive task).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveBackgroundTask {
+    pub id: String,
+    pub kind: String, // "timer" | "watcher"
+    pub label: String,
+    pub payload: String,
+    pub action: String, // "prompt" | "command"
+    pub status: String, // "running" | "completed" | "cancelled" | "error"
+    pub remaining_secs: u64,
+    pub interval_secs: u64,
+    pub trigger_count: usize,
+    pub last_event: String,
+    pub created_at: String,
+}
 
 /// A scheduled autonomous prompt or shell command execution task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +368,302 @@ impl SchedulerManager {
                 }
             }
         });
+    }
+
+    /// Returns a snapshot of all live in-memory background timers and watchers.
+    pub fn list_live_tasks() -> Vec<LiveBackgroundTask> {
+        LIVE_TASKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Cancels a running timer or watcher by ID (or `"all"` to cancel all active live tasks).
+    pub fn cancel_live_task(task_id: &str) -> usize {
+        let mut guard = LIVE_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut count = 0;
+        let clean = task_id.trim();
+        for t in guard.iter_mut() {
+            if t.status == "running" && (clean.eq_ignore_ascii_case("all") || t.id == clean) {
+                t.status = "cancelled".to_string();
+                t.last_event = "Cancelled by user".to_string();
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Drains pending reactive notifications emitted by background timers and watchers.
+    pub fn drain_notifications() -> Vec<String> {
+        let mut guard = LIVE_NOTIFICATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    }
+
+    fn push_notification(msg: String) {
+        let mut guard = LIVE_NOTIFICATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        guard.push(msg);
+    }
+
+    /// Starts an AGY-style one-shot background countdown timer (`seconds`).
+    /// When the timer expires, it executes `payload` as either a shell command (`action == "command"` or starts with `!`)
+    /// or an autonomous agent prompt (`action == "prompt"`).
+    pub fn start_timer(
+        seconds: u64,
+        action: &str,
+        payload: &str,
+        workspace: &str,
+        hm_opt: Option<Arc<HarnessManager>>,
+    ) -> LiveBackgroundTask {
+        let secs = seconds.max(1);
+        let id = format!(
+            "timer-{}",
+            chrono::Utc::now().timestamp_millis() % 1_000_000
+        );
+        let clean_payload = payload.trim().to_string();
+        let resolved_action = if action.eq_ignore_ascii_case("command")
+            || clean_payload.starts_with('!')
+        {
+            "command".to_string()
+        } else {
+            "prompt".to_string()
+        };
+        let exec_payload = clean_payload
+            .strip_prefix('!')
+            .map(|s| s.trim().to_string())
+            .unwrap_or(clean_payload.clone());
+
+        let task = LiveBackgroundTask {
+            id: id.clone(),
+            kind: "timer".to_string(),
+            label: format!("{}s Timer -> {}", secs, exec_payload),
+            payload: exec_payload.clone(),
+            action: resolved_action.clone(),
+            status: "running".to_string(),
+            remaining_secs: secs,
+            interval_secs: secs,
+            trigger_count: 0,
+            last_event: format!("Counting down ({}s remaining)", secs),
+            created_at: chrono::Local::now().format("%H:%M:%S").to_string(),
+        };
+
+        {
+            let mut guard = LIVE_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+            guard.push(task.clone());
+        }
+
+        let ws_str = workspace.to_string();
+        std::thread::spawn(move || {
+            for rem in (1..=secs).rev() {
+                {
+                    let mut guard = LIVE_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(t) = guard.iter_mut().find(|x| x.id == id) {
+                        if t.status != "running" {
+                            return;
+                        }
+                        t.remaining_secs = rem;
+                        t.last_event = format!("Counting down ({}s remaining)", rem);
+                    } else {
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+
+            // Check if cancelled before firing
+            {
+                let guard = LIVE_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+                if !guard.iter().any(|x| x.id == id && x.status == "running") {
+                    return;
+                }
+            }
+
+            let event_summary = if resolved_action == "command" {
+                let out = crate::workspace::Workspace::new(&ws_str)
+                    .ok()
+                    .and_then(|ws| crate::tools::ToolEngine::new(ws).run_command(&exec_payload, 60).ok())
+                    .unwrap_or_else(|| "Command executed".to_string());
+                let first_line = out.lines().next().unwrap_or("done").trim();
+                format!("Ran `{}` -> {}", exec_payload, first_line)
+            } else if let Some(ref hm) = hm_opt {
+                hm.submit_prompt(format!("[Timer {} Fired] {}", id, exec_payload));
+                format!("Triggered agent turn: {}", exec_payload)
+            } else {
+                format!("Timer expired: {}", exec_payload)
+            };
+
+            {
+                let mut guard = LIVE_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(t) = guard.iter_mut().find(|x| x.id == id) {
+                    t.remaining_secs = 0;
+                    t.trigger_count = 1;
+                    t.status = "completed".to_string();
+                    t.last_event = event_summary.clone();
+                }
+            }
+            Self::push_notification(format!("⏰ Timer {} finished: {}", id, event_summary));
+        });
+
+        task
+    }
+
+    /// Starts a live background file or command watcher that polls every `interval_secs` seconds.
+    /// - If `target` starts with `cmd:` or `!`, it runs that command and triggers whenever its output changes.
+    /// - Otherwise, it hashes file modification timestamps & sizes in the workspace matching `target` (or the whole workspace)
+    ///   and triggers whenever files are modified, created, or deleted!
+    pub fn start_watcher(
+        target: &str,
+        interval_secs: u64,
+        on_change: &str,
+        workspace: &str,
+        hm_opt: Option<Arc<HarnessManager>>,
+    ) -> LiveBackgroundTask {
+        let interval = interval_secs.clamp(2, 3600);
+        let id = format!(
+            "watch-{}",
+            chrono::Utc::now().timestamp_millis() % 1_000_000
+        );
+        let clean_target = if target.trim().is_empty() {
+            ".".to_string()
+        } else {
+            target.trim().to_string()
+        };
+        let clean_on_change = on_change.trim().to_string();
+
+        let task = LiveBackgroundTask {
+            id: id.clone(),
+            kind: "watcher".to_string(),
+            label: format!("Watch `{}` (every {}s)", clean_target, interval),
+            payload: if clean_on_change.is_empty() {
+                clean_target.clone()
+            } else {
+                format!("{} -> {}", clean_target, clean_on_change)
+            },
+            action: if clean_on_change.starts_with('!') {
+                "command".to_string()
+            } else {
+                "watch".to_string()
+            },
+            status: "running".to_string(),
+            remaining_secs: interval,
+            interval_secs: interval,
+            trigger_count: 0,
+            last_event: format!("Watching `{}` for changes...", clean_target),
+            created_at: chrono::Local::now().format("%H:%M:%S").to_string(),
+        };
+
+        {
+            let mut guard = LIVE_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+            guard.push(task.clone());
+        }
+
+        let ws_str = workspace.to_string();
+        std::thread::spawn(move || {
+            let compute_fingerprint = || -> (String, String) {
+                if let Some(cmd) = clean_target
+                    .strip_prefix("cmd:")
+                    .or_else(|| clean_target.strip_prefix('!'))
+                {
+                    let out = crate::workspace::Workspace::new(&ws_str)
+                        .ok()
+                        .and_then(|ws| crate::tools::ToolEngine::new(ws).run_command(cmd.trim(), 30).ok())
+                        .unwrap_or_default();
+                    let first = out.lines().next().unwrap_or("").trim().to_string();
+                    (out, first)
+                } else {
+                    let root = PathBuf::from(&ws_str);
+                    let target_filter = clean_target.trim_start_matches("./").to_lowercase();
+                    let files = crate::workspace::Workspace::new(&root)
+                        .map(|ws| ws.list_all_files(400))
+                        .unwrap_or_default();
+                    let mut sig = String::new();
+                    let mut newest_file = String::new();
+                    let mut newest_mtime = std::time::SystemTime::UNIX_EPOCH;
+                    for rel in files {
+                        let rel_low = rel.to_lowercase();
+                        if target_filter != "."
+                            && target_filter != "*"
+                            && !rel_low.contains(&target_filter)
+                        {
+                            continue;
+                        }
+                        let full = root.join(&rel);
+                        if let Ok(meta) = fs::metadata(&full) {
+                            let mtime = meta.modified().unwrap_or( std::time::SystemTime::UNIX_EPOCH);
+                            let secs = mtime
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            sig.push_str(&format!("{}:{}:{};", rel, meta.len(), secs));
+                            if mtime > newest_mtime {
+                                newest_mtime = mtime;
+                                newest_file = rel;
+                            }
+                        }
+                    }
+                    (sig, newest_file)
+                }
+            };
+
+            let (mut prev_sig, _) = compute_fingerprint();
+
+            loop {
+                for rem in (1..=interval).rev() {
+                    {
+                        let mut guard = LIVE_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(t) = guard.iter_mut().find(|x| x.id == id) {
+                            if t.status != "running" {
+                                return;
+                            }
+                            t.remaining_secs = rem;
+                        } else {
+                            return;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+
+                let (new_sig, changed_hint) = compute_fingerprint();
+                if new_sig != prev_sig {
+                    prev_sig = new_sig;
+                    let detail = if changed_hint.is_empty() {
+                        format!("Change detected on `{}`", clean_target)
+                    } else {
+                        format!("Change detected: `{}`", changed_hint)
+                    };
+
+                    if !clean_on_change.is_empty() {
+                        if let Some(cmd) = clean_on_change.strip_prefix('!') {
+                            if let Ok(ws) = crate::workspace::Workspace::new(&ws_str) {
+                                let _ = crate::tools::ToolEngine::new(ws).run_command(cmd.trim(), 60);
+                            }
+                        } else if let Some(ref hm) = hm_opt {
+                            let snap = hm.live_turn_snapshot();
+                            if !snap.running {
+                                hm.submit_prompt(format!(
+                                    "[Watcher {} Triggered — {}] {}",
+                                    id, detail, clean_on_change
+                                ));
+                            }
+                        }
+                    }
+
+                    {
+                        let mut guard = LIVE_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(t) = guard.iter_mut().find(|x| x.id == id) {
+                            t.trigger_count += 1;
+                            t.last_event = format!(
+                                "{} (at {})",
+                                detail,
+                                chrono::Local::now().format("%H:%M:%S")
+                            );
+                        }
+                    }
+                    Self::push_notification(format!("👁 Watcher {}: {}", id, detail));
+                }
+            }
+        });
+
+        task
     }
 }
 

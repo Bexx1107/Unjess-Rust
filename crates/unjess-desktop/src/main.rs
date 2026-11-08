@@ -162,6 +162,7 @@ pub struct UnjessDesktopApp {
     pub update_checking: Arc<std::sync::atomic::AtomicBool>,
     pub update_check_result:
         Arc<std::sync::Mutex<Option<Result<unjess_core::updater::UpdateCheckResult, String>>>>,
+    pub slash_selected_idx: usize,
 }
 
 impl UnjessDesktopApp {
@@ -268,6 +269,7 @@ impl UnjessDesktopApp {
             mcp_last_summary: Arc::new(std::sync::Mutex::new(None)),
             update_checking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             update_check_result: Arc::new(std::sync::Mutex::new(None)),
+            slash_selected_idx: 0,
         }
     }
 
@@ -279,6 +281,256 @@ impl UnjessDesktopApp {
         }
         self.skills_cache = SkillsManager::list_skills_for_workspace(Some(&ws_path));
         self.last_cache_refresh = Instant::now();
+    }
+
+    pub fn gui_slash_commands() -> Vec<(&'static str, &'static str, &'static str, bool)> {
+        vec![
+            ("/help", "/help", "Show all slash commands, timers, watchers & shortcuts", false),
+            ("/context", "/context", "Inspect active workspace, model, token usage & cost", false),
+            ("/compact", "/compact", "Compress conversation context to free up token window", false),
+            ("/timer", "/timer <sec> <cmd|prompt>", "Schedule a background countdown timer (e.g. /timer 10 !cargo check)", true),
+            ("/watch", "/watch <path|!cmd>", "Start a live background file or command watcher (e.g. /watch src)", true),
+            ("/tasks", "/tasks", "List active background timers, file watchers & cron schedules", false),
+            ("/stop-tasks", "/stop-tasks", "Cancel all running background timers and watchers", false),
+            ("/run", "/run <command>", "Execute a shell command in the integrated terminal (or !<cmd>)", true),
+            ("/clear", "/clear", "Clear active conversation messages", false),
+            ("/new", "/new", "Create and switch to a fresh conversation", false),
+            ("/plan", "/plan", "Switch to Plan Mode (architectural blueprint before coding)", false),
+            ("/auto", "/auto", "Switch to Autonomous Mode (full multi-step execution)", false),
+            ("/supervised", "/supervised", "Switch to Supervised Mode (confirm destructive commands)", false),
+            ("/duel", "/duel", "Switch to Red Team vs. White Team Security Duel Mode", false),
+            ("/caveman", "/caveman", "Toggle Caveman Mode (ultra-concise token compression)", false),
+            ("/ponytail", "/ponytail", "Toggle Ponytail Mode (expressive pair-programming persona)", false),
+            ("/skills", "/skills", "Open the Skills Library (47 skills)", false),
+            ("/mcp", "/mcp", "Open & probe Model Context Protocol (MCP) servers", false),
+            ("/subagents", "/subagents", "Open the Autonomous Subagent Fleet", false),
+            ("/schedules", "/schedules", "Open the Background Schedules & Cron Manager", false),
+            ("/undo", "/undo", "Undo last turn and revert file modifications", false),
+        ]
+    }
+
+    pub fn dispatch_composer_input(&mut self, raw: String) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        // Direct shell execution via `!<cmd>`
+        if let Some(shell_cmd) = trimmed.strip_prefix('!') {
+            let cmd_clean = shell_cmd.trim().to_string();
+            if !cmd_clean.is_empty() {
+                self.show_terminal_drawer = true;
+                self.terminal_cmd_buf = cmd_clean.clone();
+                let ws_path = self.hm.active_workspace_path();
+                if let Ok(ws) = Workspace::new(&ws_path) {
+                    let te = unjess_core::ToolEngine::new(ws);
+                    let out = te
+                        .run_command(&cmd_clean, 60)
+                        .unwrap_or_else(|e| format!("Error: {}", e));
+                    self.terminal_output_buf
+                        .push_str(&format!("$ {}\n{}\n\n", cmd_clean, out.trim()));
+                }
+                self.status_toast = Some((
+                    format!("Executed `{}` in Terminal Drawer", cmd_clean),
+                    Instant::now(),
+                ));
+            }
+            return;
+        }
+
+        if !trimmed.starts_with('/') {
+            self.hm.submit_prompt(raw);
+            return;
+        }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("").to_lowercase();
+        let arg = parts.next().unwrap_or("").trim();
+
+        match cmd.as_str() {
+            "/" | "/help" => {
+                self.status_toast = Some((
+                    "Slash Palette active — type /timer, /watch, /run, /compact, /context, /plan, /duel, etc.".to_string(),
+                    Instant::now(),
+                ));
+            }
+            "/context" => {
+                let conv = self.hm.active_conversation();
+                let ws = self.hm.active_workspace_path();
+                self.status_toast = Some((
+                    format!(
+                        "Workspace: {} | Model: {} ({}) | Msgs: {} | Tokens: {} (${:.4})",
+                        ws.display(),
+                        self.settings_draft.model,
+                        self.settings_draft.provider,
+                        conv.messages.len(),
+                        conv.total_tokens,
+                        conv.total_cost_usd
+                    ),
+                    Instant::now(),
+                ));
+            }
+            "/compact" => {
+                self.hm.compact_active_conversation();
+                self.status_toast = Some((
+                    "Compacted active conversation context".to_string(),
+                    Instant::now(),
+                ));
+            }
+            "/clear" => {
+                self.hm.clear_active_conversation();
+                self.status_toast = Some((
+                    "Cleared conversation messages".to_string(),
+                    Instant::now(),
+                ));
+            }
+            "/new" => {
+                let title = if arg.is_empty() { None } else { Some(arg) };
+                self.hm.new_conversation(title);
+                self.status_toast = Some((
+                    "Started new conversation".to_string(),
+                    Instant::now(),
+                ));
+            }
+            "/plan" => {
+                self.hm.set_agent_mode("Plan");
+                self.status_toast = Some(("Switched to Plan Mode".to_string(), Instant::now()));
+                if !arg.is_empty() {
+                    self.hm.submit_prompt(arg.to_string());
+                }
+            }
+            "/auto" => {
+                self.hm.set_agent_mode("Autonomous");
+                self.status_toast =
+                    Some(("Switched to Autonomous Mode".to_string(), Instant::now()));
+                if !arg.is_empty() {
+                    self.hm.submit_prompt(arg.to_string());
+                }
+            }
+            "/supervised" => {
+                self.hm.set_agent_mode("Supervised");
+                self.status_toast =
+                    Some(("Switched to Supervised Mode".to_string(), Instant::now()));
+                if !arg.is_empty() {
+                    self.hm.submit_prompt(arg.to_string());
+                }
+            }
+            "/duel" => {
+                self.hm.set_agent_mode("Duel");
+                self.status_toast = Some((
+                    "Switched to Red Team vs. White Team Security Duel Mode".to_string(),
+                    Instant::now(),
+                ));
+                if !arg.is_empty() {
+                    self.hm.submit_prompt(arg.to_string());
+                }
+            }
+            "/caveman" => {
+                let next = !self.hm.caveman_mode();
+                self.hm.set_caveman_mode(next);
+                self.status_toast = Some((
+                    format!("Caveman Mode {}", if next { "ON" } else { "OFF" }),
+                    Instant::now(),
+                ));
+            }
+            "/ponytail" => {
+                let next = !self.hm.ponytail_mode();
+                self.hm.set_ponytail_mode(next);
+                self.status_toast = Some((
+                    format!("Ponytail Mode {}", if next { "ON" } else { "OFF" }),
+                    Instant::now(),
+                ));
+            }
+            "/run" => {
+                if arg.is_empty() {
+                    self.show_terminal_drawer = !self.show_terminal_drawer;
+                } else {
+                    self.dispatch_composer_input(format!("!{}", arg));
+                }
+            }
+            "/timer" => {
+                let mut tparts = arg.splitn(2, char::is_whitespace);
+                let sec_str = tparts.next().unwrap_or("10").trim_end_matches('s');
+                let secs = sec_str.parse::<u64>().unwrap_or(10).max(1);
+                let payload = tparts.next().unwrap_or("Check workspace status").trim();
+                let ws_str = self.hm.active_workspace_path().to_string_lossy().to_string();
+                let action = if payload.starts_with('!') {
+                    "command"
+                } else {
+                    "prompt"
+                };
+                let task = SchedulerManager::start_timer(
+                    secs,
+                    action,
+                    payload,
+                    &ws_str,
+                    Some(Arc::clone(&self.hm)),
+                );
+                self.status_toast = Some((
+                    format!("⏰ Started {}s timer ({}) -> {}", secs, task.id, payload),
+                    Instant::now(),
+                ));
+            }
+            "/watch" => {
+                let mut wparts = arg.splitn(2, "->");
+                let target = wparts.next().unwrap_or(".").trim();
+                let on_change = wparts.next().unwrap_or("").trim();
+                let ws_str = self.hm.active_workspace_path().to_string_lossy().to_string();
+                let task = SchedulerManager::start_watcher(
+                    if target.is_empty() { "." } else { target },
+                    4,
+                    on_change,
+                    &ws_str,
+                    Some(Arc::clone(&self.hm)),
+                );
+                self.status_toast = Some((
+                    format!("👁 Started live watcher ({}) on `{}`", task.id, task.label),
+                    Instant::now(),
+                ));
+            }
+            "/tasks" => {
+                let live = SchedulerManager::list_live_tasks();
+                let running = live.iter().filter(|t| t.status == "running").count();
+                self.status_toast = Some((
+                    format!(
+                        "{} running live timer/watcher(s) ({} total in session)",
+                        running,
+                        live.len()
+                    ),
+                    Instant::now(),
+                ));
+            }
+            "/stop-tasks" => {
+                let target = if arg.is_empty() { "all" } else { arg };
+                let n = SchedulerManager::cancel_live_task(target);
+                self.status_toast = Some((
+                    format!("Cancelled {} background task(s)", n),
+                    Instant::now(),
+                ));
+            }
+            "/skills" => {
+                self.active_tab = MainTab::Settings;
+                self.settings_subtab = SettingsSubTab::SkillsLibrary;
+            }
+            "/mcp" => {
+                self.active_tab = MainTab::Settings;
+                self.settings_subtab = SettingsSubTab::McpServers;
+            }
+            "/subagents" | "/agents" => {
+                self.active_tab = MainTab::Agents;
+            }
+            "/schedules" | "/schedule" => {
+                self.active_tab = MainTab::Schedules;
+            }
+            "/undo" => {
+                let cid = self.hm.active_conversation().id;
+                self.hm.undo_last_turn(&cid);
+                self.status_toast = Some(("Reverted last turn".to_string(), Instant::now()));
+            }
+            _ => {
+                self.hm.submit_prompt(raw);
+            }
+        }
     }
 
     /// Renders the Top Global Header Bar (`40px` height) matching `media_1794094798213_77679872.jpg` & `media_1794094817258_ea42a648.png`.
@@ -2400,6 +2652,225 @@ impl UnjessDesktopApp {
 
                 ui.add_space(6.0);
 
+                // Live Running Timers & Watchers Status Bar (if any active)
+                let live_bg = SchedulerManager::list_live_tasks();
+                let running_bg: Vec<_> = live_bg
+                    .iter()
+                    .filter(|t| t.status == "running")
+                    .cloned()
+                    .collect();
+                if !running_bg.is_empty() {
+                    ui.ctx().request_repaint_after(Duration::from_millis(500));
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(16, 185, 129, 14))
+                        .stroke(Stroke::new(
+                            1.0,
+                            Color32::from_rgba_unmultiplied(16, 185, 129, 75),
+                        ))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let (dr, _) =
+                                    ui.allocate_exact_size(egui::vec2(7.0, 7.0), Sense::hover());
+                                ui.painter()
+                                    .circle_filled(dr.center(), 3.5, theme::ACCENT_EMERALD);
+                                let summary: Vec<String> = running_bg
+                                    .iter()
+                                    .take(2)
+                                    .map(|t| {
+                                        if t.kind == "timer" {
+                                            format!("⏰ {} ({}s left)", t.id, t.remaining_secs)
+                                        } else {
+                                            format!(
+                                                "👁 {} ({}x, next poll {}s)",
+                                                t.label, t.trigger_count, t.remaining_secs
+                                            )
+                                        }
+                                    })
+                                    .collect();
+                                ui.label(
+                                    RichText::new(summary.join("   •   "))
+                                        .size(11.5)
+                                        .family(FontFamily::Monospace)
+                                        .color(theme::ACCENT_EMERALD),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if dark_action_btn(ui, Some(Icon::X), "Stop All", false)
+                                            .clicked()
+                                        {
+                                            let n = SchedulerManager::cancel_live_task("all");
+                                            self.status_toast = Some((
+                                                format!("Stopped {} background task(s)", n),
+                                                Instant::now(),
+                                            ));
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+
+                // Live Floating `/` Slash Command Palette (appears whenever prompt starts with `/`)
+                let trimmed_input = self.prompt_input.trim_start().to_string();
+                let show_slash_palette = trimmed_input.starts_with('/') && !trimmed_input.contains('\n');
+                let mut slash_executed = false;
+                if show_slash_palette {
+                    let cmd_token = trimmed_input
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("/")
+                        .to_lowercase();
+                    let all_cmds = Self::gui_slash_commands();
+                    let filtered: Vec<_> = all_cmds
+                        .into_iter()
+                        .filter(|(cmd, _, _, _)| {
+                            cmd_token == "/"
+                                || cmd.starts_with(&cmd_token)
+                                || cmd.contains(cmd_token.trim_start_matches('/'))
+                        })
+                        .collect();
+
+                    if !filtered.is_empty() {
+                        if self.slash_selected_idx >= filtered.len() {
+                            self.slash_selected_idx = 0;
+                        }
+                        let nav_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                        let nav_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                        let tab_pressed = ui.input(|i| i.key_pressed(egui::Key::Tab));
+                        if nav_down {
+                            self.slash_selected_idx = (self.slash_selected_idx + 1) % filtered.len();
+                        }
+                        if nav_up {
+                            self.slash_selected_idx = if self.slash_selected_idx == 0 {
+                                filtered.len() - 1
+                            } else {
+                                self.slash_selected_idx - 1
+                            };
+                        }
+                        if tab_pressed {
+                            let (sel_cmd, _, _, takes_args) = filtered[self.slash_selected_idx];
+                            self.prompt_input = if takes_args {
+                                format!("{} ", sel_cmd)
+                            } else {
+                                sel_cmd.to_string()
+                            };
+                        }
+
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(15, 15, 19))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(44, 46, 56)))
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("SLASH COMMANDS")
+                                            .size(10.5)
+                                            .strong()
+                                            .family(FontFamily::Monospace)
+                                            .color(theme::ACCENT_EMERALD),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(
+                                                    "↑↓ Navigate  •  Tab Complete  •  Enter Run  •  Click to Execute",
+                                                )
+                                                .size(10.5)
+                                                .color(theme::TEXT_DIM),
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.add_space(6.0);
+                                ScrollArea::vertical()
+                                    .id_salt("gui_slash_cmd_palette_scroll")
+                                    .max_height(210.0)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        for (idx, (cmd, usage, desc, takes_args)) in
+                                            filtered.iter().enumerate()
+                                        {
+                                            let is_sel = idx == self.slash_selected_idx;
+                                            let row_w = ui.available_width();
+                                            let (r_rect, r_resp) = ui.allocate_exact_size(
+                                                egui::vec2(row_w, 28.0),
+                                                Sense::click(),
+                                            );
+                                            if r_resp.hovered() {
+                                                ui.ctx().set_cursor_icon(
+                                                    egui::CursorIcon::PointingHand,
+                                                );
+                                                self.slash_selected_idx = idx;
+                                            }
+                                            if is_sel || r_resp.hovered() {
+                                                ui.painter().rect(
+                                                    r_rect,
+                                                    CornerRadius::same(6),
+                                                    Color32::from_rgb(26, 28, 36),
+                                                    Stroke::new(
+                                                        1.0,
+                                                        Color32::from_rgba_unmultiplied(
+                                                            16, 185, 129, 80,
+                                                        ),
+                                                    ),
+                                                    StrokeKind::Inside,
+                                                );
+                                            }
+                                            ui.painter().text(
+                                                egui::pos2(
+                                                    r_rect.left() + 10.0,
+                                                    r_rect.center().y,
+                                                ),
+                                                egui::Align2::LEFT_CENTER,
+                                                *usage,
+                                                FontId::new(12.0, FontFamily::Monospace),
+                                                if is_sel {
+                                                    theme::ACCENT_EMERALD
+                                                } else {
+                                                    theme::TEXT_WHITE
+                                                },
+                                            );
+                                            ui.painter().text(
+                                                egui::pos2(
+                                                    r_rect.left() + 235.0,
+                                                    r_rect.center().y,
+                                                ),
+                                                egui::Align2::LEFT_CENTER,
+                                                *desc,
+                                                FontId::new(11.5, FontFamily::Proportional),
+                                                theme::TEXT_SECONDARY,
+                                            );
+                                            if r_resp.clicked() {
+                                                if *takes_args
+                                                    && !trimmed_input.contains(' ')
+                                                {
+                                                    self.prompt_input = format!("{} ", cmd);
+                                                } else {
+                                                    let to_run = if *takes_args {
+                                                        trimmed_input.to_string()
+                                                    } else {
+                                                        cmd.to_string()
+                                                    };
+                                                    self.prompt_input.clear();
+                                                    self.dispatch_composer_input(to_run);
+                                                    slash_executed = true;
+                                                }
+                                            }
+                                        }
+                                    });
+                            });
+                        ui.add_space(6.0);
+                    }
+                }
+
                 // Row 2: Main Rounded Composer Input Box (`#111113` fill, `14px` corner radius)
                 egui::Frame::new()
                     .fill(theme::BG_CARD)
@@ -2410,10 +2881,10 @@ impl UnjessDesktopApp {
                         ui.set_width(ui.available_width());
                         let cur_mode = self.hm.agent_mode();
                         let placeholder = match cur_mode.as_str() {
-                            "Plan" => "Plan Mode: Describe feature or goal to inspect repo, generate plan, and clarify questions...",
-                            "Supervised" => "Supervised Mode: Describe task (destructive commands require approval)...",
-                            "Duel" => "Security Duel Mode: Red Team vs. White Team vulnerability audit & remediation...",
-                            _ => "Ask Unjess to architect, refactor, debug, or audit code... (Enter to send, Shift+Enter for newline)",
+                            "Plan" => "Plan Mode: Describe feature or goal (type / for commands, ! for shell)...",
+                            "Supervised" => "Supervised Mode: Describe task (type / for commands, ! for shell)...",
+                            "Duel" => "Security Duel Mode: Red Team vs. White Team audit (type / for commands)...",
+                            _ => "Ask Unjess to architect, refactor, or audit... (Type / for commands, !cmd for shell, Enter to send)",
                         };
 
                         let enter_to_send = ui.input(|i| {
@@ -2439,7 +2910,7 @@ impl UnjessDesktopApp {
                                                 .color(theme::TEXT_DIM),
                                         ),
                                 );
-                                if enter_to_send && text_resp.has_focus() {
+                                if enter_to_send && text_resp.has_focus() && !slash_executed {
                                     submitted_via_enter = true;
                                 }
                             });
@@ -2447,8 +2918,34 @@ impl UnjessDesktopApp {
                         if submitted_via_enter {
                             let clean = self.prompt_input.trim().to_string();
                             if !clean.is_empty() {
-                                self.prompt_input.clear();
-                                self.hm.submit_prompt(clean);
+                                // If the user typed a partial `/cmd` without spaces, resolve it to the highlighted slash command
+                                if clean.starts_with('/') && !clean.contains(' ') {
+                                    let cmd_token = clean.to_lowercase();
+                                    let matching: Vec<_> = Self::gui_slash_commands()
+                                        .into_iter()
+                                        .filter(|(c, _, _, _)| {
+                                            cmd_token == "/"
+                                                || c.starts_with(&cmd_token)
+                                                || c.contains(cmd_token.trim_start_matches('/'))
+                                        })
+                                        .collect();
+                                    if let Some(&(sel_cmd, _, _, takes_args)) =
+                                        matching.get(self.slash_selected_idx).or_else(|| matching.first())
+                                    {
+                                        if takes_args && clean != sel_cmd {
+                                            self.prompt_input = format!("{} ", sel_cmd);
+                                        } else {
+                                            self.prompt_input.clear();
+                                            self.dispatch_composer_input(sel_cmd.to_string());
+                                        }
+                                    } else {
+                                        self.prompt_input.clear();
+                                        self.dispatch_composer_input(clean);
+                                    }
+                                } else {
+                                    self.prompt_input.clear();
+                                    self.dispatch_composer_input(clean);
+                                }
                             }
                         }
 
@@ -2539,7 +3036,7 @@ impl UnjessDesktopApp {
                                             let clean = self.prompt_input.trim().to_string();
                                             if !clean.is_empty() {
                                                 self.prompt_input.clear();
-                                                self.hm.submit_prompt(clean);
+                                                self.dispatch_composer_input(clean);
                                             }
                                         }
                                     }
@@ -2742,6 +3239,12 @@ impl eframe::App for UnjessDesktopApp {
 
         // Floating Modals & Terminal Drawer
         self.render_modals(ctx);
+
+        // Drain live timer/watcher notifications into the floating toast banner
+        let bg_notes = SchedulerManager::drain_notifications();
+        if let Some(last_note) = bg_notes.last() {
+            self.status_toast = Some((last_note.clone(), Instant::now()));
+        }
 
         // Floating Status Toast Notification (bottom-right)
         if let Some((msg, ts)) = self.status_toast.clone() {

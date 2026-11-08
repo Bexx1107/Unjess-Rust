@@ -2232,6 +2232,83 @@ impl ToolEngine {
                     None,
                 )
             }
+            "schedule_timer" => {
+                let secs = args
+                    .get("seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10)
+                    .max(1);
+                let action = get_str("action");
+                let payload = get_str("prompt_or_command");
+                if payload.trim().is_empty() {
+                    return (
+                        "schedule_timer requires a non-empty 'prompt_or_command'".to_string(),
+                        false,
+                        None,
+                    );
+                }
+                let ws_str = self.workspace.root().to_string_lossy().to_string();
+                let task = crate::scheduler::SchedulerManager::start_timer(
+                    secs,
+                    if action.is_empty() { "command" } else { &action },
+                    &payload,
+                    &ws_str,
+                    None,
+                );
+                (
+                    serde_json::to_string_pretty(&task).unwrap_or_default(),
+                    true,
+                    None,
+                )
+            }
+            "start_watcher" => {
+                let target = get_str("watch_target");
+                let interval = args
+                    .get("interval_seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5)
+                    .max(2);
+                let on_change = get_str("on_change_command");
+                let ws_str = self.workspace.root().to_string_lossy().to_string();
+                let task = crate::scheduler::SchedulerManager::start_watcher(
+                    if target.is_empty() { "." } else { &target },
+                    interval,
+                    &on_change,
+                    &ws_str,
+                    None,
+                );
+                (
+                    serde_json::to_string_pretty(&task).unwrap_or_default(),
+                    true,
+                    None,
+                )
+            }
+            "manage_background_tasks" => {
+                let action = get_str("action");
+                let task_id = get_str("task_id");
+                if action.eq_ignore_ascii_case("cancel") || action.eq_ignore_ascii_case("kill") {
+                    let cancelled = crate::scheduler::SchedulerManager::cancel_live_task(
+                        if task_id.is_empty() { "all" } else { &task_id },
+                    );
+                    (
+                        format!("Cancelled {} background task(s).", cancelled),
+                        true,
+                        None,
+                    )
+                } else {
+                    let live = crate::scheduler::SchedulerManager::list_live_tasks();
+                    let cron = crate::scheduler::SchedulerManager::load();
+                    let payload = serde_json::json!({
+                        "live_timers_and_watchers": live,
+                        "cron_schedules": cron
+                    });
+                    (
+                        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                        true,
+                        None,
+                    )
+                }
+            }
             "call_mcp_tool" => {
                 let server_name = get_str("server");
                 let tool_name = get_str("tool");
@@ -2651,6 +2728,53 @@ impl ToolEngine {
                     "parameters": {
                         "type": "object",
                         "properties": {}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "schedule_timer",
+                    "description": "Schedule a background countdown timer (seconds) that runs a command or task when the timer expires.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "seconds": { "type": "integer", "description": "Duration in seconds before the timer fires" },
+                            "action": { "type": "string", "description": "'command' (run shell command) or 'prompt'" },
+                            "prompt_or_command": { "type": "string", "description": "Shell command (prefix with !) or task to run when timer fires" }
+                        },
+                        "required": ["seconds", "prompt_or_command"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "start_watcher",
+                    "description": "Start a live background file or command watcher that monitors workspace changes at a recurring interval.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "watch_target": { "type": "string", "description": "Relative path/glob to watch (e.g. 'src', '.rs') or 'cmd:<command>' to watch command output" },
+                            "interval_seconds": { "type": "integer", "description": "Polling interval in seconds (default 5)" },
+                            "on_change_command": { "type": "string", "description": "Optional command (prefix with !) to execute automatically when a change is detected" }
+                        },
+                        "required": ["watch_target"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "manage_background_tasks",
+                    "description": "List or cancel active background timers, file/command watchers, and cron schedules.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "description": "'list' or 'cancel'" },
+                            "task_id": { "type": "string", "description": "Task ID to cancel (or 'all')" }
+                        },
+                        "required": ["action"]
                     }
                 }
             },
