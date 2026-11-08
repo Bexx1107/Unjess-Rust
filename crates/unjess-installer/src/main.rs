@@ -115,20 +115,29 @@ fn main() {
             exe_dir.join("dist").join(bin_name),
             PathBuf::from("dist").join(bin_name),
             PathBuf::from("target").join("release").join(bin_name),
-            PathBuf::from(bin_name),
         ];
         let dst = target_dir.join(bin_name);
-        if let Some(src) = candidates.iter().find(|p| p.exists()) {
-            if src != &dst {
-                match fs::copy(src, &dst) {
-                    Ok(_) => {
-                        installed_count += 1;
-                        println!("[+] Installed {} -> {}", bin_name, dst.display());
+
+        let mut found_src = None;
+        for c in candidates {
+            if c.exists() {
+                if let (Ok(can_c), Ok(can_d)) = (c.canonicalize(), dst.canonicalize()) {
+                    if can_c == can_d {
+                        continue;
                     }
-                    Err(e) => eprintln!("[!] Could not copy {}: {}", bin_name, e),
                 }
-            } else {
-                installed_count += 1;
+                found_src = Some(c);
+                break;
+            }
+        }
+
+        if let Some(src) = found_src {
+            match fs::copy(&src, &dst) {
+                Ok(_) => {
+                    installed_count += 1;
+                    println!("[+] Installed {} -> {}", bin_name, dst.display());
+                }
+                Err(e) => eprintln!("[!] Could not copy {}: {}", bin_name, e),
             }
         } else {
             // Attempt to download directly from GitHub raw dist if not found locally
@@ -163,10 +172,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Install CLI alias `bin\unjess.exe` and `unjess.exe` so `unjess` in cmd.exe / PowerShell launches the Rust CLI
+    // Install CLI alias `bin\unjess.exe` so `unjess` in cmd.exe / PowerShell launches the Rust CLI
     let cli_bin = target_dir.join("unjess-cli.exe");
     if cli_bin.exists() {
-        let _ = fs::copy(&cli_bin, target_dir.join("unjess.exe"));
         let bin_subdir = target_dir.join("bin");
         if fs::create_dir_all(&bin_subdir).is_ok() {
             let alias_dst = bin_subdir.join("unjess.exe");
@@ -190,7 +198,6 @@ fn main() {
                         let _ = fs::copy(&src, legacy_root.join(name));
                     }
                 }
-                let _ = fs::copy(&cli_bin, legacy_root.join("unjess.exe"));
                 let legacy_bin_dir = legacy_root.join("bin");
                 if legacy_bin_dir.exists() {
                     let legacy_cli = legacy_bin_dir.join("unjess.exe");
@@ -263,18 +270,9 @@ fn main() {
 
     if !env::args().any(|a| a == "--no-launch") {
         println!("[+] Spawning Unjess GUI...");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            let _ = Command::new(&desktop_exe)
-                .current_dir(&target_dir)
-                .creation_flags(0x00000008) // DETACHED_PROCESS
-                .spawn();
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = Command::new(&desktop_exe).spawn();
-        }
+        let _ = Command::new(&desktop_exe)
+            .current_dir(&target_dir)
+            .spawn();
         std::thread::sleep(std::time::Duration::from_millis(800));
     }
 }

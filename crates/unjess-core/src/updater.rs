@@ -339,6 +339,7 @@ pub fn download_and_launch_installer_blocking(
     {
         use std::os::windows::process::CommandExt;
         std::process::Command::new(&temp_installer)
+            .current_dir(std::env::temp_dir())
             .creation_flags(0x00000008) // DETACHED_PROCESS
             .spawn()
             .map_err(|e| format!("Failed to spawn installer: {}", e))?;
