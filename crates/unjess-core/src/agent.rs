@@ -2893,7 +2893,7 @@ impl HarnessManager {
         let mut tool_engine =
             ToolEngine::new(workspace).with_abort_flag(Arc::clone(&self.abort_flag));
 
-        let max_iters = settings.max_iterations.clamp(1, 600);
+        let max_iters = settings.max_iterations.clamp(1, 2000);
         let enable_tools = self.agent_mode() != "Plan";
 
         let active_conv = self.conversation_by_id(conv_id);
@@ -3635,6 +3635,21 @@ impl HarnessManager {
                         output_tokens: 0,
                         cost_usd: 0.0,
                     });
+
+                    // Pre-expiration autonomous budget warning protocol:
+                    // When remaining steps are <= 30, alert the agent to cease endless exploration and finalize/verify output.
+                    let steps_remaining = max_iters.saturating_sub(iter);
+                    if is_autonomous && steps_remaining <= 30 && steps_remaining > 0 {
+                        let warning_msg = format!(
+                            "\n\n<budget_warning>\n[Autonomous Budget Notice: {} step(s) remaining out of {}]\nYou are approaching the execution step limit. Stop exploratory diagnostics, sub-searches, and grid-scans now. Implement your final solution, execute it to write and verify all required final output files, run tests, and emit `<!-- GOAL_COMPLETE -->`.\n</budget_warning>",
+                            steps_remaining, max_iters
+                        );
+                        if let Some(last_msg) = working_history.last_mut() {
+                            if last_msg.role == "tool" {
+                                last_msg.content.push_str(&warning_msg);
+                            }
+                        }
+                    }
 
                     if iter >= max_iters {
                         break;

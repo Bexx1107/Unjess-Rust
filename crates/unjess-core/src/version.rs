@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.0.3";
+pub const CURRENT_VERSION: &str = "4.0.4";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,20 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.0.4".to_string(),
+            date: "2026-11-08".to_string(),
+            title: "Unjess 4.0.4 — Autonomous Step Budget Warning & 2000-Step Limit".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Raised autonomous execution step ceiling from 600 to 2000 steps with customizable CLI --max-steps flag.".to_string(),
+                "Added Pre-Expiration Autonomous Budget Notice (<budget_warning>) when remaining steps <= 30 to force final solution export and validation.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.0.3".to_string(),
             date: "2026-11-08".to_string(),
             title: "Unjess 4.0.3 — Clipboard Image Paste & Resizable GUI Sidepanels".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Added direct clipboard image paste (Ctrl+V) from OS snipping tools into composer with PNG attachment chips.".to_string(),
                 "Added draggable resizable sidepanels for chat session sidebar and diff inspector.".to_string(),
@@ -106,9 +116,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.0.3");
+        assert_eq!(CURRENT_VERSION, "4.0.4");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.0.3");
+        assert_eq!(log[0].version, "4.0.4");
     }
 }

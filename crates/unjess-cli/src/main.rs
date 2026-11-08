@@ -123,7 +123,7 @@ struct CliArgs {
     #[arg(short = 'y', long = "yes", global = true)]
     yes: bool,
 
-    /// Override maximum autonomous loop iterations (default 300, max 600)
+    /// Override maximum autonomous loop iterations (default 300, max 2000)
     #[arg(long = "max-steps", alias = "max-iterations", global = true)]
     max_steps: Option<usize>,
 

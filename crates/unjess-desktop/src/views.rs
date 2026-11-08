@@ -2389,7 +2389,7 @@ impl UnjessDesktopApp {
                     );
                     ui.add(
                         egui::DragValue::new(&mut self.settings_draft.max_iterations)
-                            .range(1..=500),
+                            .range(1..=2000),
                     );
                 });
                 ui.add_space(10.0);
@@ -2402,7 +2402,7 @@ impl UnjessDesktopApp {
                     );
                     ui.add(
                         egui::DragValue::new(&mut self.settings_draft.subagent_max_turns)
-                            .range(1..=500),
+                            .range(1..=2000),
                     );
                 });
                 ui.add_space(10.0);
