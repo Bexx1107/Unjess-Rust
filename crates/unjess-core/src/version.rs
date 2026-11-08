@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.0.1";
+pub const CURRENT_VERSION: &str = "4.0.2";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,20 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.0.2".to_string(),
+            date: "2026-11-08".to_string(),
+            title: "Unjess 4.0.2 — SOTA Loop Interception & Non-Destructive Circuit Breaker".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Replaced destructive hard circuit breaker with non-destructive in-loop interception warnings aligned with SWE-agent and OpenHands.".to_string(),
+                "Consecutive window repetition tracking preventing false-positive aborts on distributed read-only inspection commands.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.0.1".to_string(),
             date: "2026-11-08".to_string(),
             title: "Unjess 4.0.1 — Deep Reasoning Max Steps & GUI Polish".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Extended autonomous agent loop max steps up to 600 with new --max-steps CLI flag.".to_string(),
                 "Fixed header text layout overlap under action buttons in Updates & Changelog GUI tab.".to_string(),
@@ -85,9 +95,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.0.1");
+        assert_eq!(CURRENT_VERSION, "4.0.2");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.0.1");
+        assert_eq!(log[0].version, "4.0.2");
     }
 }

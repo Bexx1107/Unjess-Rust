@@ -1298,7 +1298,7 @@ impl HarnessManager {
             ))
         } else if repeat_count >= 8 {
             Some(format!(
-                "<mentor_analysis>\nCRITICAL CIRCUIT BREAKER (Level 3): `{}` was invoked {} times identically. Loop terminated. Summarize your current findings and stop.\n</mentor_analysis>",
+                "<mentor_analysis>\nCRITICAL CIRCUIT BREAKER (Level 3): `{}` was invoked {} times identically. Repetitive action intercepted and rejected to break loop. Change your strategy immediately or proceed with verification.\n</mentor_analysis>",
                 tool_name, repeat_count
             ))
         } else {
@@ -2922,8 +2922,6 @@ impl HarnessManager {
         let mut total_turn_out_tokens = 0usize;
         let mut total_turn_cost = 0.0f64;
         let mut recent_tool_signatures: Vec<String> = Vec::new();
-        let mut tool_call_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
         let mut transitional_nudges = 0usize;
         let mut pre_exit_test_check_count = 0usize;
         let mut pre_exit_unverified_edit_count = 0usize;
@@ -3301,23 +3299,22 @@ impl HarnessManager {
                     transitional_nudges = 0;
                     let mut tool_results_summary = Vec::new();
                     let mut step_tools: Vec<ToolCallRecord> = Vec::new();
-                    let mut hard_circuit_break = false;
 
                     for (tc_id, tc_name, tc_args) in resp.pending_tool_calls {
                         if self.abort_flag.load(Ordering::SeqCst) {
                             break;
                         }
 
-                        // Bookkeeping-transparent canonical stuck-loop detection with escalating [3, 5, 8] <mentor_analysis>
+                        // Bookkeeping-transparent canonical stuck-loop detection with consecutive repetition tracking
                         let mut mentor_reminder: Option<String> = None;
                         if !Self::is_transparent_bookkeeping_tool(&tc_name) {
                             let canonical_sig = Self::canonicalize_tool_call_key(&tc_name, &tc_args);
+                            let consecutive_repeats = recent_tool_signatures
+                                .iter()
+                                .rev()
+                                .take_while(|sig| *sig == &canonical_sig)
+                                .count() + 1;
                             recent_tool_signatures.push(canonical_sig.clone());
-                            let count = tool_call_counts
-                                .entry(canonical_sig.clone())
-                                .and_modify(|c| *c += 1)
-                                .or_insert(1);
-                            let repeat_count = *count;
 
                             let sig_len = recent_tool_signatures.len();
                             let ping_pong = sig_len >= 6
@@ -3330,27 +3327,36 @@ impl HarnessManager {
                                 && recent_tool_signatures[sig_len - 4]
                                     == recent_tool_signatures[sig_len - 6];
 
-                            if repeat_count >= 8 {
-                                if let Some(msg) = Self::format_repeat_tool_reminder(&tc_name, repeat_count) {
-                                    tool_results_summary.push(msg.clone());
-                                    step_tools.push(ToolCallRecord {
-                                        id: tc_id,
-                                        name: tc_name,
-                                        arguments: tc_args,
-                                        result: msg,
-                                        status: "error".to_string(),
-                                        duration_ms: 0,
-                                    });
-                                }
-                                hard_circuit_break = true;
-                                break;
-                            } else if let Some(msg) = Self::format_repeat_tool_reminder(&tc_name, repeat_count) {
-                                mentor_reminder = Some(msg);
+                            if consecutive_repeats >= 4 {
+                                let msg = Self::format_repeat_tool_reminder(&tc_name, consecutive_repeats)
+                                    .unwrap_or_else(|| format!("[Loop Interception Rejected]: `{}` called {} times consecutively. Action rejected. Pivot to another approach.", tc_name, consecutive_repeats));
+                                tool_results_summary.push(msg.clone());
+                                step_tools.push(ToolCallRecord {
+                                    id: tc_id,
+                                    name: tc_name,
+                                    arguments: tc_args,
+                                    result: msg,
+                                    status: "error".to_string(),
+                                    duration_ms: 0,
+                                });
+                                continue;
                             } else if ping_pong {
-                                mentor_reminder = Some(format!(
-                                    "<mentor_analysis>\nAlternating ping-pong tool cycle detected involving `{}`. Break out of this cycle and try a different approach.\n</mentor_analysis>",
+                                let msg = format!(
+                                    "<mentor_analysis>\nAlternating ping-pong tool cycle detected involving `{}`. Action rejected. Break out of this cycle and adopt an alternative strategy to solve the problem.\n</mentor_analysis>",
                                     tc_name
-                                ));
+                                );
+                                tool_results_summary.push(msg.clone());
+                                step_tools.push(ToolCallRecord {
+                                    id: tc_id,
+                                    name: tc_name,
+                                    arguments: tc_args,
+                                    result: msg,
+                                    status: "error".to_string(),
+                                    duration_ms: 0,
+                                });
+                                continue;
+                            } else if let Some(msg) = Self::format_repeat_tool_reminder(&tc_name, consecutive_repeats) {
+                                mentor_reminder = Some(msg);
                             }
                         }
 
@@ -3627,7 +3633,7 @@ impl HarnessManager {
                         cost_usd: 0.0,
                     });
 
-                    if hard_circuit_break || iter >= max_iters {
+                    if iter >= max_iters {
                         break;
                     }
                 }
