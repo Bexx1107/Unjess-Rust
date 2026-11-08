@@ -1,5 +1,5 @@
 {
-    "version":  "4.0.1",
+    "version":  "4.0.2",
     "edition":  "native-rust",
     "architecture":  "windows-x86_64",
     "port":  9758,
