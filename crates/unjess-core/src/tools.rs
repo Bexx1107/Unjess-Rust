@@ -2183,7 +2183,7 @@ impl ToolEngine {
                 .spawn()?
         };
 
-        let child_pid = child.id();
+        let _child_pid = child.id();
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
 
@@ -4865,20 +4865,31 @@ mod tests {
         fs::create_dir_all(ws.root().join("nested_dir")).unwrap();
 
         // 1. Test `&&` operator + persistent `cd` across `run_command` calls
-        let out1 = engine
-            .run_command("cd nested_dir && Write-Output 'inside_nested'", 30)
-            .unwrap();
-        assert!(out1.contains("inside_nested"));
+        #[cfg(target_os = "windows")]
+        let (cmd1, cmd2, cmd3, expected1, expected2) = (
+            "cd nested_dir && Write-Output 'inside_nested'",
+            "$env:UNJESS_TEST_STATE = 'persisted_ok'",
+            "Write-Output $env:UNJESS_TEST_STATE",
+            "inside_nested",
+            "persisted_ok",
+        );
+        #[cfg(not(target_os = "windows"))]
+        let (cmd1, cmd2, cmd3, expected1, expected2) = (
+            "cd nested_dir && echo 'inside_nested'",
+            "export UNJESS_TEST_STATE='persisted_ok'",
+            "echo $UNJESS_TEST_STATE",
+            "inside_nested",
+            "persisted_ok",
+        );
+
+        let out1 = engine.run_command(cmd1, 30).unwrap();
+        assert!(out1.contains(expected1));
         assert!(engine.session_cwd().ends_with("nested_dir"));
 
         // 2. Next command runs inside `nested_dir` and sets a persistent env var
-        let _ = engine
-            .run_command("$env:UNJESS_TEST_STATE = 'persisted_ok'", 30)
-            .unwrap();
-        let out2 = engine
-            .run_command("Write-Output $env:UNJESS_TEST_STATE", 30)
-            .unwrap();
-        assert!(out2.contains("persisted_ok"));
+        let _ = engine.run_command(cmd2, 30).unwrap();
+        let out2 = engine.run_command(cmd3, 30).unwrap();
+        assert!(out2.contains(expected2));
     }
 
     #[test]

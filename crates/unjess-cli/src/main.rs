@@ -92,7 +92,7 @@ fn enable_windows_ansi_and_utf8() {}
 )]
 struct CliArgs {
     /// Optional single-shot prompt to execute immediately
-    #[arg(value_name = "PROMPT")]
+    #[arg(value_name = "PROMPT", long = "prompt")]
     prompt: Option<String>,
 
     /// Read prompt or additional context from one or more files (repeatable `-f`)
@@ -118,6 +118,10 @@ struct CliArgs {
     /// Override agent mode (auto, plan, supervised, duel)
     #[arg(long, global = true)]
     mode: Option<String>,
+
+    /// Auto-confirm all prompts and actions without prompting (drop-in compatibility)
+    #[arg(short = 'y', long = "yes", global = true)]
+    yes: bool,
 
     /// Enable ultra-dense Caveman persona mode
     #[arg(long, global = true)]
@@ -208,13 +212,16 @@ async fn main() {
     let args = CliArgs::parse();
     let hm = Arc::new(HarnessManager::new());
 
-    if let Some(ws) = &args.workspace {
-        let id = hm.add_workspace(ws);
-        hm.set_active_workspace(&id);
-    }
+    let target_ws = args.workspace.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
+    let id = hm.add_workspace(&target_ws);
+    hm.set_active_workspace(&id);
 
     // Apply CLI flag overrides in-memory without mutating persistent config.yaml on disk
-    if args.model.is_some() || args.provider.is_some() || args.effort.is_some() {
+    if args.model.is_some() || args.provider.is_some() || args.effort.is_some() || args.yes {
         let mut s = hm.settings();
         if let Some(m) = &args.model {
             s.model = m.clone();
@@ -224,6 +231,9 @@ async fn main() {
         }
         if let Some(eff) = &args.effort {
             s.reasoning_effort = eff.clone();
+        }
+        if args.yes {
+            s.confirm_commands = false;
         }
         hm.update_settings_in_memory(s);
     }

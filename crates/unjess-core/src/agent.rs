@@ -1304,17 +1304,45 @@ impl HarnessManager {
             "let's run",
             "let me search",
             "let's search",
+            "let me examine",
+            "let's examine",
+            "let me verify",
+            "let's verify",
+            "let me explore",
+            "let's explore",
             "i will now",
             "i'll now",
             "now i will",
             "now i'll",
+            "i'll start by",
+            "i will start by",
+            "i'll begin by",
+            "i will begin by",
+            "i'll first",
+            "i will first",
             "first, let's",
             "first, i'll",
             "first, i will",
+            "first i'll",
+            "first i will",
             "next, i'll",
             "next, i will",
-            "let me examine",
-            "let me verify",
+            "next i'll",
+            "next i will",
+            "i'm going to",
+            "i am going to",
+            "i plan to",
+            "to start, i'll",
+            "to start, i will",
+            "to begin, i'll",
+            "to begin, i will",
+            "i need to check",
+            "i need to inspect",
+            "i need to examine",
+            "i need to read",
+            "i need to run",
+            "i will investigate",
+            "i'll investigate",
         ];
         phrases.iter().any(|p| lower.contains(p))
     }
@@ -2891,11 +2919,17 @@ impl HarnessManager {
                     }
 
                     if resp.pending_tool_calls.is_empty() {
-                        // 1. Transitional narration auto-continuation (up to 2 nudges)
+                        // 1. Transitional narration auto-continuation (up to 5 nudges per phase)
                         if enable_tools
-                            && transitional_nudges < 2
+                            && transitional_nudges < 5
                             && iter < max_iters
-                            && Self::is_transitional_narration(&resp.content)
+                            && (Self::is_transitional_narration(&resp.content)
+                                || (!resp.content.contains("<!-- GOAL_COMPLETE -->")
+                                    && resp.content.len() < 600
+                                    && (resp.content.to_lowercase().contains("start by")
+                                        || resp.content.to_lowercase().contains("proceed to")
+                                        || resp.content.to_lowercase().contains("next step")
+                                        || resp.content.to_lowercase().contains("continue by"))))
                         {
                             transitional_nudges += 1;
                             working_history.push(ChatMessage {
@@ -2978,6 +3012,7 @@ impl HarnessManager {
                     }
 
                     // Execute requested tool calls
+                    transitional_nudges = 0;
                     let mut tool_results_summary = Vec::new();
                     let mut step_tools: Vec<ToolCallRecord> = Vec::new();
                     let mut hard_circuit_break = false;
@@ -3408,7 +3443,8 @@ impl HarnessManager {
             }
             _ => {
                 prompt.push_str(
-                    "MODE DIRECTIVE (AUTONOMOUS): Use tools proactively to inspect, implement, test, and verify changes end-to-end.\n",
+                    "MODE DIRECTIVE (AUTONOMOUS): Use tools proactively to inspect, implement, test, and verify changes end-to-end.\n\
+                     AUTONOMOUS ACTION & TASK CONTINUITY INVARIANT: NEVER output transitional narration or announce what you intend to do next without invoking the tool in the same turn. Before ending your turn, check your last paragraph: if it is a plan, a question, or a promise about work you have not done yet, execute that work immediately with tool calls. Finish the whole requested scope before producing your final answer.\n",
                 );
             }
         }
@@ -3754,6 +3790,12 @@ mod tests {
         // 4. Transitional narration & text tool call extraction
         assert!(HarnessManager::is_transitional_narration(
             "Let me inspect the configuration file first:"
+        ));
+        assert!(HarnessManager::is_transitional_narration(
+            "I'll start by examining the development sample to understand the cipher."
+        ));
+        assert!(HarnessManager::is_transitional_narration(
+            "I'll start by exploring the workspace structure and understanding what I'm working with."
         ));
         assert!(!HarnessManager::is_transitional_narration(
             "All tests pass and the build is complete."
