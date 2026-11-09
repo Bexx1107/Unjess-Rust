@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.1.2";
+pub const CURRENT_VERSION: &str = "4.1.3";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,21 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.1.3".to_string(),
+            date: "2026-11-09".to_string(),
+            title: "Unjess 4.1.3 — Autonomous Continuation Directive & Anti-Stall Guard".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Eliminated mid-run stalls caused by intermediate LLM observations: expanded `is_transitional_narration` to recognize bug diagnoses, ongoing code additions, and progress notes (e.g. 'Found the real bug', 'Also adding...').".to_string(),
+                "Added Autonomous Continuation Directive: in Auto mode, if an agent provides observational text without tool calls and without declaring completion (`<!-- GOAL_COMPLETE -->`) or asking a user question, the engine automatically commands it to execute rather than prematurely stopping.".to_string(),
+                "Dynamic Guard Resets: `pre_exit_unverified_edit_count` and `pre_exit_test_check_count` now reset dynamically upon running verification commands, keeping edit and verification guards active through long runs (200+ steps).".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.1.2".to_string(),
             date: "2026-11-09".to_string(),
             title: "Unjess 4.1.2 — Multi-Conversation Concurrency, Per-Chat Abort & Context Compaction Overflow Fix".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "True concurrent multi-conversation and multi-project background execution: chats run independently in the background without halting when switching tabs, workspaces, or starting other sessions.".to_string(),
                 "Per-conversation abort isolation: clicking Stop only halts the active conversation while other background agent loops continue unimpeded.".to_string(),
@@ -212,9 +223,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.1.2");
+        assert_eq!(CURRENT_VERSION, "4.1.3");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.1.2");
+        assert_eq!(log[0].version, "4.1.3");
     }
 }

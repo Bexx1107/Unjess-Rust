@@ -1559,6 +1559,29 @@ impl HarnessManager {
             "i should verify",
             "i should test",
             "i should run",
+            "found the bug",
+            "found the real bug",
+            "found a bug",
+            "found the issue",
+            "found an issue",
+            "also adding",
+            "adding a ",
+            "adding the ",
+            "updating ",
+            "fixing ",
+            "applying ",
+            "modifying ",
+            "the bug is",
+            "the issue is",
+            "the problem is",
+            "penalty so",
+            "now fixing",
+            "now adding",
+            "now updating",
+            "now applying",
+            "now implementing",
+            "next step",
+            "in progress",
         ];
         phrases.iter().any(|p| lower.contains(p))
     }
@@ -3362,20 +3385,26 @@ impl HarnessManager {
                         let is_transitional = Self::is_transitional_narration(&resp.content);
 
                         // Autonomous Continuation Guard:
-                        // Only nudge if the model produced an empty turn or genuine transitional narration without invoking tools.
-                        // Substantive conversational replies, direct answers to questions, or final summaries are accepted without nagging.
+                        // Only nudge if the model produced an empty turn, transitional narration, or intermediate commentary
+                        // without invoking tools. Substantive conversational replies, direct answers to questions, or final summaries are accepted without nagging.
+                        let is_intermediate_autonomous_stall = is_autonomous && !collected_tools.is_empty();
                         if enable_tools
                             && iter < max_iters
                             && !is_user_question
                             && !is_explicit_completion
-                            && (is_empty_turn || is_transitional)
+                            && (is_empty_turn || is_transitional || is_intermediate_autonomous_stall)
                         {
                             if transitional_nudges < 5 {
                                 transitional_nudges += 1;
                                 let nudge_msg = if is_empty_turn {
                                     "[System Guidance]: You completed your reasoning but did not invoke any tools or output a final answer. Please invoke the appropriate tool to proceed with the task or provide your final response.".to_string()
-                                } else {
+                                } else if is_transitional {
                                     "[System Guidance]: You described a pending action without invoking a tool. In autonomous mode, call the relevant tool immediately to advance the task, or output your final verified response if finished.".to_string()
+                                } else {
+                                    format!(
+                                        "[Autonomous Continuation Directive]: You provided an intermediate observation ('{}') without invoking tools or declaring task completion. In Autonomous mode, execute the required action directly (e.g. `edit_file`, `write_file`, `run_command`), verify the result, or emit '<!-- GOAL_COMPLETE -->' if all goals are fully achieved.",
+                                        Self::clean_sentinel_tags(&resp.content).lines().next().unwrap_or("...").chars().take(120).collect::<String>()
+                                    )
                                 };
                                 working_history.push(ChatMessage {
                                     role: "assistant".to_string(),
@@ -3901,6 +3930,17 @@ impl HarnessManager {
                             tool_engine.execute_tool(&tc_name, &tc_args)
                         };
                         let duration_ms = started.elapsed().as_millis() as u64;
+                        if tc_name == "run_command" {
+                            pre_exit_unverified_edit_count = 0;
+                            if is_ok
+                                && !result_str.contains("FAILED")
+                                && !result_str.contains("FAIL:")
+                                && !result_str.contains("AssertionError")
+                                && !result_str.contains("[FAIL]")
+                            {
+                                pre_exit_test_check_count = 0;
+                            }
+                        }
                         let mut clipped_result = ToolEngine::truncate_head_tail(&result_str, 12000);
                         if let Some(rem) = mentor_reminder {
                             clipped_result.push_str("\n\n");
@@ -4512,6 +4552,9 @@ mod tests {
         ));
         assert!(HarnessManager::is_transitional_narration(
             "I'll start by exploring the workspace structure and understanding what I'm working with."
+        ));
+        assert!(HarnessManager::is_transitional_narration(
+            "Found the real bug: several offsets overlapped the hole itself (bin 3's dx=-8 sampled the bin). Also adding a vertical-edge penalty so piers and reveals aren't copied."
         ));
         assert!(!HarnessManager::is_transitional_narration(
             "All tests pass and the build is complete."
