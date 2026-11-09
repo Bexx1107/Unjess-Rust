@@ -2997,6 +2997,7 @@ impl HarnessManager {
         let mut pre_exit_unverified_edit_count = 0usize;
         let mut scratch_cleanup_nudged = false;
         let mut consecutive_probe_scripts = 0usize;
+        let mut consecutive_read_tools = 0usize;
         let mut system_prompt = self.build_system_prompt_for_query(&ws_path, &latest_user_query);
         let mut system_prompt_dirty = false;
 
@@ -3120,6 +3121,79 @@ impl HarnessManager {
                         let is_user_question = resp.content.trim().ends_with('?')
                             || lower_resp.contains("could you clarify")
                             || lower_resp.contains("please provide");
+
+                        let is_action_request = {
+                            let lower_q = latest_user_query.to_lowercase();
+                            lower_q.contains("generate")
+                                || lower_q.contains("generiraj")
+                                || lower_q.contains("create")
+                                || lower_q.contains("naredi")
+                                || lower_q.contains("fix")
+                                || lower_q.contains("popravi")
+                                || lower_q.contains("implement")
+                                || lower_q.contains("build")
+                                || lower_q.contains("run")
+                                || lower_q.contains("execute")
+                                || lower_q.contains("write")
+                                || lower_q.contains("zapolni")
+                        };
+                        let has_performed_action = collected_tools.iter().any(|tc| {
+                            matches!(
+                                tc.name.as_str(),
+                                "run_command"
+                                    | "write_file"
+                                    | "edit_file"
+                                    | "multi_edit_file"
+                                    | "delete_file"
+                                    | "apply_patch"
+                            )
+                        });
+
+                        // Autonomous Action Directive:
+                        // If the user requested an action, but the model took NO action and asked a question or stalled,
+                        // force it to execute instead of prematurely exiting the loop!
+                        if enable_tools
+                            && iter < max_iters
+                            && is_action_request
+                            && !has_performed_action
+                            && is_user_question
+                            && transitional_nudges < 3
+                        {
+                            transitional_nudges += 1;
+                            let nudge_msg = format!(
+                                "[Autonomous Action Directive]: The user gave an explicit action command ('{}'). Do not ask for confirmation, present menus of options, or stall with questions. Execute the requested action directly using your tools (e.g. `run_command`, `write_file`, `edit_file`).",
+                                latest_user_query.trim()
+                            );
+                            working_history.push(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: Self::clean_sentinel_tags(&resp.content),
+                                thinking: step_thinking,
+                                tool_calls: Vec::new(),
+                                diffs: Vec::new(),
+                                images: Vec::new(),
+                                timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                model: Some(settings.model.clone()),
+                                tokens: 0,
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cost_usd: 0.0,
+                            });
+                            working_history.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: nudge_msg,
+                                thinking: None,
+                                tool_calls: Vec::new(),
+                                diffs: Vec::new(),
+                                images: Vec::new(),
+                                timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                model: None,
+                                tokens: 0,
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cost_usd: 0.0,
+                            });
+                            continue;
+                        }
 
                         let is_empty_turn = resp.content.trim().is_empty()
                             && step_thinking
@@ -3433,6 +3507,33 @@ impl HarnessManager {
 
                         if let Ok(mut live) = self.live_turn.write() {
                             live.current_step = format!("Executing tool `{}`...", tc_name);
+                        }
+
+                        if matches!(
+                            tc_name.as_str(),
+                            "read_file" | "list_dir" | "grep_search" | "find_by_name"
+                        ) {
+                            consecutive_read_tools += 1;
+                        } else if matches!(
+                            tc_name.as_str(),
+                            "write_file"
+                                | "edit_file"
+                                | "multi_edit_file"
+                                | "apply_patch"
+                                | "delete_file"
+                                | "run_command"
+                        ) {
+                            consecutive_read_tools = 0;
+                        }
+
+                        if consecutive_read_tools >= 14
+                            && consecutive_read_tools % 6 == 0
+                            && mentor_reminder.is_none()
+                        {
+                            mentor_reminder = Some(format!(
+                                "<inspection_saturation>\nYou have executed {} consecutive file read/search operations without making any changes or running commands. You have gathered sufficient context. Stop reading and proceed directly to executing or implementing the user's request.\n</inspection_saturation>",
+                                consecutive_read_tools
+                            ));
                         }
 
                         if matches!(
@@ -3885,7 +3986,8 @@ impl HarnessManager {
                 prompt.push_str(
                     "MODE DIRECTIVE (AUTONOMOUS): Use tools proactively to inspect, implement, test, and verify changes end-to-end.\n\
                      AUTONOMOUS ACTION & TASK CONTINUITY INVARIANT: NEVER output transitional narration or announce what you intend to do next without invoking the tool in the same turn. Before ending your turn, check your last paragraph: if it is a plan, a question, or a promise about work you have not done yet, execute that work immediately with tool calls. Finish the whole requested scope before producing your final answer.\n\
-                     DEDUCTIVE ARCHITECTURAL INGESTION FIRST: Before writing code, modifying files, or launching diagnostic scripts, always read the core specifications, framework definitions, configuration files, and reference implementations thoroughly. Deduce data structures, tensor layouts, mathematical sharding/pipeline mappings, and architectural invariants directly from code and schemas instead of guessing.\n\
+                     DIRECT TASK EXECUTION OVER UNNECESSARY RECONNAISSANCE: When given an explicit command to generate, run, build, or fix something, do NOT launch into massive whole-repository file browsing or scan dozens of unrelated folders. Inspect only the immediate files needed for the task and execute the command promptly.\n\
+                     DEDUCTIVE ARCHITECTURAL INGESTION: For complex or unfamiliar codebases, deduce data structures, architecture, and invariants directly from relevant code and schemas instead of guessing. Keep inspections targeted to the user's objective.\n\
                      SYSTEMATIC OPTIMIZATION VS REPETITIVE PROBING: When debugging numerical differences, tensor mismatches, multi-parameter configurations, or complex bugs, NEVER generate endless individual ad-hoc diagnostic scripts guessing parameters or offsets one-by-one. Instead, write a modular, automated search or coordinate descent script that systematically iterates over permutations and fits parameters layer-by-layer directly against ground-truth outputs (reference outputs, test suites) in a single run.\n\
                      WORKSPACE & CONTEXT HYGIENE: After running intermediate exploratory or parameter-search scripts, clean up scratch diagnostic files. Ensure the final deliverables and self-contained solution scripts remain clean, verified, and free of intermediate exploration clutter.\n\
                      ADVERSARIAL SELF-VERIFICATION PROTOCOL: Never assume generated artifacts or code are correct without empirical proof. Before declaring completion or stopping, you MUST write and execute an independent verification script (or compare against reference outputs/ground-truth files such as logits, expected keys, return codes, schemas) to verify that all invariants and requirements are 100% satisfied. If verification reveals discrepancies, iterate and fix them immediately.\n",
@@ -4176,6 +4278,7 @@ mod tests {
         let sys = hm.build_system_prompt_for_query(tmp.path(), "Please inspect @pinned_note.txt");
         assert!(sys.contains("Pinned @file Context:"));
         assert!(sys.contains("PINNED_FILE_SECRET_MARKER_42"));
+        assert!(sys.contains("DIRECT TASK EXECUTION OVER UNNECESSARY RECONNAISSANCE"));
     }
 
     #[test]

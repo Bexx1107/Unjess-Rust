@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.0.9";
+pub const CURRENT_VERSION: &str = "4.1.0";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,22 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.1.0".to_string(),
+            date: "2026-11-09".to_string(),
+            title: "Unjess 4.1.0 — Multi-Turn Tool History Integrity & Autonomous Action Enforcement".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Fixed multi-turn tool history serialization in Ollama and OpenAI providers so historical tool calls & results are preserved across subsequent turns without amnesia.".to_string(),
+                "Added Autonomous Action Directive in `agent.rs`: prevents the model from prematurely exiting the loop by asking hesitant questions when the user gave an explicit command (e.g. generate, fix, run, build).".to_string(),
+                "Added Inspection Saturation Guard: warns and re-orients the agent to execution if it executes 14+ consecutive read/search operations without making any changes or running commands.".to_string(),
+                "Updated Autonomous system prompt directives to prioritize direct task execution over exhaustive whole-workspace file reconnaissance.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.0.9".to_string(),
             date: "2026-11-09".to_string(),
             title: "Unjess 4.0.9 — Multimodal Vision Engine & Auto Attachment Ingestion".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Restored native multimodal Vision engine with `view_image` tool schema and execution handler.".to_string(),
                 "Added transparent image delegation in `read_file` so .png, .jpg, .jpeg, .webp, .gif, .bmp auto-queue for vision input.".to_string(),
@@ -175,9 +187,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.0.9");
+        assert_eq!(CURRENT_VERSION, "4.1.0");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.0.9");
+        assert_eq!(log[0].version, "4.1.0");
     }
 }

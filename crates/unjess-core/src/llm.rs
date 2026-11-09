@@ -390,6 +390,45 @@ pub fn serialize_openai_messages(
                 }
             }
             messages.push(msg_obj);
+        } else if m.role == "assistant" && !m.tool_calls.is_empty() {
+            // Self-contained multi-turn assistant message with historical tool calls & results
+            let tc_json: Vec<serde_json::Value> = m
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments.to_string()
+                        }
+                    })
+                })
+                .collect();
+            let mut msg_obj = serde_json::json!({
+                "role": "assistant",
+                "content": if m.content.trim().is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(m.content.clone())
+                },
+                "tool_calls": tc_json
+            });
+            if let Some(ref th) = m.thinking {
+                if !th.trim().is_empty() {
+                    msg_obj["reasoning_content"] = serde_json::Value::String(th.clone());
+                }
+            }
+            messages.push(msg_obj);
+            for tc in &m.tool_calls {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tc.name,
+                    "content": tc.result
+                }));
+            }
         } else if paired_with_prev_assistant {
             for tc in &m.tool_calls {
                 messages.push(serde_json::json!({
@@ -475,6 +514,38 @@ pub fn serialize_ollama_messages(
                 }
             }
             messages.push(msg_obj);
+        } else if m.role == "assistant" && !m.tool_calls.is_empty() {
+            // Self-contained multi-turn assistant message with historical tool calls & results
+            let tc_json: Vec<serde_json::Value> = m
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        }
+                    })
+                })
+                .collect();
+            let mut msg_obj = serde_json::json!({
+                "role": "assistant",
+                "content": m.content,
+                "tool_calls": tc_json
+            });
+            if let Some(ref th) = m.thinking {
+                if !th.trim().is_empty() {
+                    msg_obj["thinking"] = serde_json::Value::String(th.clone());
+                }
+            }
+            messages.push(msg_obj);
+            for tc in &m.tool_calls {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "name": tc.name,
+                    "content": tc.result
+                }));
+            }
         } else if paired_with_prev_assistant {
             for tc in &m.tool_calls {
                 messages.push(serde_json::json!({
@@ -1506,7 +1577,7 @@ mod tests {
                 role: "tool".to_string(),
                 content: "[Tool `read_file` result]:\n1: fn main() {}".to_string(),
                 thinking: None,
-                tool_calls: vec![tc],
+                tool_calls: vec![tc.clone()],
                 diffs: Vec::new(),
                 images: Vec::new(),
                 timestamp: "12:00:02".to_string(),
@@ -1538,5 +1609,73 @@ mod tests {
         );
         assert_eq!(ollama_msgs[3]["role"], "tool");
         assert_eq!(ollama_msgs[3]["name"], "read_file");
+
+        // Verify multi-turn self-contained assistant messages preserve historical tool calls and results
+        let multi_turn_history = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "First turn prompt".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                images: Vec::new(),
+                timestamp: "12:00:00".to_string(),
+                model: None,
+                tokens: 10,
+                input_tokens: 10,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Hey, I inspected the code.".to_string(),
+                thinking: None,
+                tool_calls: vec![tc.clone()],
+                diffs: Vec::new(),
+                images: Vec::new(),
+                timestamp: "12:00:01".to_string(),
+                model: Some("deepseek-v4.1-flash:cloud".to_string()),
+                tokens: 20,
+                input_tokens: 10,
+                output_tokens: 10,
+                cost_usd: 0.0,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "generate shot 4".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                images: Vec::new(),
+                timestamp: "12:00:02".to_string(),
+                model: None,
+                tokens: 10,
+                input_tokens: 10,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            },
+        ];
+
+        let ollama_multi = serialize_ollama_messages("sys", &multi_turn_history);
+        assert_eq!(ollama_multi.len(), 5);
+        assert_eq!(ollama_multi[2]["role"], "assistant");
+        assert_eq!(
+            ollama_multi[2]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(ollama_multi[3]["role"], "tool");
+        assert_eq!(ollama_multi[3]["content"], "1: fn main() {}");
+        assert_eq!(ollama_multi[4]["role"], "user");
+        assert_eq!(ollama_multi[4]["content"], "generate shot 4");
+
+        let openai_multi = serialize_openai_messages("sys", &multi_turn_history);
+        assert_eq!(openai_multi.len(), 5);
+        assert_eq!(openai_multi[2]["role"], "assistant");
+        assert_eq!(openai_multi[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(openai_multi[3]["role"], "tool");
+        assert_eq!(openai_multi[3]["tool_call_id"], "call_1");
+        assert_eq!(openai_multi[3]["content"], "1: fn main() {}");
+        assert_eq!(openai_multi[4]["role"], "user");
+        assert_eq!(openai_multi[4]["content"], "generate shot 4");
     }
 }
