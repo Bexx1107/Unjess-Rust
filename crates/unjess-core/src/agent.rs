@@ -3154,7 +3154,12 @@ impl HarnessManager {
         let mut tool_engine =
             ToolEngine::new(workspace).with_abort_flag(Arc::clone(&conv_abort_flag));
 
-        let max_iters = settings.max_iterations.clamp(1, 2000);
+        let is_autonomous = self.agent_mode() == "Autonomous";
+        let max_iters = if is_autonomous {
+            settings.max_iterations.max(1000).clamp(1, 5000)
+        } else {
+            settings.max_iterations.clamp(1, 2000)
+        };
         let enable_tools = self.agent_mode() != "Plan";
 
         let active_conv = self.conversation_by_id(conv_id);
@@ -3424,7 +3429,7 @@ impl HarnessManager {
                             && !is_explicit_completion
                             && (is_empty_turn || is_transitional || is_intermediate_autonomous_stall)
                         {
-                            if transitional_nudges < 5 {
+                            if transitional_nudges < 15 {
                                 transitional_nudges += 1;
                                 let nudge_msg = if is_empty_turn {
                                     "[System Guidance]: You completed your reasoning but did not invoke any tools or output a final answer. Please invoke the appropriate tool to proceed with the task or provide your final response.".to_string()
@@ -3432,7 +3437,7 @@ impl HarnessManager {
                                     "[System Guidance]: You described a pending action without invoking a tool. In autonomous mode, call the relevant tool immediately to advance the task, or output your final verified response if finished.".to_string()
                                 } else {
                                     format!(
-                                        "[Autonomous Continuation Directive]: You provided an intermediate observation ('{}') without invoking tools or declaring task completion. In Autonomous mode, execute the required action directly (e.g. `edit_file`, `write_file`, `run_command`), verify the result, or emit '<!-- GOAL_COMPLETE -->' if all goals are fully achieved.",
+                                        "[Autonomous Continuation Directive]: You provided an intermediate observation ('{}') without invoking tools or declaring task completion. In Autonomous mode, execute the required action directly (e.g. `generate_image`, `edit_file`, `write_file`, `run_command`), verify the result, or emit '<!-- GOAL_COMPLETE -->' if all goals are fully achieved.",
                                         Self::clean_sentinel_tags(&resp.content).lines().next().unwrap_or("...").chars().take(120).collect::<String>()
                                     )
                                 };
@@ -3453,6 +3458,22 @@ impl HarnessManager {
                                 working_history.push(ChatMessage {
                                     role: "user".to_string(),
                                     content: nudge_msg,
+                                    thinking: None,
+                                    tool_calls: Vec::new(),
+                                    diffs: Vec::new(),
+                                    images: Vec::new(),
+                                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                                    model: None,
+                                    tokens: 0,
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cost_usd: 0.0,
+                                });
+                                continue;
+                            } else if is_autonomous {
+                                working_history.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: "[Autonomous Finalization Directive]: Multiple intermediate observations occurred without tool calls. Please synthesize your final response, summarizing what has been done and what remains, or emit '<!-- GOAL_COMPLETE -->' if finished.".to_string(),
                                     thinking: None,
                                     tool_calls: Vec::new(),
                                     diffs: Vec::new(),
@@ -4100,6 +4121,12 @@ impl HarnessManager {
                     }
 
                     if iter >= max_iters {
+                        if is_autonomous && !final_text.contains("[Autonomous Step Budget Reached]") {
+                            final_text.push_str(&format!(
+                                "\n\n---\n**[Autonomous Step Budget Reached]**: Unjess completed {} autonomous steps in this turn. All changes and workspace files have been preserved. Reply 'continue' or give your next instruction to proceed.",
+                                iter
+                            ));
+                        }
                         break;
                     }
                 }

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.1.4";
+pub const CURRENT_VERSION: &str = "4.1.5";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,23 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.1.5".to_string(),
+            date: "2026-11-09".to_string(),
+            title: "Unjess 4.1.5 — First-Class MCP Tool Injection (DMD Studio, DaVinci, Blender), Payload Interceptor & Anti-Stall Engine".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Full MCP Parity with Antigravity: automatically discovers, syncs, and injects all 132 MCP tools (including DMD Studio 44 tools, Blender, DaVinci Resolve, Google Flow, Chrome DevTools, Unity Bridge) directly into the LLM function schema.".to_string(),
+                "Native Tool Calling: models can now invoke `generate_image`, `restyle_image`, `dmd_pipeline_generate_image` directly in 1 step without reverse-engineering shell/python scripts across 240+ steps.".to_string(),
+                "Automatic Base64 Payload Interceptor: binary images and artifacts returned by MCP servers are automatically decoded and saved to disk (`.unjess/attachments/`), replacing multi-megabyte base64 strings with clean file links to completely eliminate Ollama/Cloud HTTP 400 context overflow errors.".to_string(),
+                "Autonomous Loop Tripwire Elimination: raised default autonomous step ceiling to 1,000+ iterations and replaced silent loop break tripwires with persistent continuation and transparent step budget reporting.".to_string(),
+                "Extended 240s MCP Timeout: heavy image generation and 3D rendering jobs no longer time out after 25 seconds.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.1.4".to_string(),
             date: "2026-11-09".to_string(),
             title: "Unjess 4.1.4 — Cross-Drive Absolute Path Freedom & Antigravity Skills Sync".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Eliminated workspace sandbox boundary errors on absolute paths: tools (outline_file, read_file, write_file, edit_file) can now freely access files on any drive (C:, E:, etc.) without 'escapes workspace boundary' errors.".to_string(),
                 "Full Antigravity & Gemini Skills Discovery: automatically discovers and runs skills and plugins from ~/.gemini/config/skills and ~/.gemini/config/plugins (including asset-factory, dmd-studio, hyperframes).".to_string(),
@@ -235,9 +248,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.1.4");
+        assert_eq!(CURRENT_VERSION, "4.1.5");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.1.4");
+        assert_eq!(log[0].version, "4.1.5");
     }
 }

@@ -4198,10 +4198,19 @@ impl ToolEngine {
             }
             "shadow_sandbox" => self.execute_shadow_sandbox(args),
             "call_mcp_tool" => {
-                let server_name = get_str("server");
-                let tool_name = get_str("tool");
-                let tool_args = args
-                    .get("arguments")
+                let server_name = args.get("server")
+                    .or_else(|| args.get("ServerName"))
+                    .or_else(|| args.get("server_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tool_name = args.get("tool")
+                    .or_else(|| args.get("ToolName"))
+                    .or_else(|| args.get("tool_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tool_args = args.get("arguments")
+                    .or_else(|| args.get("Arguments"))
+                    .or_else(|| args.get("args"))
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
                 match McpManager::call_tool(server_name.trim(), tool_name.trim(), &tool_args) {
@@ -4220,7 +4229,44 @@ impl ToolEngine {
                     (format!("Unknown MCP tool '{}'", other), false, None)
                 }
             }
+            other if other.starts_with("mcp_") => {
+                let rest = &other[4..];
+                let servers = McpManager::load();
+                let mut matched = false;
+                let mut res = (String::new(), false, None);
+                for srv in &servers {
+                    let srv_safe = srv.name.replace('-', "_");
+                    if rest.starts_with(&srv.name) || rest.starts_with(&srv_safe) {
+                        let prefix_len = if rest.starts_with(&srv.name) { srv.name.len() } else { srv_safe.len() };
+                        let tl = rest[prefix_len..].trim_start_matches('_');
+                        match McpManager::call_tool(&srv.name, tl, args) {
+                            Ok(val) => { res = (val, true, None); matched = true; break; }
+                            Err(e) => { res = (format!("MCP tool error: {}", e), false, None); matched = true; break; }
+                        }
+                    }
+                }
+                if matched {
+                    res
+                } else {
+                    (format!("Unknown MCP tool '{}'", other), false, None)
+                }
+            }
             other => {
+                // 1. Direct MCP tool name match across all loaded and active MCP servers
+                // (e.g. `generate_image`, `restyle_image`, `dmd_pipeline_generate_image`)
+                let mcp_servers = McpManager::load();
+                for srv in &mcp_servers {
+                    if !srv.enabled {
+                        continue;
+                    }
+                    if let Some(tool) = srv.cached_tools.iter().find(|t| t.name.eq_ignore_ascii_case(other)) {
+                        match McpManager::call_tool(&srv.name, &tool.name, args) {
+                            Ok(val) => return (val, true, None),
+                            Err(e) => return (format!("MCP tool error: {}", e), false, None),
+                        }
+                    }
+                }
+
                 if let Some(synth) = Self::load_synthesized_tools()
                     .into_iter()
                     .find(|t| t.name.eq_ignore_ascii_case(other))
@@ -4937,7 +4983,6 @@ impl ToolEngine {
                         .chars()
                         .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
                         .collect();
-                    let full_name = format!("mcp__{}__{}", safe_srv, safe_tl);
                     let params = if t.input_schema.is_object()
                         && t.input_schema.get("type").is_some()
                     {
@@ -4948,6 +4993,27 @@ impl ToolEngine {
                             "properties": {}
                         })
                     };
+
+                    // 1. Direct clean tool name (e.g. `generate_image`, `restyle_image`) if not colliding with core tools
+                    let is_core_collision = arr.iter().any(|existing| {
+                        existing.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            == Some(&t.name)
+                    });
+                    if !is_core_collision {
+                        arr.push(serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": format!("[MCP: {}] {}", srv.name, t.description),
+                                "parameters": params.clone()
+                            }
+                        }));
+                    }
+
+                    // 2. Namespaced full name mcp__{safe_srv}__{safe_tl}
+                    let full_name = format!("mcp__{}__{}", safe_srv, safe_tl);
                     arr.push(serde_json::json!({
                         "type": "function",
                         "function": {
@@ -4981,13 +5047,18 @@ impl ToolEngine {
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or("");
+                let desc = item
+                    .get("function")
+                    .and_then(|f| f.get("description"))
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
                 allow_list.iter().any(|a| {
                     a.eq_ignore_ascii_case(name)
                         || (a.eq_ignore_ascii_case("ast_outline") && name == "outline_file")
                         || (a.eq_ignore_ascii_case("outline_file") && name == "ast_outline")
                         || (a.eq_ignore_ascii_case("ast_find_callers") && name == "find_callers")
                         || (a.eq_ignore_ascii_case("find_callers") && name == "ast_find_callers")
-                        || (a.eq_ignore_ascii_case("call_mcp_tool") && name.starts_with("mcp__"))
+                        || (a.eq_ignore_ascii_case("call_mcp_tool") && (name.starts_with("mcp__") || name.starts_with("mcp_") || desc.starts_with("[MCP:")))
                 })
             })
             .cloned()
@@ -4999,6 +5070,19 @@ impl ToolEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mcp_tools_exposed_in_schemas_and_dispatchable() {
+        let schemas = ToolEngine::tool_schemas();
+        let arr = schemas.as_array().expect("Tool schemas must be array");
+        let has_generate_image = arr.iter().any(|item| {
+            item.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                == Some("generate_image")
+        });
+        assert!(has_generate_image, "generate_image must be directly present in tool schemas for DMD Studio");
+    }
 
     #[test]
     fn test_write_edit_delete_and_revert_diff() {

@@ -274,31 +274,144 @@ impl McpManager {
         None
     }
 
-    /// Loads configured MCP servers from `~/.unjess-rust/mcp.json`, falling back to `~/.unjess/mcp.json` or seeding default presets.
+    /// Loads configured MCP servers from `~/.unjess-rust/mcp.json`, merging with Gemini/Antigravity (`mcp_config.json` & schema catalogs)
+    /// and legacy Go `~/.unjess/mcp.json`, auto-hydrating tool definitions so LLMs have immediate first-class tool access.
     pub fn load() -> Vec<McpServerConfig> {
         let path = Self::mcp_path();
+        let mut servers: Vec<McpServerConfig> = Vec::new();
+        let mut loaded_from_disk = false;
+
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Some(list) = Self::parse_mcp_json(&raw) {
-                let (migrated, changed) = Self::normalize_and_migrate(list);
-                if changed {
-                    let _ = Self::save(&migrated);
-                }
-                return migrated;
+                servers = list;
+                loaded_from_disk = true;
             }
         }
-        let legacy_path = Settings::legacy_go_config_dir().join("mcp.json");
-        if let Ok(raw) = fs::read_to_string(&legacy_path) {
-            if let Some(list) = Self::parse_mcp_json(&raw) {
-                if !list.is_empty() {
-                    let (migrated, _) = Self::normalize_and_migrate(list);
-                    let _ = Self::save(&migrated);
-                    return migrated;
+
+        if servers.is_empty() {
+            let legacy_path = Settings::legacy_go_config_dir().join("mcp.json");
+            if let Ok(raw) = fs::read_to_string(&legacy_path) {
+                if let Some(list) = Self::parse_mcp_json(&raw) {
+                    servers = list;
+                    loaded_from_disk = true;
                 }
             }
         }
-        let defaults = Self::presets("");
-        let _ = Self::save(&defaults);
-        defaults
+
+        if servers.is_empty() {
+            servers = Self::presets("");
+        }
+
+        let mut changed = false;
+
+        // Auto-merge external MCP servers from Gemini / Antigravity `mcp_config.json`
+        let agy_config_paths = [
+            dirs::home_dir().map(|h| h.join(".gemini").join("antigravity").join("mcp_config.json")),
+            dirs::home_dir().map(|h| h.join(".gemini").join("mcp_config.json")),
+        ];
+        for opt_p in agy_config_paths {
+            if let Some(p) = opt_p {
+                if let Ok(raw) = fs::read_to_string(&p) {
+                    if let Some(agy_list) = Self::parse_mcp_json(&raw) {
+                        for agy_srv in agy_list {
+                            if let Some(existing) = servers.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&agy_srv.name)) {
+                                if existing.command.trim().is_empty() && !agy_srv.command.trim().is_empty() {
+                                    existing.command = agy_srv.command;
+                                    existing.args = agy_srv.args;
+                                    existing.env = agy_srv.env;
+                                    changed = true;
+                                }
+                            } else {
+                                servers.push(agy_srv);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Auto-merge from legacy Go ~/.unjess/mcp.json if not already merged
+        let legacy_go_mcp = Settings::legacy_go_config_dir().join("mcp.json");
+        if legacy_go_mcp != path && legacy_go_mcp.exists() {
+            if let Ok(raw) = fs::read_to_string(&legacy_go_mcp) {
+                if let Some(legacy_list) = Self::parse_mcp_json(&raw) {
+                    for leg_srv in legacy_list {
+                        if !servers.iter().any(|s| s.name.eq_ignore_ascii_case(&leg_srv.name)) {
+                            servers.push(leg_srv);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hydrate cached_tools from Antigravity tool schema catalogs: ~/.gemini/antigravity/mcp/<server_name>/*.json
+        let mcp_schemas_roots = [
+            dirs::home_dir().map(|h| h.join(".gemini").join("antigravity").join("mcp")),
+            dirs::home_dir().map(|h| h.join(".gemini").join("mcp")),
+        ];
+        for opt_root in mcp_schemas_roots {
+            let Some(root) = opt_root else { continue };
+            if !root.is_dir() { continue };
+
+            for srv in &mut servers {
+                if !srv.cached_tools.is_empty() {
+                    continue;
+                }
+                let candidates = [
+                    root.join(&srv.name),
+                    root.join(srv.name.to_lowercase()),
+                    root.join(srv.name.replace(' ', "-")),
+                    root.join(srv.name.replace(' ', "_")),
+                    root.join(srv.name.replace('-', " ")),
+                ];
+                for cand in candidates {
+                    if cand.is_dir() {
+                        let mut discovered_tools = Vec::new();
+                        if let Ok(entries) = fs::read_dir(&cand) {
+                            for entry in entries.flatten() {
+                                let ep = entry.path();
+                                if ep.extension().and_then(|x| x.to_str()) == Some("json") {
+                                    if let Ok(content) = fs::read_to_string(&ep) {
+                                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                                            let stem = ep.file_stem().and_then(|s| s.to_str()).unwrap_or("tool").to_string();
+                                            let tool_name = val.get("name").and_then(|v| v.as_str()).unwrap_or(&stem).to_string();
+                                            let desc = val.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let params = val.get("parameters")
+                                                .or_else(|| val.get("inputSchema"))
+                                                .or_else(|| val.get("input_schema"))
+                                                .cloned()
+                                                .unwrap_or_else(|| serde_json::json!({
+                                                    "type": "object",
+                                                    "properties": {}
+                                                }));
+                                            discovered_tools.push(McpToolInfo {
+                                                name: tool_name,
+                                                description: desc,
+                                                input_schema: params,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !discovered_tools.is_empty() {
+                            srv.cached_tools = discovered_tools;
+                            srv.last_probe_ok = Some(true);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let (migrated, norm_changed) = Self::normalize_and_migrate(servers);
+        if changed || norm_changed || !loaded_from_disk {
+            let _ = Self::save(&migrated);
+        }
+        migrated
     }
 
     /// Saves MCP server configurations to `~/.unjess-rust/mcp.json`.
@@ -1036,9 +1149,91 @@ impl McpManager {
         }
     }
 
+    fn base64_decode(input: &str) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(input.len() * 3 / 4);
+        let mut buf = 0u32;
+        let mut bits = 0u32;
+        for &b in input.as_bytes() {
+            let val = match b {
+                b'A'..=b'Z' => (b - b'A') as u32,
+                b'a'..=b'z' => (b - b'a' + 26) as u32,
+                b'0'..=b'9' => (b - b'0' + 52) as u32,
+                b'+' | b'-' => 62,
+                b'/' | b'_' => 63,
+                b'=' | b' ' | b'\r' | b'\n' | b'\t' => continue,
+                _ => return None,
+            };
+            buf = (buf << 6) | val;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        Some(out)
+    }
+
+    /// Saves raw base64 artifact from an MCP server directly to disk and returns a concise file reference
+    /// so the LLM context window does not explode with millions of base64 characters.
+    pub fn save_mcp_base64_payload(mime: &str, b64: &str) -> String {
+        let Some(bytes) = Self::base64_decode(b64.trim()) else {
+            return format!("[MCP Binary Attachment ({} bytes)]", b64.len());
+        };
+        let ext = if mime.contains("jpeg") || mime.contains("jpg") {
+            "jpg"
+        } else if mime.contains("webp") {
+            "webp"
+        } else if mime.contains("gif") {
+            "gif"
+        } else if mime.contains("pdf") {
+            "pdf"
+        } else {
+            "png"
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let target_dir = cwd.join(".unjess").join("attachments");
+        let _ = fs::create_dir_all(&target_dir);
+        let prefix = b64.trim().chars().take(8).collect::<String>();
+        let filename = format!(
+            "mcp_artifact_{}_{}.{}",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+            prefix,
+            ext
+        );
+        let full_path = target_dir.join(&filename);
+        if fs::write(&full_path, &bytes).is_ok() {
+            format!(
+                "[MCP Output Image/Artifact saved to disk: {} ({} bytes)]",
+                full_path.display(),
+                bytes.len()
+            )
+        } else {
+            format!("[MCP Output Image/Artifact ({} bytes)]", bytes.len())
+        }
+    }
+
+    /// Scans raw string outputs for embedded large base64 data URIs and persists them to disk.
+    pub fn intercept_and_save_payloads(raw: &str) -> String {
+        if !raw.contains("data:") || !raw.contains(";base64,") {
+            return raw.to_string();
+        }
+        let mut result = raw.to_string();
+        let re = regex::Regex::new(r"data:([a-zA-Z0-9\+\-\_\.\/]+);base64,([A-Za-z0-9+/=\r\n]{128,})");
+        if let Ok(re) = re {
+            result = re
+                .replace_all(&result, |caps: &regex::Captures| {
+                    let mime = &caps[1];
+                    let b64 = &caps[2];
+                    Self::save_mcp_base64_payload(mime, b64)
+                })
+                .to_string();
+        }
+        result
+    }
+
     fn extract_mcp_result_payload(raw_json_str: &str) -> Result<String, String> {
         let Some(json) = parse_jsonrpc_or_sse(raw_json_str) else {
-            return Ok(raw_json_str.to_string());
+            return Ok(Self::intercept_and_save_payloads(raw_json_str));
         };
         if let Some(err_obj) = json.get("error") {
             let msg = err_obj
@@ -1058,12 +1253,18 @@ impl McpManager {
                 for item in content_arr {
                     if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
                         texts.push(t.to_string());
-                    } else if item.get("type").and_then(|v| v.as_str()) == Some("image") {
+                    } else if item.get("type").and_then(|v| v.as_str()) == Some("image")
+                        || item.get("data").is_some()
+                    {
                         let mime = item
                             .get("mimeType")
                             .and_then(|v| v.as_str())
                             .unwrap_or("image/png");
-                        texts.push(format!("[MCP Image Attachment ({})]", mime));
+                        if let Some(b64) = item.get("data").and_then(|v| v.as_str()) {
+                            texts.push(Self::save_mcp_base64_payload(mime, b64));
+                        } else {
+                            texts.push(format!("[MCP Image Attachment ({})]", mime));
+                        }
                     }
                 }
                 if !texts.is_empty() {
@@ -1073,12 +1274,13 @@ impl McpManager {
             let payload_str = extracted.unwrap_or_else(|| {
                 serde_json::to_string_pretty(res).unwrap_or_else(|_| res.to_string())
             });
+            let intercepted = Self::intercept_and_save_payloads(&payload_str);
             if is_err {
-                return Err(format!("MCP tool error: {}", payload_str));
+                return Err(format!("MCP tool error: {}", intercepted));
             }
-            return Ok(payload_str);
+            return Ok(intercepted);
         }
-        Ok(raw_json_str.to_string())
+        Ok(Self::intercept_and_save_payloads(raw_json_str))
     }
 
     /// Invokes a tool on a configured MCP server over JSON-RPC 2.0 (Stdio or Streamable HTTP).
@@ -1114,6 +1316,11 @@ impl McpManager {
             String::new()
         };
 
+        let timeout_secs = std::env::var("UNJESS_MCP_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(240);
+
         if !effective_url.is_empty() {
             let url = effective_url;
             let env = cfg.env.clone();
@@ -1122,7 +1329,7 @@ impl McpManager {
             let args = arguments.clone();
             let raw_resp = std::thread::spawn(move || {
                 let client = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(30))
+                    .timeout(Duration::from_secs(timeout_secs))
                     .build()
                     .map_err(|e| e.to_string())?;
                 let bearer_tok = resolve_mcp_auth_token(&env);
@@ -1240,7 +1447,7 @@ impl McpManager {
                     }
                 }
             });
-            let deadline = Instant::now() + Duration::from_secs(25);
+            let deadline = Instant::now() + Duration::from_secs(timeout_secs);
             while Instant::now() < deadline {
                 match rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(line) => {
@@ -1367,5 +1574,21 @@ impl McpManager {
         Self::presets(mashina_token)
             .into_iter()
             .find(|p| p.name.eq_ignore_ascii_case(key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mcp_discovery_and_tool_hydration() {
+        let servers = McpManager::load();
+        assert!(!servers.is_empty(), "Servers should be populated");
+        if let Some(dmd) = servers.iter().find(|s| s.name.eq_ignore_ascii_case("dmd-studio")) {
+            assert!(dmd.enabled, "dmd-studio should be enabled");
+            assert!(!dmd.cached_tools.is_empty(), "dmd-studio cached_tools should be hydrated from schema files");
+            assert!(dmd.cached_tools.iter().any(|t| t.name == "generate_image"), "dmd-studio must include generate_image");
+        }
     }
 }
