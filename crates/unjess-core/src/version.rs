@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.1.3";
+pub const CURRENT_VERSION: &str = "4.1.4";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,22 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.1.4".to_string(),
+            date: "2026-11-09".to_string(),
+            title: "Unjess 4.1.4 — Cross-Drive Absolute Path Freedom & Antigravity Skills Sync".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Eliminated workspace sandbox boundary errors on absolute paths: tools (outline_file, read_file, write_file, edit_file) can now freely access files on any drive (C:, E:, etc.) without 'escapes workspace boundary' errors.".to_string(),
+                "Full Antigravity & Gemini Skills Discovery: automatically discovers and runs skills and plugins from ~/.gemini/config/skills and ~/.gemini/config/plugins (including asset-factory, dmd-studio, hyperframes).".to_string(),
+                "Sanitized Compaction Task Anchor: opening greetings ('jou', 'yo', 'hi') are no longer pinned as the root task specification, preventing agent amnesia and confusion.".to_string(),
+                "Autonomous Action Enforcement: intercepted hesitant multiple-choice option menus ('Want me to (a)... (b)... or (c)...?') when explicit generation/action commands were given, forcing the agent to execute directly.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.1.3".to_string(),
             date: "2026-11-09".to_string(),
             title: "Unjess 4.1.3 — Autonomous Continuation Directive & Anti-Stall Guard".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Eliminated mid-run stalls caused by intermediate LLM observations: expanded `is_transitional_narration` to recognize bug diagnoses, ongoing code additions, and progress notes (e.g. 'Found the real bug', 'Also adding...').".to_string(),
                 "Added Autonomous Continuation Directive: in Auto mode, if an agent provides observational text without tool calls and without declaring completion (`<!-- GOAL_COMPLETE -->`) or asking a user question, the engine automatically commands it to execute rather than prematurely stopping.".to_string(),
@@ -223,9 +235,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.1.3");
+        assert_eq!(CURRENT_VERSION, "4.1.4");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.1.3");
+        assert_eq!(log[0].version, "4.1.4");
     }
 }

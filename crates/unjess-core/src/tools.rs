@@ -520,23 +520,22 @@ impl ToolEngine {
         if !trimmed.contains("..") {
             let norm = trimmed.replace('\\', "/");
             let norm_lower = norm.to_lowercase();
-            let skill_roots = [
+            // 1. Direct absolute path anywhere on disk
+            let candidate = PathBuf::from(trimmed);
+            if candidate.is_absolute() && candidate.exists() {
+                return Ok(candidate);
+            }
+
+            let mut skill_roots = vec![
                 SkillsManager::skills_dir(),
                 Settings::legacy_go_config_dir().join("skills"),
                 self.workspace.root().join(".agents").join("skills"),
                 self.workspace.root().join(".unjess").join("skills"),
             ];
-
-            // 1. Direct absolute path inside any skill root (case-insensitive on Windows)
-            let candidate = PathBuf::from(trimmed);
-            if candidate.is_absolute() && candidate.exists() {
-                let cand_norm = candidate.to_string_lossy().replace('\\', "/").to_lowercase();
-                if skill_roots.iter().any(|r| {
-                    let r_norm = r.to_string_lossy().replace('\\', "/").to_lowercase();
-                    cand_norm.starts_with(&r_norm)
-                }) {
-                    return Ok(candidate);
-                }
+            if let Some(home) = dirs::home_dir() {
+                skill_roots.push(home.join(".gemini").join("config").join("skills"));
+                skill_roots.push(home.join(".gemini").join("config").join("plugins"));
+                skill_roots.push(home.join(".gemini").join("antigravity").join("builtin").join("skills"));
             }
 
             // 2. Extract `<skill>/<subpath>` after `/skills/` and search across all skill roots

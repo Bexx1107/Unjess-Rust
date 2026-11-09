@@ -529,11 +529,94 @@ impl SkillsManager {
         search_dirs.push((Self::skills_dir(), "global"));
         search_dirs.push((Settings::legacy_go_config_dir().join("skills"), "global"));
 
+        if let Some(home) = dirs::home_dir() {
+            search_dirs.push((home.join(".gemini").join("config").join("skills"), "global"));
+            search_dirs.push((home.join(".gemini").join("antigravity").join("builtin").join("skills"), "global"));
+        }
+
         for (dir, scope) in search_dirs {
             Self::scan_skills_dir(&dir, scope, &mut skills);
         }
 
+        if let Some(home) = dirs::home_dir() {
+            Self::scan_plugins_dir(&home.join(".gemini").join("config").join("plugins"), "global", &mut skills);
+        }
+
         skills
+    }
+
+    fn scan_plugins_dir(plugins_root: &Path, scope: &str, skills: &mut Vec<SkillInfo>) {
+        let Ok(entries) = fs::read_dir(plugins_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let direct_skill = path.join("SKILL.md");
+            if direct_skill.is_file() {
+                Self::ingest_skill_at_path(&path, &direct_skill, scope, skills);
+            }
+            let nested_skills = path.join("skills");
+            if nested_skills.is_dir() {
+                Self::scan_skills_dir(&nested_skills, scope, skills);
+            }
+        }
+    }
+
+    fn ingest_skill_at_path(path: &Path, skill_md: &Path, scope: &str, skills: &mut Vec<SkillInfo>) {
+        if let Ok(content) = fs::read_to_string(skill_md) {
+            let id = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "skill".to_string());
+            let (name, desc, body, extra_triggers, folder, repo_url) =
+                Self::parse_skill_markdown(&id, &content);
+            let (files, scripts, references) = scan_skill_companion_files(path);
+            let dir_path_str = path.to_string_lossy().to_string();
+
+            if let Some(existing_idx) = skills.iter().position(|s| {
+                s.id.eq_ignore_ascii_case(&id)
+                    || s.name.eq_ignore_ascii_case(&name)
+                    || slugify_skill_id(&s.name) == slugify_skill_id(&name)
+            }) {
+                if skills[existing_idx].builtin {
+                    skills[existing_idx] = Self::make_skill(
+                        id,
+                        name,
+                        desc,
+                        skill_md.to_string_lossy().to_string(),
+                        dir_path_str,
+                        false,
+                        body,
+                        content,
+                        scope,
+                        extra_triggers,
+                        folder,
+                        repo_url,
+                        files,
+                        scripts,
+                        references,
+                    );
+                }
+                return;
+            }
+            skills.push(Self::make_skill(
+                id,
+                name,
+                desc,
+                skill_md.to_string_lossy().to_string(),
+                dir_path_str,
+                false,
+                body,
+                content,
+                scope,
+                extra_triggers,
+                folder,
+                repo_url,
+                files,
+                scripts,
+                references,
+            ));
+        }
     }
 
     fn scan_skills_dir(dir: &Path, scope: &str, skills: &mut Vec<SkillInfo>) {
@@ -545,57 +628,7 @@ impl SkillsManager {
             if path.is_dir() {
                 let skill_md = path.join("SKILL.md");
                 if skill_md.is_file() {
-                    if let Ok(content) = fs::read_to_string(&skill_md) {
-                        let id = entry.file_name().to_string_lossy().to_string();
-                        let (name, desc, body, extra_triggers, folder, repo_url) =
-                            Self::parse_skill_markdown(&id, &content);
-                        let (files, scripts, references) = scan_skill_companion_files(&path);
-                        let dir_path_str = path.to_string_lossy().to_string();
-
-                        if let Some(existing_idx) = skills.iter().position(|s| {
-                            s.id.eq_ignore_ascii_case(&id)
-                                || s.name.eq_ignore_ascii_case(&name)
-                                || slugify_skill_id(&s.name) == slugify_skill_id(&name)
-                        }) {
-                            if skills[existing_idx].builtin {
-                                skills[existing_idx] = Self::make_skill(
-                                    id,
-                                    name,
-                                    desc,
-                                    skill_md.to_string_lossy().to_string(),
-                                    dir_path_str,
-                                    false,
-                                    body,
-                                    content,
-                                    scope,
-                                    extra_triggers,
-                                    folder,
-                                    repo_url,
-                                    files,
-                                    scripts,
-                                    references,
-                                );
-                            }
-                            continue;
-                        }
-                        skills.push(Self::make_skill(
-                            id,
-                            name,
-                            desc,
-                            skill_md.to_string_lossy().to_string(),
-                            dir_path_str,
-                            false,
-                            body,
-                            content,
-                            scope,
-                            extra_triggers,
-                            folder,
-                            repo_url,
-                            files,
-                            scripts,
-                            references,
-                        ));
-                    }
+                    Self::ingest_skill_at_path(&path, &skill_md, scope, skills);
                 }
             }
         }

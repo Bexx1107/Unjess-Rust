@@ -54,7 +54,8 @@ impl Workspace {
         &self.root
     }
 
-    /// Resolves a relative or inside-workspace path while strictly preventing `..` or symlink escapes.
+    /// Resolves a path while strictly preventing relative `..` traversal escapes out of the workspace.
+    /// Explicit absolute paths (e.g. `C:\...`, `/...`) are lexically resolved and permitted across any drive or directory.
     pub fn resolve<P: AsRef<Path>>(&self, rel_path: P) -> Result<PathBuf, WorkspaceError> {
         let rel = rel_path.as_ref();
         let rel_str = rel.to_string_lossy();
@@ -62,11 +63,29 @@ impl Workspace {
             return Ok(self.root.clone());
         }
 
-        let candidate = if rel.is_absolute() {
-            rel.to_path_buf()
-        } else {
-            self.root.join(rel)
-        };
+        let is_explicit_abs = rel.is_absolute()
+            || (rel_str.len() >= 2 && rel_str.chars().nth(1) == Some(':'))
+            || rel_str.starts_with('/')
+            || rel_str.starts_with('\\');
+
+        if is_explicit_abs {
+            let mut normalized = PathBuf::new();
+            for comp in rel.components() {
+                match comp {
+                    Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    Component::CurDir => {}
+                    other => normalized.push(other.as_os_str()),
+                }
+            }
+            if normalized.exists() {
+                return Ok(normalized.canonicalize().unwrap_or(normalized));
+            }
+            return Ok(normalized);
+        }
+
+        let candidate = self.root.join(rel);
 
         // Normalize lexical components first
         let mut normalized = PathBuf::new();
@@ -361,6 +380,7 @@ mod tests {
         assert!(ws.resolve("src/main.rs").is_ok());
         assert!(ws.resolve("../../outside.txt").is_err());
         assert!(ws.resolve("../../../../../../../../../../nonexistent_root_escape.txt").is_err());
+        assert!(ws.resolve(r"C:\Users\zanzu\dev\battlefield-asset-factory\af.py").is_ok());
     }
 
     #[test]

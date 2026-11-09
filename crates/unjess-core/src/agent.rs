@@ -1041,8 +1041,28 @@ impl HarnessManager {
             return messages.to_vec();
         }
 
-        // Always preserve initial user prompt if present at index 0 (Task Specification Anchor)
-        let has_initial_user = !messages.is_empty() && messages[0].role == "user";
+        let is_trivial_greeting = |text: &str| -> bool {
+            let t = text.trim().to_lowercase();
+            t.len() < 12
+                && (t == "hi"
+                    || t == "hello"
+                    || t == "hey"
+                    || t == "yo"
+                    || t == "jou"
+                    || t == "test"
+                    || t == "hej"
+                    || t == "zdravo"
+                    || t.starts_with("hi ")
+                    || t.starts_with("hey ")
+                    || t.starts_with("yo ")
+                    || t.starts_with("jou "))
+        };
+
+        // Always preserve initial user prompt if present at index 0 (Task Specification Anchor),
+        // but ignore trivial opening greetings like 'jou', 'yo', 'hi' that carry no task spec.
+        let has_initial_user = !messages.is_empty()
+            && messages[0].role == "user"
+            && !is_trivial_greeting(&messages[0].content);
         let (root_user, rest) = if has_initial_user {
             (Some(messages[0].clone()), &messages[1..])
         } else {
@@ -3332,15 +3352,25 @@ impl HarnessManager {
                             )
                         });
 
+                        let is_hesitant_menu = lower_resp.contains("want me to (a)")
+                            || lower_resp.contains("want me to:")
+                            || lower_resp.contains("should i (a)")
+                            || lower_resp.contains("do you want me to (a)")
+                            || lower_resp.contains("which option")
+                            || (is_user_question
+                                && (lower_resp.contains("want me to")
+                                    || lower_resp.contains("should i proceed")
+                                    || lower_resp.contains("should i get on with")));
+
                         // Autonomous Action Directive:
-                        // If the user requested an action, but the model took NO action and asked a question or stalled,
-                        // force it to execute instead of prematurely exiting the loop!
+                        // If the user requested an action, and the model asked a question, stalled with an option menu,
+                        // or took no real action, force it to execute instead of prematurely exiting the loop!
                         if enable_tools
                             && iter < max_iters
                             && is_action_request
-                            && !has_performed_action
-                            && is_user_question
-                            && transitional_nudges < 3
+                            && (!has_performed_action || is_hesitant_menu)
+                            && (is_user_question || is_hesitant_menu)
+                            && transitional_nudges < 4
                         {
                             transitional_nudges += 1;
                             let nudge_msg = format!(
