@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.1.1";
+pub const CURRENT_VERSION: &str = "4.1.2";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,23 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.1.2".to_string(),
+            date: "2026-11-09".to_string(),
+            title: "Unjess 4.1.2 — Multi-Conversation Concurrency, Per-Chat Abort & Context Compaction Overflow Fix".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "True concurrent multi-conversation and multi-project background execution: chats run independently in the background without halting when switching tabs, workspaces, or starting other sessions.".to_string(),
+                "Per-conversation abort isolation: clicking Stop only halts the active conversation while other background agent loops continue unimpeded.".to_string(),
+                "Visual concurrency indicators: active background conversations display live emerald run pulses and status tags in the sidebar.".to_string(),
+                "Eliminated Ollama HTTP 400 'The prompt is too long' (1M+ token limit) errors: multi-stage context compaction now accurately weighs tool results and historical reasoning tokens, auto-pruning stale multi-megabyte command outputs.".to_string(),
+                "Auto-renaming & state isolation for new conversations: creating a new conversation resets live state, generates numbered titles ('Quick Chat N', 'Session N'), and dynamically auto-titles on the first user message.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.1.1".to_string(),
             date: "2026-11-09".to_string(),
             title: "Unjess 4.1.1 — Multimodal Image Downscaling, Compression & Historical Turn Pruning".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Eliminated Ollama HTTP 400 'request body too large' error during long multi-step vision workflows by auto-downscaling large images to 1568px and re-encoding as compressed JPEG/PNG.".to_string(),
                 "Added active vision windowing (`filter_active_vision_images`): only the 2 most recent vision images retain raw Base64 strings, safely pruning multi-megabyte payloads from earlier turns.".to_string(),
@@ -199,9 +212,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.1.1");
+        assert_eq!(CURRENT_VERSION, "4.1.2");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.1.1");
+        assert_eq!(log[0].version, "4.1.2");
     }
 }

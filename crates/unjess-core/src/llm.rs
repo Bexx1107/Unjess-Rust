@@ -259,7 +259,7 @@ fn shared_http_client() -> &'static reqwest::Client {
     })
 }
 
-fn estimate_prompt_tokens(system_prompt: &str, history: &[ChatMessage]) -> usize {
+pub fn estimate_prompt_tokens(system_prompt: &str, history: &[ChatMessage]) -> usize {
     let hist_chars: usize = history.iter().map(|m| m.content.len() + 8).sum();
     ((system_prompt.len() + hist_chars) / 4).max(1)
 }
@@ -414,9 +414,12 @@ pub fn serialize_openai_messages(
                 },
                 "tool_calls": tc_json
             });
-            if let Some(ref th) = m.thinking {
-                if !th.trim().is_empty() {
-                    msg_obj["reasoning_content"] = serde_json::Value::String(th.clone());
+            let is_latest_assistant = idx >= history.len().saturating_sub(2);
+            if is_latest_assistant {
+                if let Some(ref th) = m.thinking {
+                    if !th.trim().is_empty() {
+                        msg_obj["reasoning_content"] = serde_json::Value::String(th.clone());
+                    }
                 }
             }
             messages.push(msg_obj);
@@ -445,9 +448,12 @@ pub fn serialize_openai_messages(
                 },
                 "tool_calls": tc_json
             });
-            if let Some(ref th) = m.thinking {
-                if !th.trim().is_empty() {
-                    msg_obj["reasoning_content"] = serde_json::Value::String(th.clone());
+            let is_latest_assistant = idx >= history.len().saturating_sub(2);
+            if is_latest_assistant {
+                if let Some(ref th) = m.thinking {
+                    if !th.trim().is_empty() {
+                        msg_obj["reasoning_content"] = serde_json::Value::String(th.clone());
+                    }
                 }
             }
             messages.push(msg_obj);
@@ -540,9 +546,12 @@ pub fn serialize_ollama_messages(
                 "content": m.content,
                 "tool_calls": tc_json
             });
-            if let Some(ref th) = m.thinking {
-                if !th.trim().is_empty() {
-                    msg_obj["thinking"] = serde_json::Value::String(th.clone());
+            let is_latest_assistant = idx >= history.len().saturating_sub(2);
+            if is_latest_assistant {
+                if let Some(ref th) = m.thinking {
+                    if !th.trim().is_empty() {
+                        msg_obj["thinking"] = serde_json::Value::String(th.clone());
+                    }
                 }
             }
             messages.push(msg_obj);
@@ -565,9 +574,12 @@ pub fn serialize_ollama_messages(
                 "content": m.content,
                 "tool_calls": tc_json
             });
-            if let Some(ref th) = m.thinking {
-                if !th.trim().is_empty() {
-                    msg_obj["thinking"] = serde_json::Value::String(th.clone());
+            let is_latest_assistant = idx >= history.len().saturating_sub(2);
+            if is_latest_assistant {
+                if let Some(ref th) = m.thinking {
+                    if !th.trim().is_empty() {
+                        msg_obj["thinking"] = serde_json::Value::String(th.clone());
+                    }
                 }
             }
             messages.push(msg_obj);

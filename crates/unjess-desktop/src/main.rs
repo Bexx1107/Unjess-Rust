@@ -1238,8 +1238,12 @@ impl UnjessDesktopApp {
                                     f_resp.context_menu(|ui| {
                                         if ui.button("+ New Chat in Folder").clicked() {
                                             self.hm.set_active_workspace(&ws.id);
-                                            self.hm.new_conversation(Some("New Chat"));
+                                            let new_id = self.hm.new_conversation(Some("New Chat"));
+                                            self.hm.set_active_conversation(&new_id);
+                                            self.prompt_input.clear();
+                                            self.attached_images.clear();
                                             self.active_tab = MainTab::Chat;
+                                            self.status_toast = Some(("Started new conversation".to_string(), Instant::now()));
                                             ui.close_menu();
                                         }
                                         if ui.button("Rename Folder").clicked() {
@@ -1299,8 +1303,12 @@ impl UnjessDesktopApp {
                                             .clicked()
                                             {
                                                 self.hm.set_active_workspace(&ws.id);
-                                                self.hm.new_conversation(Some("New Chat"));
+                                                let new_id = self.hm.new_conversation(Some("New Chat"));
+                                                self.hm.set_active_conversation(&new_id);
+                                                self.prompt_input.clear();
+                                                self.attached_images.clear();
                                                 self.active_tab = MainTab::Chat;
+                                                self.status_toast = Some(("Started new conversation".to_string(), Instant::now()));
                                             }
                                         },
                                     );
@@ -1412,7 +1420,19 @@ impl UnjessDesktopApp {
                                             },
                                         );
 
-                                        if !row_hovered {
+                                        let is_conv_running = self.hm.is_conversation_running(&conv.id);
+                                        if is_conv_running {
+                                            ui.painter().text(
+                                                egui::pos2(
+                                                    item_rect.right() - 8.0,
+                                                    item_rect.center().y,
+                                                ),
+                                                egui::Align2::RIGHT_CENTER,
+                                                "● running",
+                                                FontId::new(10.0, FontFamily::Proportional),
+                                                theme::ACCENT_EMERALD,
+                                            );
+                                        } else if !row_hovered {
                                             ui.painter().text(
                                                 egui::pos2(
                                                     item_rect.right() - 8.0,
@@ -1427,6 +1447,9 @@ impl UnjessDesktopApp {
 
                                         if c_resp.clicked() {
                                             self.hm.set_active_conversation(&conv.id);
+                                            if !conv.workspace_id.is_empty() {
+                                                self.hm.set_active_workspace(&conv.workspace_id);
+                                            }
                                             self.active_tab = MainTab::Chat;
                                         }
 
@@ -1507,9 +1530,13 @@ impl UnjessDesktopApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_btn(ui, Icon::Plus, false, "New Quick Chat").clicked() {
-                            self.hm
+                            let new_id = self.hm
                                 .new_conversation_with_mode(Some("Quick Chat"), Some("quick"));
+                            self.hm.set_active_conversation(&new_id);
+                            self.prompt_input.clear();
+                            self.attached_images.clear();
                             self.active_tab = MainTab::Chat;
+                            self.status_toast = Some(("Started new quick chat".to_string(), Instant::now()));
                         }
                     });
                 });
@@ -1708,7 +1735,7 @@ impl UnjessDesktopApp {
 
     fn render_inspector_diffs(&mut self, ui: &mut Ui) {
         let conv = self.hm.active_conversation();
-        let live = self.hm.live_turn_snapshot();
+        let live = self.hm.live_turn_for_conversation(&conv.id).unwrap_or_else(|| self.hm.live_turn_snapshot());
         let mut all_diffs: Vec<FileDiff> = Vec::new();
         for m in &conv.messages {
             for d in &m.diffs {
@@ -2058,7 +2085,11 @@ impl UnjessDesktopApp {
                             self.hm.clear_active_conversation();
                         }
                         if dark_action_btn(ui, Some(Icon::Plus), "New Chat", false).clicked() {
-                            self.hm.new_conversation(Some("New Chat"));
+                            let new_id = self.hm.new_conversation(Some("New Chat"));
+                            self.hm.set_active_conversation(&new_id);
+                            self.prompt_input.clear();
+                            self.attached_images.clear();
+                            self.status_toast = Some(("Started new conversation".to_string(), Instant::now()));
                         }
                     });
                 });
@@ -2081,8 +2112,9 @@ impl UnjessDesktopApp {
                 ui.vertical_centered(|ui| {
                     ui.set_max_width(780.0);
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        let live = self.hm.live_turn_snapshot();
-                        if conv.messages.is_empty() && !live.running {
+                        let live = self.hm.live_turn_for_conversation(&conv.id).unwrap_or_else(|| self.hm.live_turn_snapshot());
+                        let is_running_this_conv = live.running && live.conv_id == conv.id;
+                        if conv.messages.is_empty() && !is_running_this_conv {
                             self.render_empty_chat_welcome(ui);
                         } else {
                             for (idx, msg) in conv.messages.iter().enumerate() {
@@ -2094,7 +2126,7 @@ impl UnjessDesktopApp {
                                 ui.add_space(16.0);
                             }
 
-                            if live.running && live.conv_id == conv.id {
+                            if is_running_this_conv {
                                 self.render_live_streaming_card(ui, &live);
                                 ui.add_space(16.0);
                             }
@@ -3263,7 +3295,8 @@ impl UnjessDesktopApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.spacing_mut().item_spacing.x = 8.0;
-                                    let live = self.hm.live_turn_snapshot();
+                                    let active_cid = self.hm.active_conversation_id();
+                                    let is_cur_running = self.hm.is_conversation_running(&active_cid);
 
                                     // Solid White 28x28 Send Button (or Red Stop Button when running)
                                     let (send_rect, send_resp) = ui.allocate_exact_size(
@@ -3274,7 +3307,7 @@ impl UnjessDesktopApp {
                                         ui.ctx()
                                             .set_cursor_icon(egui::CursorIcon::PointingHand);
                                     }
-                                    if live.running {
+                                    if is_cur_running {
                                         ui.painter().rect_filled(
                                             send_rect,
                                             CornerRadius::same(7),
@@ -3290,7 +3323,7 @@ impl UnjessDesktopApp {
                                             Color32::WHITE,
                                         );
                                         if send_resp.clicked() {
-                                            self.hm.abort_turn();
+                                            self.hm.abort_conversation(&active_cid);
                                         }
                                     } else {
                                         ui.painter().rect_filled(
@@ -3470,7 +3503,7 @@ impl eframe::App for UnjessDesktopApp {
             .update_checking
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        if self.hm.live_turn_snapshot().running || mcp_busy || upd_busy {
+        if self.hm.running_conversations_count() > 0 || mcp_busy || upd_busy {
             ctx.request_repaint_after(Duration::from_millis(80));
         } else if self.last_cache_refresh.elapsed() > Duration::from_secs(12) {
             self.refresh_workspace_cache();

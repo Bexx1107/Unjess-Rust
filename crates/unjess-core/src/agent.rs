@@ -258,7 +258,9 @@ pub struct HarnessManager {
     settings: RwLock<Settings>,
     state: RwLock<PersistedHarnessState>,
     live_turn: RwLock<LiveTurnSnapshot>,
+    live_turns: RwLock<std::collections::HashMap<String, LiveTurnSnapshot>>,
     abort_flag: Arc<AtomicBool>,
+    abort_flags: RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl Default for HarnessManager {
@@ -365,7 +367,9 @@ impl HarnessManager {
             settings: RwLock::new(settings),
             state: RwLock::new(state),
             live_turn: RwLock::new(LiveTurnSnapshot::default()),
+            live_turns: RwLock::new(std::collections::HashMap::new()),
             abort_flag: Arc::new(AtomicBool::new(false)),
+            abort_flags: RwLock::new(std::collections::HashMap::new()),
         };
         mgr.save_state();
         mgr
@@ -616,6 +620,19 @@ impl HarnessManager {
             }
         }
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    /// Resolves the dedicated workspace path for a specific conversation by its `conv_id`.
+    /// Guarantees that multi-project autonomous runs never bleed paths across workspaces when switching tabs.
+    pub fn workspace_path_for_conversation(&self, conv_id: &str) -> PathBuf {
+        if let Ok(guard) = self.state.read() {
+            if let Some(conv) = guard.conversations.iter().find(|c| c.id == conv_id) {
+                if let Some(ws) = guard.workspaces.iter().find(|w| w.id == conv.workspace_id) {
+                    return PathBuf::from(&ws.path);
+                }
+            }
+        }
+        self.active_workspace_path()
     }
 
     pub fn workspaces(&self) -> Vec<WorkspaceEntry> {
@@ -901,6 +918,21 @@ impl HarnessManager {
                 g.active_conversation_id = id.to_string();
             }
         }
+        // Sync active single live_turn with this conversation's dedicated live state
+        if let Ok(map) = self.live_turns.read() {
+            if let Some(snap) = map.get(id) {
+                if let Ok(mut live) = self.live_turn.write() {
+                    *live = snap.clone();
+                }
+            } else if let Ok(mut live) = self.live_turn.write() {
+                *live = LiveTurnSnapshot {
+                    running: false,
+                    conv_id: id.to_string(),
+                    current_step: "Ready".to_string(),
+                    ..Default::default()
+                };
+            }
+        }
         self.save_state();
     }
 
@@ -917,14 +949,15 @@ impl HarnessManager {
             .to_string();
         if let Ok(mut g) = self.state.write() {
             let ws_id = g.active_workspace_id.clone();
+            let count_in_ws = g.conversations.iter().filter(|c| c.workspace_id == ws_id).count() + 1;
             let chat_title = title
-                .filter(|t| !t.trim().is_empty())
+                .filter(|t| !t.trim().is_empty() && t.trim() != "New Chat")
                 .map(|t| t.trim().to_string())
                 .unwrap_or_else(|| {
                     if conv_mode == "quick" {
-                        "Quick Chat".to_string()
+                        format!("Quick Chat {}", count_in_ws)
                     } else {
-                        format!("Session {}", g.conversations.len() + 1)
+                        format!("Session {}", count_in_ws)
                     }
                 });
             g.conversations.insert(
@@ -944,6 +977,7 @@ impl HarnessManager {
             );
             g.active_conversation_id = id.clone();
         }
+        self.init_live_turn(&id);
         self.save_state();
         id
     }
@@ -1130,16 +1164,29 @@ impl HarnessManager {
         let ctx_tokens = model_context_window_tokens(model);
         // Reserve 20% headroom for system prompt, tool schemas, and output generation
         let usable_tokens = (ctx_tokens.saturating_mul(80)) / 100;
+
         let (stage1_threshold, stage2_threshold) = if usable_tokens <= 30_000 {
-            (40_000usize, 72_000usize)
+            (35_000usize, 65_000usize)
         } else if usable_tokens <= 60_000 {
-            (70_000usize, 115_000usize)
+            (65_000usize, 110_000usize)
         } else if usable_tokens <= 120_000 {
             (100_000usize, 160_000usize)
         } else if usable_tokens <= 250_000 {
-            (180_000usize, 320_000usize)
+            (160_000usize, 260_000usize)
         } else {
-            (600_000usize, 1_200_000usize)
+            (250_000usize, 450_000usize)
+        };
+
+        // Accurately measure total textual weight of each message across content, thinking, and tool outputs
+        let msg_weight = |m: &ChatMessage| -> usize {
+            let mut w = m.content.len();
+            if let Some(ref th) = m.thinking {
+                w += th.len();
+            }
+            for tc in &m.tool_calls {
+                w += tc.name.len() + tc.result.len();
+            }
+            w
         };
 
         // Pass 1: Deduplicate superseded `read_file` outputs with identical `[File: ...]` headers
@@ -1153,12 +1200,12 @@ impl HarnessManager {
                         latest_file_header_idx.insert(trimmed.to_string(), idx);
                     }
                 }
-                for tc in &m.tool_calls {
-                    for line in tc.result.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("[File: ") && trimmed.ends_with(']') {
-                            latest_file_header_idx.insert(trimmed.to_string(), idx);
-                        }
+            }
+            for tc in &m.tool_calls {
+                for line in tc.result.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("[File: ") && trimmed.ends_with(']') {
+                        latest_file_header_idx.insert(trimmed.to_string(), idx);
                     }
                 }
             }
@@ -1183,72 +1230,22 @@ impl HarnessManager {
                         }
                     }
                 }
-                for tc in &mut m.tool_calls {
-                    let mut tc_hdr = None;
-                    for line in tc.result.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("[File: ") && trimmed.ends_with(']') {
-                            tc_hdr = Some(trimmed.to_string());
-                            break;
-                        }
-                    }
-                    if let Some(hdr) = tc_hdr {
-                        if let Some(&latest_idx) = latest_file_header_idx.get(&hdr) {
-                            if idx < latest_idx && tc.result.len() > 240 {
-                                tc.result = format!(
-                                    "{}\n[Superseded read_file output — see newer read of this file in step #{}]",
-                                    hdr, latest_idx
-                                );
-                            }
-                        }
+            }
+            for tc in &mut m.tool_calls {
+                let mut tc_hdr = None;
+                for line in tc.result.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("[File: ") && trimmed.ends_with(']') {
+                        tc_hdr = Some(trimmed.to_string());
+                        break;
                     }
                 }
-            }
-        }
-
-        // Pass 2: Stage-1 head+tail pruning when total context exceeds `stage1_threshold`
-        let total_chars: usize = msgs.iter().map(|m| m.content.len()).sum();
-        if total_chars > stage1_threshold && msgs.len() > 4 {
-            let protect_from = msgs.len().saturating_sub(4);
-            for m in &mut msgs[..protect_from] {
-                if m.role == "tool" {
-                    if m.content.chars().count() > 5500 {
-                        let total_c = m.content.chars().count();
-                        let head: String = m.content.chars().take(4096).collect();
-                        let tail: String = m
-                            .content
-                            .chars()
-                            .rev()
-                            .take(1024)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-                        m.content = format!(
-                            "{}\n\n... [Stage-1 Intra-Turn Pruned {} chars (kept 4096 head + 1024 tail)] ...\n\n{}",
-                            head,
-                            total_c.saturating_sub(5120),
-                            tail
-                        );
-                    }
-                    for tc in &mut m.tool_calls {
-                        if tc.result.chars().count() > 5500 {
-                            let total_c = tc.result.chars().count();
-                            let head: String = tc.result.chars().take(4096).collect();
-                            let tail: String = tc
-                                .result
-                                .chars()
-                                .rev()
-                                .take(1024)
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .rev()
-                                .collect();
+                if let Some(hdr) = tc_hdr {
+                    if let Some(&latest_idx) = latest_file_header_idx.get(&hdr) {
+                        if idx < latest_idx && tc.result.len() > 240 {
                             tc.result = format!(
-                                "{}\n\n... [Stage-1 Intra-Turn Pruned {} chars (kept 4096 head + 1024 tail)] ...\n\n{}",
-                                head,
-                                total_c.saturating_sub(5120),
-                                tail
+                                "{}\n[Superseded read_file output — see newer read of this file in step #{}]",
+                                hdr, latest_idx
                             );
                         }
                     }
@@ -1256,17 +1253,69 @@ impl HarnessManager {
             }
         }
 
+        // Pass 2: Stage-1 head+tail pruning across both standalone tool messages and assistant tool calls
+        let total_chars: usize = msgs.iter().map(msg_weight).sum();
+        if total_chars > stage1_threshold && msgs.len() > 4 {
+            let protect_from = msgs.len().saturating_sub(4);
+            for m in &mut msgs[..protect_from] {
+                if m.role == "tool" && m.content.chars().count() > 3000 {
+                    let total_c = m.content.chars().count();
+                    let head: String = m.content.chars().take(2048).collect();
+                    let tail: String = m
+                        .content
+                        .chars()
+                        .rev()
+                        .take(512)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    m.content = format!(
+                        "{}\n\n... [Stage-1 Intra-Turn Pruned {} chars (kept head + tail)] ...\n\n{}",
+                        head,
+                        total_c.saturating_sub(2560),
+                        tail
+                    );
+                }
+                for tc in &mut m.tool_calls {
+                    if tc.result.chars().count() > 3000 {
+                        let total_c = tc.result.chars().count();
+                        let head: String = tc.result.chars().take(2048).collect();
+                        let tail: String = tc
+                            .result
+                            .chars()
+                            .rev()
+                            .take(512)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        tc.result = format!(
+                            "{}\n\n... [Stage-1 Intra-Turn Pruned {} chars (kept head + tail)] ...\n\n{}",
+                            head,
+                            total_c.saturating_sub(2560),
+                            tail
+                        );
+                    }
+                }
+            }
+        }
+
         // Pass 3: Stage-2 structural digest compaction when context still exceeds `stage2_threshold`
-        let post_stage1_chars: usize = msgs.iter().map(|m| m.content.len()).sum();
+        let post_stage1_chars: usize = msgs.iter().map(msg_weight).sum();
         let keep_tail = if usable_tokens >= 500_000 {
-            48
+            24
         } else if usable_tokens >= 100_000 {
-            32
-        } else {
             16
+        } else {
+            10
         };
         if post_stage1_chars > stage2_threshold && msgs.len() > keep_tail {
             msgs = Self::compact_messages(&msgs, keep_tail);
+        }
+        let post_stage2_chars: usize = msgs.iter().map(msg_weight).sum();
+        if post_stage2_chars > stage2_threshold && msgs.len() > 8 {
+            msgs = Self::compact_messages(&msgs, 8);
         }
 
         msgs
@@ -1782,11 +1831,16 @@ impl HarnessManager {
         task: &str,
         parent_conv_id: Option<&str>,
     ) -> Result<SubagentTurnResult, String> {
+        let target_conv_id = parent_conv_id
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.active_conversation_id());
         let mut settings = self.settings();
-        let ws_path = self.active_workspace_path();
+        let ws_path = self.workspace_path_for_conversation(&target_conv_id);
+        let conv_abort_flag = self.abort_flag_for_conversation(&target_conv_id);
         let workspace = Workspace::new(&ws_path).map_err(|e| e.to_string())?;
         let mut tool_engine =
-            ToolEngine::new(workspace).with_abort_flag(Arc::clone(&self.abort_flag));
+            ToolEngine::new(workspace).with_abort_flag(Arc::clone(&conv_abort_flag));
 
         let mut resolved_id = if subagent_id.trim().is_empty() {
             "sub-coder".to_string()
@@ -1798,11 +1852,6 @@ impl HarnessManager {
             "You are a specialized Unjess autonomous subagent operating in workspace {}. Use tools to inspect and complete your assigned task.",
             ws_path.display()
         );
-
-        let target_conv_id = parent_conv_id
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.active_conversation_id());
 
         if let Ok(mut g) = self.state.write() {
             if !g.subagents.iter().any(|s| {
@@ -1992,7 +2041,7 @@ impl HarnessManager {
                     let mut step_tools = Vec::new();
                     let mut stuck = false;
                     for (tc_id, tc_name, tc_args) in resp.pending_tool_calls {
-                        if self.abort_flag.load(Ordering::SeqCst) {
+                        if conv_abort_flag.load(Ordering::SeqCst) {
                             break;
                         }
                         if tc_name == "delegate_subagent" || tc_name == "delegate_parallel_subagents" {
@@ -2399,7 +2448,132 @@ impl HarnessManager {
         self.save_state();
     }
 
+    pub fn live_turn_for_conversation(&self, conv_id: &str) -> Option<LiveTurnSnapshot> {
+        self.live_turns
+            .read()
+            .ok()
+            .and_then(|map| map.get(conv_id).cloned())
+            .map(|mut snap| {
+                if snap.running && snap.started_at > 0.0 {
+                    snap.elapsed_s = (Self::now_epoch_secs() - snap.started_at).max(0.0);
+                }
+                snap
+            })
+    }
+
+    pub fn is_conversation_running(&self, conv_id: &str) -> bool {
+        self.live_turns
+            .read()
+            .ok()
+            .and_then(|map| map.get(conv_id).map(|s| s.running))
+            .unwrap_or(false)
+    }
+
+    pub fn running_conversations_count(&self) -> usize {
+        self.live_turns
+            .read()
+            .ok()
+            .map(|map| map.values().filter(|s| s.running).count())
+            .unwrap_or(0)
+    }
+
+    pub fn abort_flag_for_conversation(&self, conv_id: &str) -> Arc<AtomicBool> {
+        if let Ok(mut flags) = self.abort_flags.write() {
+            flags
+                .entry(conv_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        } else {
+            Arc::new(AtomicBool::new(false))
+        }
+    }
+
+    pub fn abort_conversation(&self, conv_id: &str) {
+        if let Ok(flags) = self.abort_flags.read() {
+            if let Some(flag) = flags.get(conv_id) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+        self.update_live_turn(conv_id, |live| {
+            live.running = false;
+            live.current_step = "Aborted by user".to_string();
+        });
+        if self.active_conversation_id() == conv_id {
+            self.abort_flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn init_live_turn(&self, conv_id: &str) {
+        let flag = self.abort_flag_for_conversation(conv_id);
+        flag.store(false, Ordering::SeqCst);
+
+        let snap = LiveTurnSnapshot {
+            running: true,
+            conv_id: conv_id.to_string(),
+            current_step: "Initializing autonomous reasoning turn...".to_string(),
+            thinking: String::new(),
+            streaming_text: String::new(),
+            tool_calls: Vec::new(),
+            diffs: Vec::new(),
+            iteration: 1,
+            started_at: Self::now_epoch_secs(),
+            elapsed_s: 0.0,
+            tokens: 0,
+            cost_usd: 0.0,
+        };
+        if let Ok(mut map) = self.live_turns.write() {
+            map.insert(conv_id.to_string(), snap.clone());
+        }
+        if self.active_conversation_id() == conv_id {
+            self.abort_flag.store(false, Ordering::SeqCst);
+            if let Ok(mut live) = self.live_turn.write() {
+                *live = snap;
+            }
+        }
+    }
+
+    pub fn update_live_turn<F>(&self, conv_id: &str, f: F)
+    where
+        F: FnOnce(&mut LiveTurnSnapshot),
+    {
+        let mut updated_snap: Option<LiveTurnSnapshot> = None;
+        if let Ok(mut map) = self.live_turns.write() {
+            let snap = map
+                .entry(conv_id.to_string())
+                .or_insert_with(|| LiveTurnSnapshot {
+                    conv_id: conv_id.to_string(),
+                    ..Default::default()
+                });
+            f(snap);
+            if snap.running && snap.started_at > 0.0 {
+                snap.elapsed_s = (Self::now_epoch_secs() - snap.started_at).max(0.0);
+            }
+            updated_snap = Some(snap.clone());
+        }
+        if self.active_conversation_id() == conv_id {
+            if let Some(snap) = updated_snap {
+                if let Ok(mut live) = self.live_turn.write() {
+                    *live = snap;
+                }
+            }
+        }
+    }
+
+    pub fn finish_live_turn(&self, conv_id: &str) {
+        self.update_live_turn(conv_id, |live| {
+            if live.started_at > 0.0 {
+                live.elapsed_s = (Self::now_epoch_secs() - live.started_at).max(0.0);
+            }
+            live.running = false;
+            live.current_step = "Ready".to_string();
+        });
+    }
+
     pub fn live_turn_snapshot(&self) -> LiveTurnSnapshot {
+        let active_id = self.active_conversation_id();
+        if let Some(snap) = self.live_turn_for_conversation(&active_id) {
+            return snap;
+        }
         self.live_turn
             .read()
             .map(|l| {
@@ -2413,11 +2587,8 @@ impl HarnessManager {
     }
 
     pub fn abort_turn(&self) {
-        self.abort_flag.store(true, Ordering::SeqCst);
-        if let Ok(mut live) = self.live_turn.write() {
-            live.running = false;
-            live.current_step = "Aborted by user".to_string();
-        }
+        let active_id = self.active_conversation_id();
+        self.abort_conversation(&active_id);
     }
 
     pub fn revert_diff(&self, diff: &FileDiff) -> Result<(), String> {
@@ -2802,19 +2973,25 @@ impl HarnessManager {
     }
 
     /// Appends the user prompt to the active conversation and spawns the multi-step
-    /// autonomous agent tool-execution loop on Tokio, updating `live_turn` in real time.
+    /// autonomous agent tool-execution loop on Tokio, updating `live_turns` in real time.
     pub fn submit_prompt(self: &Arc<Self>, prompt: String) {
+        let conv_id = self.active_conversation_id();
+        self.submit_prompt_to_conversation(&conv_id, prompt);
+    }
+
+    /// Appends the user prompt to the specified conversation and spawns the multi-step
+    /// autonomous agent tool-execution loop on Tokio, updating `live_turns` in real time.
+    pub fn submit_prompt_to_conversation(self: &Arc<Self>, conv_id: &str, prompt: String) {
         let trimmed = prompt.trim().to_string();
         if trimmed.is_empty() {
             return;
         }
 
-        let conv_id = self.active_conversation_id();
-        let Some(effective_prompt) = self.try_handle_slash_command(&conv_id, &trimmed) else {
+        let Some(effective_prompt) = self.try_handle_slash_command(conv_id, &trimmed) else {
             return;
         };
 
-        self.abort_flag.store(false, Ordering::SeqCst);
+        self.init_live_turn(conv_id);
         let now_ts = Utc::now().format("%H:%M:%S").to_string();
         let est_in = (effective_prompt.len() / 4).max(1);
 
@@ -2823,7 +3000,9 @@ impl HarnessManager {
                 if conv.messages.is_empty()
                     && (conv.title == "Main Engineering Session"
                         || conv.title.starts_with("Session")
-                        || conv.title == "Quick Chat")
+                        || conv.title == "Quick Chat"
+                        || conv.title == "New Chat"
+                        || conv.title.starts_with("New Chat"))
                 {
                     let short: String = effective_prompt.chars().take(42).collect();
                     conv.title = short;
@@ -2847,31 +3026,15 @@ impl HarnessManager {
         }
         self.save_state();
 
-        if let Ok(mut live) = self.live_turn.write() {
-            *live = LiveTurnSnapshot {
-                running: true,
-                conv_id: conv_id.clone(),
-                current_step: "Initializing autonomous reasoning turn...".to_string(),
-                thinking: String::new(),
-                streaming_text: String::new(),
-                tool_calls: Vec::new(),
-                diffs: Vec::new(),
-                iteration: 1,
-                started_at: Self::now_epoch_secs(),
-                elapsed_s: 0.0,
-                tokens: 0,
-                cost_usd: 0.0,
-            };
-        }
-
+        let cid = conv_id.to_string();
         let mgr = Arc::clone(self);
         tokio::spawn(async move {
-            mgr.run_autonomous_loop(&conv_id).await;
+            mgr.run_autonomous_loop(&cid).await;
         });
     }
 
     /// Appends the user prompt and awaits the multi-turn autonomous agent loop completion,
-    /// returning the updated `Conversation` while updating `live_turn` in real time.
+    /// returning the updated `Conversation` while updating `live_turns` in real time.
     pub async fn execute_prompt_turn(
         self: &Arc<Self>,
         conv_id_opt: Option<&str>,
@@ -2890,7 +3053,7 @@ impl HarnessManager {
             return self.active_conversation();
         };
 
-        self.abort_flag.store(false, Ordering::SeqCst);
+        self.init_live_turn(&conv_id);
         let now_ts = Utc::now().format("%H:%M:%S").to_string();
         let est_in = (effective_prompt.len() / 4).max(1);
 
@@ -2899,7 +3062,9 @@ impl HarnessManager {
                 if conv.messages.is_empty()
                     && (conv.title == "Main Engineering Session"
                         || conv.title.starts_with("Session")
-                        || conv.title == "Quick Chat")
+                        || conv.title == "Quick Chat"
+                        || conv.title == "New Chat"
+                        || conv.title.starts_with("New Chat"))
                 {
                     let short: String = effective_prompt.chars().take(42).collect();
                     conv.title = short;
@@ -2923,30 +3088,13 @@ impl HarnessManager {
         }
         self.save_state();
 
-        if let Ok(mut live) = self.live_turn.write() {
-            *live = LiveTurnSnapshot {
-                running: true,
-                conv_id: conv_id.clone(),
-                current_step: "Initializing autonomous reasoning turn...".to_string(),
-                thinking: String::new(),
-                streaming_text: String::new(),
-                tool_calls: Vec::new(),
-                diffs: Vec::new(),
-                iteration: 1,
-                started_at: Self::now_epoch_secs(),
-                elapsed_s: 0.0,
-                tokens: 0,
-                cost_usd: 0.0,
-            };
-        }
-
         self.run_autonomous_loop(&conv_id).await;
         self.conversation_by_id(&conv_id)
     }
 
     async fn run_autonomous_loop(&self, conv_id: &str) {
         let mut settings = self.settings();
-        let ws_path = self.active_workspace_path();
+        let ws_path = self.workspace_path_for_conversation(conv_id);
         let workspace = Workspace::new(&ws_path).unwrap_or_else(|_| {
             Workspace::new(".").expect("Fallback workspace must resolve")
         });
@@ -2959,8 +3107,9 @@ impl HarnessManager {
                 }
             }
         }
+        let conv_abort_flag = self.abort_flag_for_conversation(conv_id);
         let mut tool_engine =
-            ToolEngine::new(workspace).with_abort_flag(Arc::clone(&self.abort_flag));
+            ToolEngine::new(workspace).with_abort_flag(Arc::clone(&conv_abort_flag));
 
         let max_iters = settings.max_iterations.clamp(1, 2000);
         let enable_tools = self.agent_mode() != "Plan";
@@ -3003,7 +3152,7 @@ impl HarnessManager {
         let mut system_prompt_dirty = false;
 
         for iter in 1..=max_iters {
-            if self.abort_flag.load(Ordering::SeqCst) {
+            if conv_abort_flag.load(Ordering::SeqCst) {
                 final_text = "*[Turn aborted by user]*".to_string();
                 break;
             }
@@ -3024,6 +3173,13 @@ impl HarnessManager {
             if settings.enable_compaction {
                 working_history =
                     Self::compact_messages_for_model(&working_history, &settings.model);
+            } else {
+                let ctx_tokens = crate::llm::model_context_window_tokens(&settings.model);
+                let est_tokens = crate::llm::estimate_prompt_tokens(&system_prompt, &working_history);
+                if est_tokens > (ctx_tokens * 7) / 10 {
+                    working_history =
+                        Self::compact_messages_for_model(&working_history, &settings.model);
+                }
             }
 
             // Multimodal request body safety: prune older base64 image strings across turns
@@ -3034,7 +3190,7 @@ impl HarnessManager {
                 system_prompt_dirty = false;
             }
 
-            if let Ok(mut live) = self.live_turn.write() {
+            self.update_live_turn(conv_id, |live| {
                 live.iteration = iter;
                 live.tokens = total_turn_tokens;
                 live.cost_usd = total_turn_cost;
@@ -3042,7 +3198,7 @@ impl HarnessManager {
                     "Calling {} (step {}/{})...",
                     settings.model, iter, max_iters
                 );
-            }
+            });
 
             // Call primary model, with automatic fallback to `settings.fallback_models` if configured
             let mut turn_result =
@@ -3097,12 +3253,12 @@ impl HarnessManager {
                         final_text = resp.content.trim().to_string();
                     }
 
-                    if let Ok(mut live) = self.live_turn.write() {
+                    self.update_live_turn(conv_id, |live| {
                         live.thinking = collected_thinking.clone();
                         live.streaming_text = Self::clean_sentinel_tags(&final_text);
                         live.tokens = total_turn_tokens;
                         live.cost_usd = total_turn_cost;
-                    }
+                    });
 
                     if resp.pending_tool_calls.is_empty() {
                         let lower_resp = resp.content.to_lowercase();
@@ -3450,7 +3606,7 @@ impl HarnessManager {
                     let mut step_tools: Vec<ToolCallRecord> = Vec::new();
 
                     for (tc_id, tc_name, tc_args) in resp.pending_tool_calls {
-                        if self.abort_flag.load(Ordering::SeqCst) {
+                        if conv_abort_flag.load(Ordering::SeqCst) {
                             break;
                         }
 
@@ -3509,9 +3665,9 @@ impl HarnessManager {
                             }
                         }
 
-                        if let Ok(mut live) = self.live_turn.write() {
+                        self.update_live_turn(conv_id, |live| {
                             live.current_step = format!("Executing tool `{}`...", tc_name);
-                        }
+                        });
 
                         if matches!(
                             tc_name.as_str(),
@@ -3769,12 +3925,12 @@ impl HarnessManager {
                             collected_diffs.push(d);
                         }
 
-                        if let Ok(mut live) = self.live_turn.write() {
+                        self.update_live_turn(conv_id, |live| {
                             live.tool_calls = collected_tools.clone();
                             live.diffs = collected_diffs.clone();
                             live.tokens = total_turn_tokens;
                             live.cost_usd = total_turn_cost;
-                        }
+                        });
 
                         tool_results_summary.push(format!(
                             "[Tool `{}` result]:\n{}",
@@ -3936,13 +4092,7 @@ impl HarnessManager {
         }
         self.save_state();
 
-        if let Ok(mut live) = self.live_turn.write() {
-            if live.started_at > 0.0 {
-                live.elapsed_s = (Self::now_epoch_secs() - live.started_at).max(0.0);
-            }
-            live.running = false;
-            live.current_step = "Ready".to_string();
-        }
+        self.finish_live_turn(conv_id);
     }
 
     pub fn build_system_prompt(&self, ws_path: &std::path::Path) -> String {
@@ -4372,5 +4522,136 @@ mod tests {
         );
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].1, "read_file");
+    }
+
+    #[test]
+    fn test_multi_conversation_concurrency_and_abort_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("UNJESS_RUST_CONFIG_DIR", tmp.path());
+            std::env::set_var("UNJESS_SKIP_LOCAL_PROBE", "1");
+        }
+        let hm = HarnessManager::new();
+
+        let conv1 = hm.new_conversation(Some("Task A"));
+        let conv2 = hm.new_conversation(Some("Task B"));
+
+        // Both conversations start live turns concurrently
+        hm.init_live_turn(&conv1);
+        hm.init_live_turn(&conv2);
+
+        assert!(hm.is_conversation_running(&conv1));
+        assert!(hm.is_conversation_running(&conv2));
+        assert_eq!(hm.running_conversations_count(), 2);
+
+        let flag1 = hm.abort_flag_for_conversation(&conv1);
+        let flag2 = hm.abort_flag_for_conversation(&conv2);
+        assert!(!flag1.load(Ordering::SeqCst));
+        assert!(!flag2.load(Ordering::SeqCst));
+
+        // Abort conversation 1: conversation 2 MUST NOT be affected!
+        hm.abort_conversation(&conv1);
+
+        assert!(!hm.is_conversation_running(&conv1));
+        assert!(hm.is_conversation_running(&conv2), "Conv 2 must continue running independently!");
+        assert_eq!(hm.running_conversations_count(), 1);
+
+        assert!(flag1.load(Ordering::SeqCst));
+        assert!(!flag2.load(Ordering::SeqCst), "Conv 2 abort flag must remain false!");
+
+        // Finish conversation 2
+        hm.finish_live_turn(&conv2);
+        assert!(!hm.is_conversation_running(&conv2));
+        assert_eq!(hm.running_conversations_count(), 0);
+    }
+
+    #[test]
+    fn test_massive_tool_results_compaction_prevents_overflow() {
+        let mut msgs = Vec::new();
+        msgs.push(ChatMessage {
+            role: "user".to_string(),
+            content: "Initial task prompt".to_string(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            diffs: Vec::new(),
+            images: Vec::new(),
+            timestamp: "10:00:00".to_string(),
+            model: None,
+            tokens: 10,
+            input_tokens: 10,
+            output_tokens: 0,
+            cost_usd: 0.0,
+        });
+
+        // Add 20 assistant messages with large tool outputs (over 600,000 characters total)
+        for i in 1..=20 {
+            let tc = ToolCallRecord {
+                id: format!("call_{}", i),
+                name: "fetch_markdown".to_string(),
+                arguments: serde_json::json!({ "url": format!("https://example.com/page_{}", i) }),
+                result: "A".repeat(30_000), // 30KB per call * 20 = 600KB
+                status: "ok".to_string(),
+                duration_ms: 10,
+            };
+            msgs.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: format!("Step {} complete", i),
+                thinking: Some("Reasoning thought".repeat(500)),
+                tool_calls: vec![tc],
+                diffs: Vec::new(),
+                images: Vec::new(),
+                timestamp: "10:00:01".to_string(),
+                model: Some("deepseek-v4.1-flash:cloud".to_string()),
+                tokens: 100,
+                input_tokens: 50,
+                output_tokens: 50,
+                cost_usd: 0.001,
+            });
+        }
+
+        // Add a recent user question
+        msgs.push(ChatMessage {
+            role: "user".to_string(),
+            content: "now answer honestly how far is the game from being done".to_string(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            diffs: Vec::new(),
+            images: Vec::new(),
+            timestamp: "10:05:00".to_string(),
+            model: None,
+            tokens: 20,
+            input_tokens: 20,
+            output_tokens: 0,
+            cost_usd: 0.0,
+        });
+
+        let compacted = HarnessManager::compact_messages_for_model(&msgs, "deepseek-v4.1-flash:cloud");
+
+        // Verify total characters across compacted messages is well under 450,000 chars
+        let total_chars: usize = compacted
+            .iter()
+            .map(|m| {
+                let mut sum = m.content.len();
+                if let Some(ref t) = m.thinking {
+                    sum += t.len();
+                }
+                for tc in &m.tool_calls {
+                    sum += tc.name.len() + tc.result.len();
+                }
+                sum
+            })
+            .sum();
+
+        assert!(
+            total_chars < 450_000,
+            "Compacted context ({} chars) must not exceed 450k chars!",
+            total_chars
+        );
+        // Verify root user prompt and recent user question are preserved
+        assert_eq!(compacted.first().unwrap().content, "Initial task prompt");
+        assert_eq!(
+            compacted.last().unwrap().content,
+            "now answer honestly how far is the game from being done"
+        );
     }
 }
