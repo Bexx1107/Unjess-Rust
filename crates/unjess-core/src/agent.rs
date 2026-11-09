@@ -1125,7 +1125,8 @@ impl HarnessManager {
     /// (e.g. 32K local GGUF vs. 128K/200K/1M cloud models) and prunes both `m.content` and
     /// structured `m.tool_calls` outputs for native multi-turn tool replay.
     pub fn compact_messages_for_model(messages: &[ChatMessage], model: &str) -> Vec<ChatMessage> {
-        let mut msgs = messages.to_vec();
+        // Multi-turn vision safety: prune historical base64 images so request body stays well under HTTP limits
+        let mut msgs = crate::llm::filter_active_vision_images(messages, 2);
         let ctx_tokens = model_context_window_tokens(model);
         // Reserve 20% headroom for system prompt, tool schemas, and output generation
         let usable_tokens = (ctx_tokens.saturating_mul(80)) / 100;
@@ -3024,6 +3025,9 @@ impl HarnessManager {
                 working_history =
                     Self::compact_messages_for_model(&working_history, &settings.model);
             }
+
+            // Multimodal request body safety: prune older base64 image strings across turns
+            working_history = crate::llm::filter_active_vision_images(&working_history, 2);
 
             if system_prompt_dirty {
                 system_prompt = self.build_system_prompt_for_query(&ws_path, &latest_user_query);

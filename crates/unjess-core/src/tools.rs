@@ -288,6 +288,73 @@ impl ToolEngine {
         out
     }
 
+    /// Optimizes and downscales an image buffer for multimodal LLM vision consumption.
+    /// Resizes if dimensions exceed 1568px, and compresses to efficient JPEG (or PNG if has alpha channel)
+    /// to prevent huge Base64 strings from blowing Ollama/OpenAI/Claude HTTP payload limits.
+    /// If image cannot be decoded (e.g. mock test bytes or unsupported format), falls back to raw bytes.
+    pub fn optimize_image_for_vision(raw_bytes: &[u8], original_ext: &str) -> (Vec<u8>, String) {
+        let default_mime = match original_ext.to_lowercase().as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            _ => "image/png",
+        };
+
+        // Try decoding with the image crate
+        let img = match image::load_from_memory(raw_bytes) {
+            Ok(img) => img,
+            Err(_) => {
+                // If decoding fails (e.g. mock test bytes), fallback to raw bytes directly
+                return (raw_bytes.to_vec(), default_mime.to_string());
+            }
+        };
+
+        let (width, height) = (img.width(), img.height());
+        const MAX_DIMENSION: u32 = 1568;
+
+        let resized_img = if width > MAX_DIMENSION || height > MAX_DIMENSION {
+            img.resize(MAX_DIMENSION, MAX_DIMENSION, image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
+
+        let mut output_bytes = Vec::new();
+        let mime;
+
+        let has_alpha = resized_img.color().has_alpha();
+        let use_png = has_alpha && original_ext.eq_ignore_ascii_case("png");
+
+        if use_png {
+            mime = "image/png".to_string();
+            let mut cursor = std::io::Cursor::new(&mut output_bytes);
+            if resized_img.write_to(&mut cursor, image::ImageFormat::Png).is_err() {
+                return (raw_bytes.to_vec(), default_mime.to_string());
+            }
+        } else {
+            mime = "image/jpeg".to_string();
+            let rgb_img = resized_img.to_rgb8();
+            let mut cursor = std::io::Cursor::new(&mut output_bytes);
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 82);
+            if encoder.encode(
+                rgb_img.as_raw(),
+                rgb_img.width(),
+                rgb_img.height(),
+                image::ExtendedColorType::Rgb8,
+            ).is_err() {
+                return (raw_bytes.to_vec(), default_mime.to_string());
+            }
+        }
+
+        if !output_bytes.is_empty() && output_bytes.len() < raw_bytes.len() {
+            (output_bytes, mime)
+        } else if !output_bytes.is_empty() && (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+            (output_bytes, mime)
+        } else {
+            (raw_bytes.to_vec(), default_mime.to_string())
+        }
+    }
+
     /// Loads an image file from disk, base64 encodes it, queues it for multimodal vision input,
     /// and returns a descriptive summary.
     pub fn view_image(&self, rel_path: &str) -> Result<String, ToolError> {
@@ -304,22 +371,23 @@ impl ToolEngine {
             .and_then(|s| s.to_str())
             .unwrap_or("png")
             .to_lowercase();
-        let mime = match ext.as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "webp" => "image/webp",
-            "gif" => "image/gif",
-            "bmp" => "image/bmp",
-            _ => "image/png",
-        };
-        let b64 = Self::base64_encode(&bytes);
+        let (opt_bytes, mime) = Self::optimize_image_for_vision(&bytes, &ext);
+        let b64 = Self::base64_encode(&opt_bytes);
         self.queue_vision_image(b64);
-        let size_kb = bytes.len() / 1024;
+        let orig_kb = bytes.len() / 1024;
+        let opt_kb = opt_bytes.len() / 1024;
         let norm_path = rel_path.replace('\\', "/");
-        Ok(format!(
-            "Image file loaded and attached to your Vision input ({}, {} KB): {} — you can now see and inspect this image directly.",
-            mime, size_kb, norm_path
-        ))
+        if opt_kb < orig_kb {
+            Ok(format!(
+                "Image file loaded and attached to your Vision input ({}, {} KB, optimized from {} KB): {} — you can now see and inspect this image directly.",
+                mime, opt_kb, orig_kb, norm_path
+            ))
+        } else {
+            Ok(format!(
+                "Image file loaded and attached to your Vision input ({}, {} KB): {} — you can now see and inspect this image directly.",
+                mime, opt_kb, norm_path
+            ))
+        }
     }
 
     /// Checks whether `candidate_path` matches any protected path constraint.
@@ -5203,5 +5271,33 @@ mod tests {
         assert!(out2.contains("Image file loaded and attached to your Vision input"));
         let drained2 = engine.drain_vision_images();
         assert_eq!(drained2.len(), 1);
+    }
+
+    #[test]
+    fn test_optimize_image_for_vision_downscales_large_image() {
+        // Create an uncompressed 2000x2000 image in memory
+        let img = image::RgbImage::from_fn(2000, 2000, |x, y| {
+            image::Rgb([(x % 255) as u8, (y % 255) as u8, ((x + y) % 255) as u8])
+        });
+        let mut raw_png = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut raw_png);
+        img.write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+        assert!(!raw_png.is_empty());
+
+        let (optimized_bytes, mime) = ToolEngine::optimize_image_for_vision(&raw_png, "png");
+        assert_eq!(mime, "image/jpeg");
+        // Verify output is significantly smaller than raw high-res image
+        assert!(optimized_bytes.len() < raw_png.len());
+
+        // Verify decoded dimensions are <= 1568px
+        let decoded = image::load_from_memory(&optimized_bytes).unwrap();
+        assert!(decoded.width() <= 1568);
+        assert!(decoded.height() <= 1568);
+
+        // Verify that invalid/mock bytes safely return raw bytes without panicking
+        let mock_bytes = b"not_a_real_image_data";
+        let (fallback_bytes, fallback_mime) = ToolEngine::optimize_image_for_vision(mock_bytes, "png");
+        assert_eq!(fallback_bytes, mock_bytes);
+        assert_eq!(fallback_mime, "image/png");
     }
 }

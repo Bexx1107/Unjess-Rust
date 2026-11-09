@@ -336,6 +336,34 @@ pub fn model_context_window_tokens(model: &str) -> usize {
     }
 }
 
+/// Prunes older base64 vision images across conversation messages so that only the most recent
+/// `max_active_images` images (default 2) retain their raw Base64 payload.
+/// This prevents multi-step agent loops (e.g. 40+ turns) from accumulating tens of megabytes
+/// of image data that trigger HTTP 400 "request body too large" errors from Ollama, OpenAI, or Claude.
+pub fn filter_active_vision_images(history: &[ChatMessage], max_active_images: usize) -> Vec<ChatMessage> {
+    let mut cloned = history.to_vec();
+    let mut remaining_images = max_active_images;
+    for m in cloned.iter_mut().rev() {
+        if m.images.is_empty() {
+            continue;
+        }
+        if remaining_images >= m.images.len() {
+            remaining_images -= m.images.len();
+        } else if remaining_images > 0 {
+            let keep_count = remaining_images;
+            let start = m.images.len().saturating_sub(keep_count);
+            m.images = m.images[start..].to_vec();
+            remaining_images = 0;
+        } else {
+            m.images.clear();
+            if !m.content.contains("[Image payload pruned") {
+                m.content.push_str(" [Image payload pruned from turn history to conserve context/request body budget]");
+            }
+        }
+    }
+    cloned
+}
+
 /// Serializes conversation history for OpenAI-compatible endpoints (`/v1/chat/completions`),
 /// preserving structured `tool_calls`, `reasoning_content`, and paired `role: "tool"` (`tool_call_id`)
 /// messages across multi-step reasoning turns.
@@ -343,6 +371,8 @@ pub fn serialize_openai_messages(
     system_prompt: &str,
     history: &[ChatMessage],
 ) -> Vec<serde_json::Value> {
+    let filtered_history = filter_active_vision_images(history, 2);
+    let history = &filtered_history;
     let mut messages = vec![serde_json::json!({
         "role": "system",
         "content": system_prompt
@@ -473,6 +503,8 @@ pub fn serialize_ollama_messages(
     system_prompt: &str,
     history: &[ChatMessage],
 ) -> Vec<serde_json::Value> {
+    let filtered_history = filter_active_vision_images(history, 2);
+    let history = &filtered_history;
     let mut messages = vec![serde_json::json!({
         "role": "system",
         "content": system_prompt
@@ -994,6 +1026,9 @@ async fn call_anthropic(
         .get_api_key("anthropic")
         .ok_or_else(|| "Missing Anthropic API key in Settings -> Cloud Providers".to_string())?;
 
+    let filtered_history = filter_active_vision_images(history, 2);
+    let history = &filtered_history;
+
     // Coalesce consecutive messages of the same role so Anthropic's strict alternating role validator never rejects
     let mut messages: Vec<serde_json::Value> = Vec::new();
     for m in history {
@@ -1216,6 +1251,9 @@ async fn call_gemini(
         .ok_or_else(|| "Missing Google Gemini API key in Settings -> Cloud Providers".to_string())?;
 
     let api_model = model.trim().trim_start_matches("models/");
+
+    let filtered_history = filter_active_vision_images(history, 2);
+    let history = &filtered_history;
 
     let mut contents: Vec<serde_json::Value> = Vec::new();
     for m in history {
@@ -1677,5 +1715,48 @@ mod tests {
         assert_eq!(openai_multi[3]["content"], "1: fn main() {}");
         assert_eq!(openai_multi[4]["role"], "user");
         assert_eq!(openai_multi[4]["content"], "generate shot 4");
+    }
+    #[test]
+    fn test_filter_active_vision_images_prunes_older_payloads() {
+        let mut history = Vec::new();
+        // Create 5 user messages each with an image payload
+        for i in 1..=5 {
+            history.push(ChatMessage {
+                role: "user".to_string(),
+                content: format!("Step {} inspection", i),
+                thinking: None,
+                tool_calls: Vec::new(),
+                diffs: Vec::new(),
+                images: vec![format!("base64_data_for_image_{}", i)],
+                timestamp: format!("12:00:0{}", i),
+                model: None,
+                tokens: 10,
+                input_tokens: 10,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            });
+        }
+
+        let filtered = filter_active_vision_images(&history, 2);
+        assert_eq!(filtered.len(), 5);
+
+        // Steps 1, 2, 3 should have empty images and pruned content note
+        assert!(filtered[0].images.is_empty());
+        assert!(filtered[0].content.contains("pruned"));
+        assert!(filtered[1].images.is_empty());
+        assert!(filtered[2].images.is_empty());
+
+        // Steps 4 and 5 (the 2 most recent) should retain their image payloads
+        assert_eq!(filtered[3].images, vec!["base64_data_for_image_4".to_string()]);
+        assert_eq!(filtered[4].images, vec!["base64_data_for_image_5".to_string()]);
+
+        // When serialized for Ollama, only steps 4 and 5 should have "images" in JSON
+        let ollama_json = serialize_ollama_messages("sys", &history);
+        // ollama_json[0] is sys, [1..=3] are steps 1..=3, [4..=5] are steps 4..=5
+        assert!(ollama_json[1].get("images").is_none());
+        assert!(ollama_json[2].get("images").is_none());
+        assert!(ollama_json[3].get("images").is_none());
+        assert!(ollama_json[4].get("images").is_some());
+        assert!(ollama_json[5].get("images").is_some());
     }
 }

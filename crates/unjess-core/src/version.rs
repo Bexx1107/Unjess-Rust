@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.1.0";
+pub const CURRENT_VERSION: &str = "4.1.1";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,22 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.1.1".to_string(),
+            date: "2026-11-09".to_string(),
+            title: "Unjess 4.1.1 — Multimodal Image Downscaling, Compression & Historical Turn Pruning".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Eliminated Ollama HTTP 400 'request body too large' error during long multi-step vision workflows by auto-downscaling large images to 1568px and re-encoding as compressed JPEG/PNG.".to_string(),
+                "Added active vision windowing (`filter_active_vision_images`): only the 2 most recent vision images retain raw Base64 strings, safely pruning multi-megabyte payloads from earlier turns.".to_string(),
+                "Applied vision payload pruning across all providers: Ollama (/api/chat), OpenAI (/v1/chat/completions), Anthropic, and Gemini.".to_string(),
+                "Integrated image retention compaction directly into the agent execution loop and `compact_messages_for_model`.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.1.0".to_string(),
             date: "2026-11-09".to_string(),
             title: "Unjess 4.1.0 — Multi-Turn Tool History Integrity & Autonomous Action Enforcement".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Fixed multi-turn tool history serialization in Ollama and OpenAI providers so historical tool calls & results are preserved across subsequent turns without amnesia.".to_string(),
                 "Added Autonomous Action Directive in `agent.rs`: prevents the model from prematurely exiting the loop by asking hesitant questions when the user gave an explicit command (e.g. generate, fix, run, build).".to_string(),
@@ -187,9 +199,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.1.0");
+        assert_eq!(CURRENT_VERSION, "4.1.1");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.1.0");
+        assert_eq!(log[0].version, "4.1.1");
     }
 }
