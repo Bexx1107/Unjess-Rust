@@ -17,7 +17,7 @@ fn install_dir() -> PathBuf {
     }
 }
 
-fn stop_running_processes() {
+fn stop_running_processes(target_dir: &Path) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -27,8 +27,63 @@ fn stop_running_processes() {
                 .creation_flags(0x08000000)
                 .status();
         }
-        std::thread::sleep(std::time::Duration::from_millis(350));
+
+        // Wait up to 5 seconds for target executables to be fully unlocked by Windows
+        let exes = ["Unjess.exe", "unjessd.exe", "unjess-cli.exe"];
+        for _ in 0..25 {
+            let mut all_unlocked = true;
+            for name in &exes {
+                let p = target_dir.join(name);
+                if p.exists() {
+                    match fs::OpenOptions::new().write(true).open(&p) {
+                        Ok(_) => {},
+                        Err(_) => {
+                            all_unlocked = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if all_unlocked {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
+}
+
+fn safe_write_or_copy(src: Option<&Path>, bytes: Option<&[u8]>, dst: &Path) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // If dst exists and is locked, try renaming to .old first
+    let old_backup = dst.with_extension("old");
+    let _ = fs::remove_file(&old_backup);
+    if dst.exists() {
+        let _ = fs::rename(dst, &old_backup);
+    }
+
+    let mut last_err = None;
+    for _ in 0..10 {
+        let res = if let Some(s) = src {
+            fs::copy(s, dst).map(|_| ()).map_err(|e| e.to_string())
+        } else if let Some(b) = bytes {
+            fs::write(dst, b).map_err(|e| e.to_string())
+        } else {
+            return Err("No source or bytes provided".to_string());
+        };
+        match res {
+            Ok(_) => {
+                let _ = fs::remove_file(&old_backup);
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "Unknown error".to_string()))
 }
 
 fn escape_ps_single_quotes(s: &str) -> String {
@@ -60,16 +115,35 @@ fn create_shortcut(shortcut_path: &Path, target_exe: &Path, working_dir: &Path) 
 fn download_file(url: &str, dst: &Path) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
-        .user_agent("Unjess-Installer/4.0.1")
+        .user_agent("Unjess-Installer/4.1.0")
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+
+    let mut last_err = None;
+    for _attempt in 0..3 {
+        let resp = match client.get(url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(e.to_string());
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = Some(format!("HTTP {}", resp.status()));
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+        let bytes = match resp.bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                last_err = Some(e.to_string());
+                continue;
+            }
+        };
+        return safe_write_or_copy(None, Some(&bytes), dst);
     }
-    let bytes = resp.bytes().map_err(|e| e.to_string())?;
-    fs::write(dst, &bytes).map_err(|e| e.to_string())?;
-    Ok(())
+    Err(last_err.unwrap_or_else(|| "Failed after 3 attempts".to_string()))
 }
 
 fn main() {
@@ -80,9 +154,8 @@ fn main() {
     );
     println!("====================================================");
 
-    stop_running_processes();
-
     let target_dir = install_dir();
+    stop_running_processes(&target_dir);
     if let Err(e) = fs::create_dir_all(&target_dir) {
         eprintln!(
             "[!] Failed to create install directory {}: {}",
@@ -132,7 +205,7 @@ fn main() {
         }
 
         if let Some(src) = found_src {
-            match fs::copy(&src, &dst) {
+            match safe_write_or_copy(Some(&src), None, &dst) {
                 Ok(_) => {
                     installed_count += 1;
                     println!("[+] Installed {} -> {}", bin_name, dst.display());
@@ -270,9 +343,19 @@ fn main() {
 
     if !env::args().any(|a| a == "--no-launch") {
         println!("[+] Spawning Unjess GUI...");
-        let _ = Command::new(&desktop_exe)
+        match Command::new(&desktop_exe)
             .current_dir(&target_dir)
-            .spawn();
-        std::thread::sleep(std::time::Duration::from_millis(800));
+            .spawn()
+        {
+            Ok(child) => {
+                println!("[+] Unjess GUI successfully launched (PID: {})", child.id());
+                std::thread::sleep(std::time::Duration::from_millis(800));
+            }
+            Err(e) => {
+                eprintln!("[!] Warning: Could not auto-launch Unjess GUI: {}", e);
+                println!("    Please launch Unjess from your Desktop shortcut or: {}", desktop_exe.display());
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+        }
     }
 }
