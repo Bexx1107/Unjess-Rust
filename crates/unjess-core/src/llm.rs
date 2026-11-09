@@ -26,6 +26,8 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCallRecord>,
     #[serde(default)]
     pub diffs: Vec<FileDiff>,
+    #[serde(default)]
+    pub images: Vec<String>,
     pub timestamp: String,
     pub model: Option<String>,
     #[serde(default)]
@@ -36,6 +38,25 @@ pub struct ChatMessage {
     pub output_tokens: usize,
     #[serde(default)]
     pub cost_usd: f64,
+}
+
+impl Default for ChatMessage {
+    fn default() -> Self {
+        Self {
+            role: "user".to_string(),
+            content: String::new(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            diffs: Vec::new(),
+            images: Vec::new(),
+            timestamp: String::new(),
+            model: None,
+            tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+        }
+    }
 }
 
 /// Parsed response from a single LLM completion call.
@@ -379,10 +400,29 @@ pub fn serialize_openai_messages(
                 }));
             }
         } else {
-            messages.push(serde_json::json!({
-                "role": if m.role == "tool" { "user" } else { &m.role },
-                "content": m.content
-            }));
+            if m.images.is_empty() {
+                messages.push(serde_json::json!({
+                    "role": if m.role == "tool" { "user" } else { &m.role },
+                    "content": m.content
+                }));
+            } else {
+                let mut parts = vec![serde_json::json!({
+                    "type": "text",
+                    "text": m.content
+                })];
+                for img in &m.images {
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:image/png;base64,{}", img)
+                        }
+                    }));
+                }
+                messages.push(serde_json::json!({
+                    "role": if m.role == "tool" { "user" } else { &m.role },
+                    "content": parts
+                }));
+            }
         }
     }
     messages
@@ -444,10 +484,14 @@ pub fn serialize_ollama_messages(
                 }));
             }
         } else {
-            messages.push(serde_json::json!({
+            let mut obj = serde_json::json!({
                 "role": if m.role == "tool" { "user" } else { &m.role },
                 "content": m.content
-            }));
+            });
+            if !m.images.is_empty() {
+                obj["images"] = serde_json::json!(m.images);
+            }
+            messages.push(obj);
         }
     }
     messages
@@ -887,21 +931,48 @@ async fn call_anthropic(
         } else {
             "user"
         };
-        if let Some(last) = messages.last_mut() {
-            if last.get("role").and_then(|r| r.as_str()) == Some(mapped_role) {
-                let prev = last
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                last["content"] = serde_json::Value::String(format!("{}\n\n{}", prev, m.content));
-                continue;
+        if m.images.is_empty() {
+            if let Some(last) = messages.last_mut() {
+                if last.get("role").and_then(|r| r.as_str()) == Some(mapped_role) {
+                    if let Some(prev) = last.get("content").and_then(|c| c.as_str()) {
+                        last["content"] = serde_json::Value::String(format!("{}\n\n{}", prev, m.content));
+                        continue;
+                    }
+                }
             }
+            messages.push(serde_json::json!({
+                "role": mapped_role,
+                "content": m.content
+            }));
+        } else {
+            let mut parts = Vec::new();
+            if !m.content.is_empty() {
+                parts.push(serde_json::json!({
+                    "type": "text",
+                    "text": m.content
+                }));
+            }
+            for img in &m.images {
+                parts.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": img
+                    }
+                }));
+            }
+            if parts.is_empty() {
+                parts.push(serde_json::json!({
+                    "type": "text",
+                    "text": "..."
+                }));
+            }
+            messages.push(serde_json::json!({
+                "role": mapped_role,
+                "content": parts
+            }));
         }
-        messages.push(serde_json::json!({
-            "role": mapped_role,
-            "content": m.content
-        }));
     }
 
     let mut tools_list = Vec::new();
@@ -1082,17 +1153,32 @@ async fn call_gemini(
         } else {
             "user"
         };
+        let mut parts = Vec::new();
+        if !m.content.is_empty() {
+            parts.push(serde_json::json!({ "text": m.content }));
+        }
+        for img in &m.images {
+            parts.push(serde_json::json!({
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": img
+                }
+            }));
+        }
+        if parts.is_empty() {
+            parts.push(serde_json::json!({ "text": "..." }));
+        }
         if let Some(last) = contents.last_mut() {
             if last.get("role").and_then(|r| r.as_str()) == Some(role) {
-                if let Some(parts) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
-                    parts.push(serde_json::json!({ "text": m.content }));
+                if let Some(p) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                    p.extend(parts);
                     continue;
                 }
             }
         }
         contents.push(serde_json::json!({
             "role": role,
-            "parts": [{ "text": m.content }]
+            "parts": parts
         }));
     }
     if contents.first().and_then(|c| c.get("role")).and_then(|r| r.as_str()) == Some("model") {
@@ -1394,6 +1480,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
                 diffs: Vec::new(),
+                images: Vec::new(),
                 timestamp: "12:00:00".to_string(),
                 model: None,
                 tokens: 10,
@@ -1407,6 +1494,7 @@ mod tests {
                 thinking: Some("I should read src/main.rs first.".to_string()),
                 tool_calls: vec![tc.clone()],
                 diffs: Vec::new(),
+                images: Vec::new(),
                 timestamp: "12:00:01".to_string(),
                 model: Some("kimi-k3".to_string()),
                 tokens: 20,
@@ -1420,6 +1508,7 @@ mod tests {
                 thinking: None,
                 tool_calls: vec![tc],
                 diffs: Vec::new(),
+                images: Vec::new(),
                 timestamp: "12:00:02".to_string(),
                 model: None,
                 tokens: 0,

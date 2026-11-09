@@ -26,6 +26,30 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Extracts image attachment file paths formatted by Discord bots (`[Attachment saved to disk — you may view_image this: <path>]`),
+/// reads their bytes from disk, and returns Base64 encoded strings ready for multimodal LLM vision input.
+pub fn extract_image_attachments_from_prompt(prompt: &str) -> Vec<String> {
+    let mut b64_images = Vec::new();
+    let marker = "[Attachment saved to disk — you may view_image this: ";
+    for line in prompt.lines() {
+        if let Some(idx) = line.find(marker) {
+            let rest = &line[idx + marker.len()..];
+            if let Some(end_bracket) = rest.find(']') {
+                let path_str = rest[..end_bracket].trim();
+                let path = std::path::Path::new(path_str);
+                if path.is_file() {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        if !bytes.is_empty() {
+                            b64_images.push(crate::tools::ToolEngine::base64_encode(&bytes));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    b64_images
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub model: String,
@@ -1075,6 +1099,7 @@ impl HarnessManager {
                 thinking: None,
                 tool_calls: Vec::new(),
                 diffs: Vec::new(),
+                images: Vec::new(),
                 timestamp: Utc::now().format("%H:%M:%S").to_string(),
                 model: head_model,
                 tokens: head_tokens.max(tok_est),
@@ -1857,6 +1882,7 @@ impl HarnessManager {
             thinking: None,
             tool_calls: Vec::new(),
             diffs: Vec::new(),
+            images: Vec::new(),
             timestamp: Utc::now().format("%H:%M:%S").to_string(),
             model: None,
             tokens: task.len() / 4,
@@ -2062,6 +2088,7 @@ impl HarnessManager {
                         thinking: resp.thinking.clone(),
                         tool_calls: step_tools.clone(),
                         diffs: Vec::new(),
+                        images: Vec::new(),
                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                         model: Some(settings.model.clone()),
                         tokens: resp.tokens,
@@ -2075,6 +2102,7 @@ impl HarnessManager {
                         thinking: None,
                         tool_calls: step_tools,
                         diffs: Vec::new(),
+                        images: Vec::new(),
                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                         model: None,
                         tokens: 0,
@@ -2173,6 +2201,7 @@ impl HarnessManager {
                                 thinking: None,
                                 tool_calls: res.tool_calls,
                                 diffs: res.diffs,
+                                images: Vec::new(),
                                 timestamp: Utc::now().format("%H:%M:%S").to_string(),
                                 model: Some(active_model),
                                 tokens: res.tokens,
@@ -2418,6 +2447,7 @@ impl HarnessManager {
                         thinking: None,
                         tool_calls: Vec::new(),
                         diffs: Vec::new(),
+                        images: Vec::new(),
                         timestamp: now_ts.clone(),
                         model: None,
                         tokens: user_txt.len() / 4,
@@ -2431,6 +2461,7 @@ impl HarnessManager {
                         thinking: None,
                         tool_calls: Vec::new(),
                         diffs: Vec::new(),
+                        images: Vec::new(),
                         timestamp: now_ts,
                         model: Some(self.settings().model),
                         tokens: 16,
@@ -2796,12 +2827,14 @@ impl HarnessManager {
                     let short: String = effective_prompt.chars().take(42).collect();
                     conv.title = short;
                 }
+                let initial_images = extract_image_attachments_from_prompt(&effective_prompt);
                 conv.messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: effective_prompt,
                     thinking: None,
                     tool_calls: Vec::new(),
                     diffs: Vec::new(),
+                    images: initial_images,
                     timestamp: now_ts,
                     model: None,
                     tokens: est_in,
@@ -2870,12 +2903,14 @@ impl HarnessManager {
                     let short: String = effective_prompt.chars().take(42).collect();
                     conv.title = short;
                 }
+                let initial_images = extract_image_attachments_from_prompt(&effective_prompt);
                 conv.messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: effective_prompt,
                     thinking: None,
                     tool_calls: Vec::new(),
                     diffs: Vec::new(),
+                    images: initial_images,
                     timestamp: now_ts,
                     model: None,
                     tokens: est_in,
@@ -3114,6 +3149,7 @@ impl HarnessManager {
                                     thinking: step_thinking,
                                     tool_calls: Vec::new(),
                                     diffs: Vec::new(),
+                                    images: Vec::new(),
                                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                                     model: Some(settings.model.clone()),
                                     tokens: 0,
@@ -3127,6 +3163,7 @@ impl HarnessManager {
                                     thinking: None,
                                     tool_calls: Vec::new(),
                                     diffs: Vec::new(),
+                                    images: Vec::new(),
                                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                                     model: None,
                                     tokens: 0,
@@ -3197,6 +3234,7 @@ impl HarnessManager {
                                         thinking: step_thinking,
                                         tool_calls: Vec::new(),
                                         diffs: Vec::new(),
+                                        images: Vec::new(),
                                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                                         model: Some(settings.model.clone()),
                                         tokens: 0,
@@ -3210,6 +3248,7 @@ impl HarnessManager {
                                         thinking: None,
                                         tool_calls: Vec::new(),
                                         diffs: Vec::new(),
+                                        images: Vec::new(),
                                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                                         model: None,
                                         tokens: 0,
@@ -3249,6 +3288,7 @@ impl HarnessManager {
                                     thinking: step_thinking,
                                     tool_calls: Vec::new(),
                                     diffs: Vec::new(),
+                                    images: Vec::new(),
                                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                                     model: Some(settings.model.clone()),
                                     tokens: 0,
@@ -3262,6 +3302,7 @@ impl HarnessManager {
                                     thinking: None,
                                     tool_calls: Vec::new(),
                                     diffs: Vec::new(),
+                                    images: Vec::new(),
                                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                                     model: None,
                                     tokens: 0,
@@ -3293,6 +3334,7 @@ impl HarnessManager {
                                     thinking: step_thinking,
                                     tool_calls: Vec::new(),
                                     diffs: Vec::new(),
+                                    images: Vec::new(),
                                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                                     model: Some(settings.model.clone()),
                                     tokens: 0,
@@ -3309,6 +3351,7 @@ impl HarnessManager {
                                     thinking: None,
                                     tool_calls: Vec::new(),
                                     diffs: Vec::new(),
+                                    images: Vec::new(),
                                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                                     model: None,
                                     tokens: 0,
@@ -3653,6 +3696,7 @@ impl HarnessManager {
                         thinking: step_thinking,
                         tool_calls: step_tools.clone(),
                         diffs: Vec::new(),
+                        images: Vec::new(),
                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                         model: Some(settings.model.clone()),
                         tokens: 0,
@@ -3660,12 +3704,14 @@ impl HarnessManager {
                         output_tokens: 0,
                         cost_usd: 0.0,
                     });
+                    let drained_images = tool_engine.drain_vision_images();
                     working_history.push(ChatMessage {
                         role: "tool".to_string(),
                         content: tool_results_summary.join("\n\n"),
                         thinking: None,
                         tool_calls: step_tools,
                         diffs: Vec::new(),
+                        images: Vec::new(),
                         timestamp: Utc::now().format("%H:%M:%S").to_string(),
                         model: None,
                         tokens: 0,
@@ -3673,6 +3719,22 @@ impl HarnessManager {
                         output_tokens: 0,
                         cost_usd: 0.0,
                     });
+                    if !drained_images.is_empty() {
+                        working_history.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: format!("Attached {} image(s) for visual inspection:", drained_images.len()),
+                            thinking: None,
+                            tool_calls: Vec::new(),
+                            diffs: Vec::new(),
+                            images: drained_images,
+                            timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                            model: None,
+                            tokens: 0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cost_usd: 0.0,
+                        });
+                    }
 
                     // Pre-expiration autonomous budget warning protocol:
                     // When remaining steps are <= 30, alert the agent to cease endless exploration and finalize/verify output.
@@ -3757,6 +3819,7 @@ impl HarnessManager {
                     },
                     tool_calls: collected_tools,
                     diffs: collected_diffs,
+                    images: Vec::new(),
                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                     model: Some(settings.model),
                     tokens: total_turn_tokens,
@@ -3840,6 +3903,14 @@ impl HarnessManager {
                 "PERSONA (PONYTAIL MODE): Bring high-energy, sharp systems-engineering enthusiasm and crystal-clear architectural insight.\n",
             );
         }
+
+        prompt.push_str(
+            "\nMULTIMODAL VISION CAPABILITY:\n\
+             - You have full multimodal vision capabilities. You can see, inspect, and analyze images.\n\
+             - To inspect an image file (.png, .jpg, .jpeg, .webp, .gif, .bmp) inside the workspace or system, call `view_image` (or `read_file` with the image path). The image is loaded, base64-encoded, and attached directly to your visual multimodal context so you can perceive it directly.\n\
+             - Discord attachments are automatically ingested into your visual context.\n\
+             - NEVER state or claim that you do not have vision or that you cannot see images. You have native multimodal vision.\n",
+        );
 
         let protected = crate::tools::extract_protected_paths_from_prompt(user_query);
         if !protected.is_empty() {
@@ -4055,6 +4126,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
                 diffs: Vec::new(),
+                images: Vec::new(),
                 timestamp: "12:00:00".to_string(),
                 model: None,
                 tokens: 50,
@@ -4068,6 +4140,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
                 diffs: Vec::new(),
+                images: Vec::new(),
                 timestamp: "12:00:01".to_string(),
                 model: Some("claude-4-sonnet".to_string()),
                 tokens: 150,
@@ -4081,6 +4154,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
                 diffs: Vec::new(),
+                images: Vec::new(),
                 timestamp: "12:00:02".to_string(),
                 model: None,
                 tokens: 30,
@@ -4117,6 +4191,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
                 diffs: Vec::new(),
+                images: Vec::new(),
                 timestamp: "12:00:01".to_string(),
                 model: None,
                 tokens: 100,
@@ -4133,6 +4208,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
                 diffs: Vec::new(),
+                images: Vec::new(),
                 timestamp: "12:00:02".to_string(),
                 model: None,
                 tokens: 100,

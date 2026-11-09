@@ -167,6 +167,7 @@ pub struct ToolEngine {
     protected_paths: Arc<Mutex<Vec<String>>>,
     read_files: Arc<Mutex<HashMap<String, u64>>>,
     todo_items: Arc<Mutex<Vec<TodoItem>>>,
+    pending_vision_images: Arc<Mutex<Vec<String>>>,
 }
 
 impl ToolEngine {
@@ -180,6 +181,7 @@ impl ToolEngine {
             protected_paths: Arc::new(Mutex::new(Vec::new())),
             read_files: Arc::new(Mutex::new(HashMap::new())),
             todo_items: Arc::new(Mutex::new(Vec::new())),
+            pending_vision_images: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -229,6 +231,95 @@ impl ToolEngine {
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default()
+    }
+
+    /// Queues a base64 encoded image to be attached to the multimodal vision turn.
+    pub fn queue_vision_image(&self, b64: String) {
+        if let Ok(mut guard) = self.pending_vision_images.lock() {
+            guard.push(b64);
+        }
+    }
+
+    /// Drains and clears all queued base64 vision images.
+    pub fn drain_vision_images(&self) -> Vec<String> {
+        if let Ok(mut guard) = self.pending_vision_images.lock() {
+            let imgs = guard.clone();
+            guard.clear();
+            imgs
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Returns whether the file path has a supported image extension.
+    pub fn is_supported_image_extension(path: &str) -> bool {
+        let p = path.to_lowercase();
+        p.ends_with(".png")
+            || p.ends_with(".jpg")
+            || p.ends_with(".jpeg")
+            || p.ends_with(".webp")
+            || p.ends_with(".gif")
+            || p.ends_with(".bmp")
+    }
+
+    /// Encodes arbitrary byte slices to standard RFC 4648 Base64 string.
+    pub fn base64_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(ALPHABET[(triple & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    /// Loads an image file from disk, base64 encodes it, queues it for multimodal vision input,
+    /// and returns a descriptive summary.
+    pub fn view_image(&self, rel_path: &str) -> Result<String, ToolError> {
+        let abs_path = self.resolve_skill_or_workspace_path(rel_path, false)?;
+        if !abs_path.exists() {
+            return Err(ToolError::Execution(format!("File not found: {}", rel_path)));
+        }
+        let bytes = fs::read(&abs_path)?;
+        if bytes.is_empty() {
+            return Err(ToolError::Execution(format!("Image file '{}' is empty (0 bytes)", rel_path)));
+        }
+        let ext = abs_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("png")
+            .to_lowercase();
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            _ => "image/png",
+        };
+        let b64 = Self::base64_encode(&bytes);
+        self.queue_vision_image(b64);
+        let size_kb = bytes.len() / 1024;
+        let norm_path = rel_path.replace('\\', "/");
+        Ok(format!(
+            "Image file loaded and attached to your Vision input ({}, {} KB): {} — you can now see and inspect this image directly.",
+            mime, size_kb, norm_path
+        ))
     }
 
     /// Checks whether `candidate_path` matches any protected path constraint.
@@ -442,6 +533,9 @@ impl ToolEngine {
         start_line: Option<usize>,
         end_line: Option<usize>,
     ) -> Result<String, ToolError> {
+        if Self::is_supported_image_extension(rel_path) {
+            return self.view_image(rel_path);
+        }
         let abs_path = self.resolve_skill_or_workspace_path(rel_path, false)?;
         let content = fs::read_to_string(&abs_path)?;
         self.record_file_snapshot(rel_path, &content);
@@ -2819,6 +2913,38 @@ impl ToolEngine {
         };
 
         match name {
+            "view_image" | "view_images" | "visual_qa" => {
+                let path = {
+                    let p = get_str("path");
+                    if p.is_empty() {
+                        let p2 = get_str("file_path");
+                        if p2.is_empty() {
+                            let p3 = get_str("image");
+                            if p3.is_empty() {
+                                get_str("target")
+                            } else {
+                                p3
+                            }
+                        } else {
+                            p2
+                        }
+                    } else {
+                        p
+                    }
+                };
+                if path.is_empty() {
+                    (
+                        "Error: 'path' parameter is required for view_image.".to_string(),
+                        false,
+                        None,
+                    )
+                } else {
+                    match self.view_image(&path) {
+                        Ok(msg) => (msg, true, None),
+                        Err(e) => (format!("Error: {}", e), false, None),
+                    }
+                }
+            }
             "read_file" => {
                 let path = {
                     let p = get_str("path");
@@ -4063,6 +4189,20 @@ impl ToolEngine {
             {
                 "type": "function",
                 "function": {
+                    "name": "view_image",
+                    "description": "View and inspect an image file (.png, .jpg, .jpeg, .webp, .gif, .bmp) inside the workspace. Loads the image directly into your visual multimodal context so you can see it.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Relative or absolute path to the image file" }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "read_file",
                     "description": "Read the contents of a file inside the workspace with 1-indexed line numbers.",
                     "parameters": {
@@ -5037,5 +5177,31 @@ mod tests {
         assert!(engine.delete_file(".env").is_err());
         assert!(engine.run_command("git push --force origin main", 10).is_err());
         assert!(engine.run_command("git reset --hard HEAD~1", 10).is_err());
+    }
+
+    #[test]
+    fn test_view_image_and_vision_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(tmp.path()).unwrap();
+        let mut engine = ToolEngine::new(ws.clone());
+
+        let img_path = tmp.path().join("test_shot.png");
+        fs::write(&img_path, b"\x89PNG\r\n\x1a\nfake_image_bytes").unwrap();
+
+        let (out, ok, diff) = engine.execute_tool("view_image", &serde_json::json!({ "path": "test_shot.png" }));
+        assert!(ok);
+        assert!(out.contains("Image file loaded and attached to your Vision input"));
+        assert!(diff.is_none());
+
+        let drained = engine.drain_vision_images();
+        assert_eq!(drained.len(), 1);
+        assert!(!drained[0].is_empty());
+        assert!(engine.drain_vision_images().is_empty());
+
+        let (out2, ok2, _) = engine.execute_tool("read_file", &serde_json::json!({ "path": "test_shot.png" }));
+        assert!(ok2);
+        assert!(out2.contains("Image file loaded and attached to your Vision input"));
+        let drained2 = engine.drain_vision_images();
+        assert_eq!(drained2.len(), 1);
     }
 }

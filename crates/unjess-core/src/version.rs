@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.0.8";
+pub const CURRENT_VERSION: &str = "4.0.9";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,23 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.0.9".to_string(),
+            date: "2026-11-09".to_string(),
+            title: "Unjess 4.0.9 — Multimodal Vision Engine & Auto Attachment Ingestion".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Restored native multimodal Vision engine with `view_image` tool schema and execution handler.".to_string(),
+                "Added transparent image delegation in `read_file` so .png, .jpg, .jpeg, .webp, .gif, .bmp auto-queue for vision input.".to_string(),
+                "Added RFC 4648 Base64 serialization across Ollama (`images: []`), OpenAI (`image_url`), Anthropic (`type: 'image'`), and Gemini (`inline_data`).".to_string(),
+                "Integrated automatic Discord attachment parser to ingest disk attachments directly into turn 1 visual context.".to_string(),
+                "Injected Multimodal Vision Directive into the system prompt to eradicate vision amnesia and false capability denials.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.0.8".to_string(),
             date: "2026-11-09".to_string(),
             title: "Unjess 4.0.8 — Context Window Integrity & DeepSeek 1M Context Parity".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Eliminated artificial 6-message compaction clamp in autonomous execution loop, restoring full multi-turn context retention matching Go benchmark baseline.".to_string(),
                 "Updated DeepSeek v4 context window capacity in llm.rs to 1,000,000 tokens for full repository-level retention.".to_string(),
@@ -162,9 +175,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.0.8");
+        assert_eq!(CURRENT_VERSION, "4.0.9");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.0.8");
+        assert_eq!(log[0].version, "4.0.9");
     }
 }
