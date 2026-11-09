@@ -1110,8 +1110,10 @@ impl HarnessManager {
             (70_000usize, 115_000usize)
         } else if usable_tokens <= 120_000 {
             (100_000usize, 160_000usize)
+        } else if usable_tokens <= 250_000 {
+            (180_000usize, 320_000usize)
         } else {
-            (160_000usize, 260_000usize)
+            (600_000usize, 1_200_000usize)
         };
 
         // Pass 1: Deduplicate superseded `read_file` outputs with identical `[File: ...]` headers
@@ -1230,8 +1232,15 @@ impl HarnessManager {
 
         // Pass 3: Stage-2 structural digest compaction when context still exceeds `stage2_threshold`
         let post_stage1_chars: usize = msgs.iter().map(|m| m.content.len()).sum();
-        if post_stage1_chars > stage2_threshold && msgs.len() > 16 {
-            msgs = Self::compact_messages(&msgs, 16);
+        let keep_tail = if usable_tokens >= 500_000 {
+            48
+        } else if usable_tokens >= 100_000 {
+            32
+        } else {
+            16
+        };
+        if post_stage1_chars > stage2_threshold && msgs.len() > keep_tail {
+            msgs = Self::compact_messages(&msgs, keep_tail);
         }
 
         msgs
@@ -2978,13 +2987,6 @@ impl HarnessManager {
             if settings.enable_compaction {
                 working_history =
                     Self::compact_messages_for_model(&working_history, &settings.model);
-                let total_history_chars: usize =
-                    working_history.iter().map(|m| m.content.len()).sum();
-                if (working_history.len() > 28 || total_history_chars > 140_000)
-                    && working_history.len() > 6
-                {
-                    working_history = Self::compact_messages(&working_history, 6);
-                }
             }
 
             if system_prompt_dirty {

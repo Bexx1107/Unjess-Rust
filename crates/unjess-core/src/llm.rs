@@ -284,7 +284,11 @@ pub fn is_transient_llm_error(err: &str) -> bool {
 /// Returns the context window capacity (in tokens) for `model` to power dynamic context-budget compaction.
 pub fn model_context_window_tokens(model: &str) -> usize {
     let m = model.trim().to_lowercase();
-    if m.starts_with("gemini-") || m.starts_with("antigravity-") || m.starts_with("learnlm-") {
+    if m.starts_with("gemini-")
+        || m.starts_with("antigravity-")
+        || m.starts_with("learnlm-")
+        || m.contains("deepseek-v4")
+    {
         1_000_000
     } else if m.starts_with("claude-")
         || m.starts_with("gpt-5")
@@ -1371,7 +1375,8 @@ mod tests {
     fn test_native_tool_call_and_reasoning_replay_serialization() {
         assert_eq!(model_context_window_tokens("gemini-3.8-flash"), 1_000_000);
         assert_eq!(model_context_window_tokens("kimi-k3"), 200_000);
-        assert_eq!(model_context_window_tokens("deepseek-v4.1-flash:cloud"), 128_000);
+        assert_eq!(model_context_window_tokens("deepseek-v4.1-flash:cloud"), 1_000_000);
+        assert_eq!(model_context_window_tokens("deepseek-v3:cloud"), 128_000);
         assert_eq!(model_context_window_tokens("qwen2.5-coder:7b"), 32_768);
 
         let tc = ToolCallRecord {
