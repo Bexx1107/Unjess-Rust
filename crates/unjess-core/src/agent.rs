@@ -3234,6 +3234,25 @@ impl HarnessManager {
 
         let active_conv = self.conversation_by_id(conv_id);
         let mut working_history = active_conv.messages.clone();
+        // Pixels from images viewed in EARLIER turns are not persisted. Rewrite their tool results so the
+        // model is not told "you can now see this image" about an image it can no longer see (which made it
+        // wrongly conclude it is blind). It must call view_image again to look at the file again.
+        for m in working_history.iter_mut() {
+            for tc in m.tool_calls.iter_mut() {
+                if tc.name == "view_image" && tc.result.contains("Vision input") {
+                    let path = tc
+                        .arguments
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown path)")
+                        .to_string();
+                    tc.result = format!(
+                        "[Image '{}' was viewed in an earlier turn. Its pixels are no longer in context. You CAN see images: call view_image on this path again if you need to look at it.]",
+                        path
+                    );
+                }
+            }
+        }
         let initial_session_cost = active_conv.total_cost_usd;
         let latest_user_query = working_history
             .iter()
@@ -4331,7 +4350,7 @@ impl HarnessManager {
             prompt.push_str(
                 "\nMULTIMODAL VISION CAPABILITY:\n\
                  - This model can see images. To inspect an image file (.png, .jpg, .jpeg, .webp, .gif, .bmp) call `view_image` (or `read_file` with the image path); it is attached to your visual context.\n\
-                 - LOOK at images and describe what you actually see. Judge visual questions (sleeves, colours, garments, composition) with your eyes, not with coordinate math, crop-and-score scripts or pixel heuristics, unless the user explicitly asks for that. You may crop to zoom into one region, but do the judging by looking. If, after view_image, you genuinely cannot perceive the image, say so plainly instead of guessing.\n\
+                 - LOOK at images and describe what you actually see. Judge visual questions (sleeves, colours, garments, composition) with your eyes, not with coordinate math, crop-and-score scripts or pixel heuristics, unless the user explicitly asks for that. You may crop to zoom into one region, but do the judging by looking. Images from earlier turns are NOT kept in context: if you need to look at one again, call view_image on its path again. You are not blind; never say you cannot see images, just re-open the file.\n\
                  - Discord attachments are automatically ingested into your visual context.\n",
             );
         } else {
