@@ -1104,33 +1104,101 @@ impl HarnessManager {
                     touched_files.push(d.path.clone());
                 }
             }
-            let snippet: String = m
-                .content
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(140)
-                .collect();
-            if m.role == "user" || m.role == "assistant" {
-                let tools_note = if m.tool_calls.is_empty() {
-                    String::new()
-                } else {
-                    let names: Vec<String> = m.tool_calls.iter().map(|t| t.name.clone()).collect();
-                    format!(" [tools: {}]", names.join(", "))
-                };
-                digest_lines.push(format!("- [{}]{}: {}", m.role, tools_note, snippet));
+            let one_line = |s: &str, max: usize| -> String {
+                s.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(max)
+                    .collect()
+            };
+            if m.role == "user" {
+                // User instructions are the ground truth of the session: keep them nearly verbatim.
+                digest_lines.push(format!("- [USER SAID]: {}", one_line(&m.content, 400)));
+            } else if m.role == "assistant" {
+                let is_boilerplate = m.content.starts_with("Completed ")
+                    || m.content.contains("Turn aborted by user")
+                    || m.content.trim().is_empty();
+                if !m.tool_calls.is_empty() {
+                    // Aggregate tool activity instead of listing hundreds of bare tool names.
+                    let mut counts: Vec<(String, usize)> = Vec::new();
+                    let mut actions: Vec<String> = Vec::new();
+                    for t in &m.tool_calls {
+                        if let Some(entry) = counts.iter_mut().find(|(n, _)| *n == t.name) {
+                            entry.1 += 1;
+                        } else {
+                            counts.push((t.name.clone(), 1));
+                        }
+                        let arg_str = |k: &str| {
+                            t.arguments
+                                .get(k)
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        };
+                        match t.name.as_str() {
+                            "write_file" | "edit_file" | "delete_file" | "apply_patch" => {
+                                if let Some(p) = arg_str("path") {
+                                    actions.push(format!("{} {}", t.name, one_line(&p, 120)));
+                                }
+                            }
+                            "run_command" => {
+                                if let Some(c) = arg_str("command") {
+                                    actions.push(format!("ran `{}`", one_line(&c, 110)));
+                                }
+                            }
+                            "read_file" | "view_image" | "grep_search" | "list_dir"
+                            | "find_by_name" | "outline_file" | "ast_outline" => {}
+                            other => {
+                                // MCP / synthesized / unusual tools (e.g. generate_image) are always worth remembering.
+                                let args_short = one_line(&t.arguments.to_string(), 90);
+                                let res_short = one_line(&t.result, 110);
+                                actions.push(format!(
+                                    "{}({}) [{}] -> {}",
+                                    other, args_short, t.status, res_short
+                                ));
+                            }
+                        }
+                    }
+                    let counts_txt: Vec<String> =
+                        counts.iter().map(|(n, c)| format!("{}x{}", n, c)).collect();
+                    let n = actions.len();
+                    let kept: Vec<String> = if n > 14 {
+                        actions[n - 14..].to_vec()
+                    } else {
+                        actions
+                    };
+                    digest_lines.push(format!(
+                        "- [ASSISTANT ran {} tool calls: {}] key actions (latest): {}",
+                        m.tool_calls.len(),
+                        counts_txt.join(", "),
+                        if kept.is_empty() {
+                            "(read-only inspection)".to_string()
+                        } else {
+                            kept.join("; ")
+                        }
+                    ));
+                }
+                if !is_boilerplate {
+                    digest_lines.push(format!("- [ASSISTANT SAID]: {}", one_line(&m.content, 500)));
+                }
             }
         }
 
-        let mut summary_text = format!(
-            "[Context Compacted — Summarized {} earlier intermediate messages]:\n{}",
-            head.len(),
+        // Keep the earliest context plus the MOST RECENT activity (never drop the freshest history).
+        let total_lines = digest_lines.len();
+        let digest_lines: Vec<String> = if total_lines > 60 {
+            let mut v: Vec<String> = digest_lines[..6].to_vec();
+            v.push(format!("... ({} older entries omitted) ...", total_lines - 60));
+            v.extend_from_slice(&digest_lines[total_lines - 54..]);
+            v
+        } else {
             digest_lines
-                .into_iter()
-                .take(25)
-                .collect::<Vec<_>>()
-                .join("\n")
+        };
+
+        let mut summary_text = format!(
+            "[Session Ledger — {} earlier messages were compacted. This is a factual record of what already happened in THIS conversation; do not contradict it, and never claim you did or did not do something the ledger shows.]:\n{}",
+            head.len(),
+            digest_lines.join("\n")
         );
         if !touched_files.is_empty() {
             summary_text.push_str(&format!(
@@ -1883,7 +1951,9 @@ impl HarnessManager {
         let conv_abort_flag = self.abort_flag_for_conversation(&target_conv_id);
         let workspace = Workspace::new(&ws_path).map_err(|e| e.to_string())?;
         let mut tool_engine =
-            ToolEngine::new(workspace).with_abort_flag(Arc::clone(&conv_abort_flag));
+            ToolEngine::new(workspace)
+                .with_abort_flag(Arc::clone(&conv_abort_flag))
+                .with_vision(crate::llm::model_supports_vision(&settings.model));
 
         let mut resolved_id = if subagent_id.trim().is_empty() {
             "sub-coder".to_string()
@@ -4257,13 +4327,20 @@ impl HarnessManager {
             );
         }
 
-        prompt.push_str(
-            "\nMULTIMODAL VISION CAPABILITY:\n\
-             - You have full multimodal vision capabilities. You can see, inspect, and analyze images.\n\
-             - To inspect an image file (.png, .jpg, .jpeg, .webp, .gif, .bmp) inside the workspace or system, call `view_image` (or `read_file` with the image path). The image is loaded, base64-encoded, and attached directly to your visual multimodal context so you can perceive it directly.\n\
-             - Discord attachments are automatically ingested into your visual context.\n\
-             - NEVER state or claim that you do not have vision or that you cannot see images. You have native multimodal vision.\n",
-        );
+        if crate::llm::model_supports_vision(&Settings::load().model) {
+            prompt.push_str(
+                "\nMULTIMODAL VISION CAPABILITY:\n\
+                 - This model can see images. To inspect an image file (.png, .jpg, .jpeg, .webp, .gif, .bmp) call `view_image` (or `read_file` with the image path); it is attached to your visual context.\n\
+                 - LOOK at images and describe what you actually see. Do NOT replace looking with coordinate math, crop-and-score scripts or pixel heuristics unless the user asks for it. If, after view_image, you genuinely cannot perceive the image, say so plainly instead of guessing.\n\
+                 - Discord attachments are automatically ingested into your visual context.\n",
+            );
+        } else {
+            prompt.push_str(
+                "\nVISION LIMITATION:\n\
+                 - The active model is text-only: it CANNOT see images. `view_image` will not show you anything.\n\
+                 - Never claim to have seen or inspected an image, and never fake it with coordinate math or pixel scripts. When a task requires looking at an image, tell the user plainly that this model cannot see images and ask them to switch to a vision-capable model (Gemini, Claude, GPT-5, Kimi, Qwen-VL) or describe the image.\n",
+            );
+        }
 
         let protected = crate::tools::extract_protected_paths_from_prompt(user_query);
         if !protected.is_empty() {

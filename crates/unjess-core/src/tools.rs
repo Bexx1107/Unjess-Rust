@@ -168,6 +168,7 @@ pub struct ToolEngine {
     read_files: Arc<Mutex<HashMap<String, u64>>>,
     todo_items: Arc<Mutex<Vec<TodoItem>>>,
     pending_vision_images: Arc<Mutex<Vec<String>>>,
+    vision_enabled: bool,
 }
 
 impl ToolEngine {
@@ -182,7 +183,14 @@ impl ToolEngine {
             read_files: Arc::new(Mutex::new(HashMap::new())),
             todo_items: Arc::new(Mutex::new(Vec::new())),
             pending_vision_images: Arc::new(Mutex::new(Vec::new())),
+            vision_enabled: true,
         }
+    }
+
+    /// Declares whether the active model can actually perceive images.
+    pub fn with_vision(mut self, enabled: bool) -> Self {
+        self.vision_enabled = enabled;
+        self
     }
 
     pub fn with_abort_flag(mut self, abort_flag: Arc<AtomicBool>) -> Self {
@@ -373,6 +381,13 @@ impl ToolEngine {
             .to_lowercase();
         let (opt_bytes, mime) = Self::optimize_image_for_vision(&bytes, &ext);
         let b64 = Self::base64_encode(&opt_bytes);
+        if !self.vision_enabled {
+            return Ok(format!(
+                "[NO VISION] The active model cannot perceive images, so '{}' was NOT shown to you ({} KB). Do not pretend to have seen it and do not try to reverse-engineer its content with coordinate math or pixel scripts. Tell the user plainly that this model cannot see images and ask them to switch to a vision-capable model (Gemini, Claude, GPT-5, Kimi, Qwen-VL) or to describe what is in the image.",
+                rel_path.replace('\\', "/"),
+                opt_bytes.len() / 1024
+            ));
+        }
         self.queue_vision_image(b64);
         let orig_kb = bytes.len() / 1024;
         let opt_kb = opt_bytes.len() / 1024;

@@ -1772,3 +1772,50 @@ mod tests {
         assert!(ollama_json[5].get("images").is_some());
     }
 }
+
+/// Heuristic: can this model actually perceive images? Known text-only families return `false`
+/// so the harness never tells a blind model that it "can see" (which makes it guess/hallucinate
+/// instead of saying it cannot see). Unknown models are assumed vision-capable.
+pub fn model_supports_vision(model: &str) -> bool {
+    let m = model.to_lowercase();
+    let explicit_vision = m.contains("-vl")
+        || m.contains("vision")
+        || m.contains("ocr")
+        || m.contains("llava")
+        || m.contains("pixtral")
+        || m.contains("gemma3")
+        || m.contains("gemini")
+        || m.contains("gpt-4o")
+        || m.contains("gpt-4.1")
+        || m.contains("gpt-5")
+        || m.contains("claude")
+        || m.contains("kimi")
+        || m.contains("qwen3.5")
+        || m.contains("qwen3-vl");
+    if explicit_vision {
+        return true;
+    }
+    let text_only = m.contains("deepseek")
+        || m.contains("gpt-oss")
+        || m.contains("coder")
+        || m.contains("codestral")
+        || m.contains("devstral")
+        || m.contains("minimax")
+        || m.contains("glm");
+    !text_only
+}
+
+#[cfg(test)]
+mod vision_capability_tests {
+    use super::model_supports_vision;
+
+    #[test]
+    fn test_vision_heuristic() {
+        assert!(!model_supports_vision("deepseek-v4.1-flash:cloud"));
+        assert!(model_supports_vision("deepseek-vl2"));
+        assert!(model_supports_vision("gemini-3.8-flash"));
+        assert!(model_supports_vision("claude-sonnet-5.5"));
+        assert!(model_supports_vision("kimi-k3.1-pro:cloud"));
+        assert!(!model_supports_vision("qwen3-coder:480b"));
+    }
+}

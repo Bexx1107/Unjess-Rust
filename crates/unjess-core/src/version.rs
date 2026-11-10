@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.1.5";
+pub const CURRENT_VERSION: &str = "4.1.6";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,22 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.1.6".to_string(),
+            date: "2026-11-10".to_string(),
+            title: "Unjess 4.1.6 — Session Ledger: fixes mid-session amnesia & hallucinated history".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Root cause of 'I never generated anything / I don't know where we are': context compaction kept only the oldest 25 messages as 140-char first lines and listed hundreds of bare tool names, wiping what actually happened. Replaced with a factual Session Ledger.".to_string(),
+                "Ledger keeps every user instruction near-verbatim, per-turn tool counts, files written/edited, shell commands run, and every MCP/unusual tool call (e.g. generate_image) with args, status and result.".to_string(),
+                "Honest vision: the harness no longer tells text-only models (e.g. deepseek flash) that they can see images. view_image now returns a clear [NO VISION] result and the system prompt says so, instead of a forced false claim that made the model fake it with coordinate math.".to_string(),
+                "Ledger always retains the most recent activity (older entries are omitted instead) and instructs the model never to contradict recorded history.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.1.5".to_string(),
             date: "2026-11-09".to_string(),
             title: "Unjess 4.1.5 — First-Class MCP Tool Injection (DMD Studio, DaVinci, Blender), Payload Interceptor & Anti-Stall Engine".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Full MCP Parity with Antigravity: automatically discovers, syncs, and injects all 132 MCP tools (including DMD Studio 44 tools, Blender, DaVinci Resolve, Google Flow, Chrome DevTools, Unity Bridge) directly into the LLM function schema.".to_string(),
                 "Native Tool Calling: models can now invoke `generate_image`, `restyle_image`, `dmd_pipeline_generate_image` directly in 1 step without reverse-engineering shell/python scripts across 240+ steps.".to_string(),
@@ -248,9 +260,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.1.5");
+        assert_eq!(CURRENT_VERSION, "4.1.6");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.1.5");
+        assert_eq!(log[0].version, "4.1.6");
     }
 }
