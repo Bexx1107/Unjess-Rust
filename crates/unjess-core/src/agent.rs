@@ -1248,7 +1248,7 @@ impl HarnessManager {
     /// structured `m.tool_calls` outputs for native multi-turn tool replay.
     pub fn compact_messages_for_model(messages: &[ChatMessage], model: &str) -> Vec<ChatMessage> {
         // Multi-turn vision safety: prune historical base64 images so request body stays well under HTTP limits
-        let mut msgs = crate::llm::filter_active_vision_images(messages, 2);
+        let mut msgs = crate::llm::filter_active_vision_images(messages, crate::llm::MAX_ACTIVE_VISION_IMAGES);
         let ctx_tokens = model_context_window_tokens(model);
         // Reserve 20% headroom for system prompt, tool schemas, and output generation
         let usable_tokens = (ctx_tokens.saturating_mul(80)) / 100;
@@ -3301,7 +3301,7 @@ impl HarnessManager {
             }
 
             // Multimodal request body safety: prune older base64 image strings across turns
-            working_history = crate::llm::filter_active_vision_images(&working_history, 2);
+            working_history = crate::llm::filter_active_vision_images(&working_history, crate::llm::MAX_ACTIVE_VISION_IMAGES);
 
             if system_prompt_dirty {
                 system_prompt = self.build_system_prompt_for_query(&ws_path, &latest_user_query);
@@ -4331,7 +4331,7 @@ impl HarnessManager {
             prompt.push_str(
                 "\nMULTIMODAL VISION CAPABILITY:\n\
                  - This model can see images. To inspect an image file (.png, .jpg, .jpeg, .webp, .gif, .bmp) call `view_image` (or `read_file` with the image path); it is attached to your visual context.\n\
-                 - LOOK at images and describe what you actually see. Do NOT replace looking with coordinate math, crop-and-score scripts or pixel heuristics unless the user asks for it. If, after view_image, you genuinely cannot perceive the image, say so plainly instead of guessing.\n\
+                 - LOOK at images and describe what you actually see. Judge visual questions (sleeves, colours, garments, composition) with your eyes, not with coordinate math, crop-and-score scripts or pixel heuristics, unless the user explicitly asks for that. You may crop to zoom into one region, but do the judging by looking. If, after view_image, you genuinely cannot perceive the image, say so plainly instead of guessing.\n\
                  - Discord attachments are automatically ingested into your visual context.\n",
             );
         } else {

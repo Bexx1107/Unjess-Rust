@@ -340,6 +340,11 @@ pub fn model_context_window_tokens(model: &str) -> usize {
 /// `max_active_images` images (default 2) retain their raw Base64 payload.
 /// This prevents multi-step agent loops (e.g. 40+ turns) from accumulating tens of megabytes
 /// of image data that trigger HTTP 400 "request body too large" errors from Ollama, OpenAI, or Claude.
+/// Number of most-recent images kept as real pixels in the request. Older ones are pruned to
+/// keep the request body small; too low a value forces the model to re-open images it already
+/// looked at, so it falls back to cropping/scripting instead of just looking.
+pub const MAX_ACTIVE_VISION_IMAGES: usize = 6;
+
 pub fn filter_active_vision_images(history: &[ChatMessage], max_active_images: usize) -> Vec<ChatMessage> {
     let mut cloned = history.to_vec();
     let mut remaining_images = max_active_images;
@@ -371,7 +376,7 @@ pub fn serialize_openai_messages(
     system_prompt: &str,
     history: &[ChatMessage],
 ) -> Vec<serde_json::Value> {
-    let filtered_history = filter_active_vision_images(history, 2);
+    let filtered_history = filter_active_vision_images(history, MAX_ACTIVE_VISION_IMAGES);
     let history = &filtered_history;
     let mut messages = vec![serde_json::json!({
         "role": "system",
@@ -509,7 +514,7 @@ pub fn serialize_ollama_messages(
     system_prompt: &str,
     history: &[ChatMessage],
 ) -> Vec<serde_json::Value> {
-    let filtered_history = filter_active_vision_images(history, 2);
+    let filtered_history = filter_active_vision_images(history, MAX_ACTIVE_VISION_IMAGES);
     let history = &filtered_history;
     let mut messages = vec![serde_json::json!({
         "role": "system",
@@ -1038,7 +1043,7 @@ async fn call_anthropic(
         .get_api_key("anthropic")
         .ok_or_else(|| "Missing Anthropic API key in Settings -> Cloud Providers".to_string())?;
 
-    let filtered_history = filter_active_vision_images(history, 2);
+    let filtered_history = filter_active_vision_images(history, MAX_ACTIVE_VISION_IMAGES);
     let history = &filtered_history;
 
     // Coalesce consecutive messages of the same role so Anthropic's strict alternating role validator never rejects
@@ -1264,7 +1269,7 @@ async fn call_gemini(
 
     let api_model = model.trim().trim_start_matches("models/");
 
-    let filtered_history = filter_active_vision_images(history, 2);
+    let filtered_history = filter_active_vision_images(history, MAX_ACTIVE_VISION_IMAGES);
     let history = &filtered_history;
 
     let mut contents: Vec<serde_json::Value> = Vec::new();
@@ -1762,20 +1767,26 @@ mod tests {
         assert_eq!(filtered[3].images, vec!["base64_data_for_image_4".to_string()]);
         assert_eq!(filtered[4].images, vec!["base64_data_for_image_5".to_string()]);
 
-        // When serialized for Ollama, only steps 4 and 5 should have "images" in JSON
-        let ollama_json = serialize_ollama_messages("sys", &history);
-        // ollama_json[0] is sys, [1..=3] are steps 1..=3, [4..=5] are steps 4..=5
+        // When serialized for Ollama, only the MAX_ACTIVE_VISION_IMAGES most recent keep "images"
+        let mut long_history = Vec::new();
+        for i in 1..=(MAX_ACTIVE_VISION_IMAGES + 2) {
+            let mut m = history[0].clone();
+            m.content = format!("Step {}", i);
+            m.images = vec![format!("img{}", i)];
+            long_history.push(m);
+        }
+        let ollama_json = serialize_ollama_messages("sys", &long_history);
+        // ollama_json[0] is sys; [1..] are steps 1..
         assert!(ollama_json[1].get("images").is_none());
         assert!(ollama_json[2].get("images").is_none());
-        assert!(ollama_json[3].get("images").is_none());
-        assert!(ollama_json[4].get("images").is_some());
-        assert!(ollama_json[5].get("images").is_some());
+        assert!(ollama_json[3].get("images").is_some());
+        assert!(ollama_json[MAX_ACTIVE_VISION_IMAGES + 2].get("images").is_some());
     }
 }
 
-/// Heuristic: can this model actually perceive images? Known text-only families return `false`
-/// so the harness never tells a blind model that it "can see" (which makes it guess/hallucinate
-/// instead of saying it cannot see). Unknown models are assumed vision-capable.
+/// Heuristic: can this model actually perceive images? Only families known to be text-only return
+/// `false` (e.g. gpt-oss, *coder); everything else, including DeepSeek cloud which describes images
+/// fine in practice, is assumed vision-capable.
 pub fn model_supports_vision(model: &str) -> bool {
     let m = model.to_lowercase();
     let explicit_vision = m.contains("-vl")
