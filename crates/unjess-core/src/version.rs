@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.1.7";
+pub const CURRENT_VERSION: &str = "4.1.8";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,20 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.1.8".to_string(),
+            date: "2026-11-10".to_string(),
+            title: "Unjess 4.1.8 — Pasted screenshots reach the model as real pixels; DeepSeek no longer mislabeled text-only".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Fixed: the 'text-only model' override from 4.1.6/4.1.7 never actually removed DeepSeek from the text-only list, so the system prompt told DeepSeek it was blind and it refused to look at images. DeepSeek flash was verified to describe a test image correctly.".to_string(),
+                "Composer screenshots ('[Attached Screenshot: `path`]') are now loaded from disk, downscaled for vision and attached to the message as pixels automatically; previously only a text note with the path was sent.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.1.7".to_string(),
             date: "2026-11-10".to_string(),
             title: "Unjess 4.1.7 — Vision continuity: no more false 'I cannot see images'".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Images viewed in earlier turns are not kept in context; their saved tool results used to still claim 'you can now see this image', so the model concluded it was blind. They are now rewritten to tell it to call view_image again.".to_string(),
                 "System prompt now states images from earlier turns are not retained and instructs the model to re-open the file instead of claiming it cannot see.".to_string(),
@@ -270,9 +280,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.1.7");
+        assert_eq!(CURRENT_VERSION, "4.1.8");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.1.7");
+        assert_eq!(log[0].version, "4.1.8");
     }
 }

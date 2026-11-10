@@ -1785,35 +1785,17 @@ mod tests {
 }
 
 /// Heuristic: can this model actually perceive images? Only families known to be text-only return
-/// `false` (e.g. gpt-oss, *coder); everything else, including DeepSeek cloud which describes images
-/// fine in practice, is assumed vision-capable.
+/// `false` (e.g. gpt-oss, *coder). Everything else, INCLUDING DeepSeek cloud (verified: it correctly
+/// describes shapes, colours and text in a test image), is assumed vision-capable.
 pub fn model_supports_vision(model: &str) -> bool {
     let m = model.to_lowercase();
-    let explicit_vision = m.contains("-vl")
-        || m.contains("vision")
-        || m.contains("ocr")
-        || m.contains("llava")
-        || m.contains("pixtral")
-        || m.contains("gemma3")
-        || m.contains("gemini")
-        || m.contains("gpt-4o")
-        || m.contains("gpt-4.1")
-        || m.contains("gpt-5")
-        || m.contains("claude")
-        || m.contains("kimi")
-        || m.contains("qwen3.5")
-        || m.contains("qwen3-vl");
-    if explicit_vision {
-        return true;
-    }
-    let text_only = m.contains("deepseek")
-        || m.contains("gpt-oss")
+    let text_only = m.contains("gpt-oss")
         || m.contains("coder")
         || m.contains("codestral")
         || m.contains("devstral")
-        || m.contains("minimax")
-        || m.contains("glm");
-    !text_only
+        || m.contains("minimax");
+    let explicit_vision = m.contains("-vl") || m.contains("vision") || m.contains("llava");
+    explicit_vision || !text_only
 }
 
 #[cfg(test)]
@@ -1822,8 +1804,9 @@ mod vision_capability_tests {
 
     #[test]
     fn test_vision_heuristic() {
-        assert!(!model_supports_vision("deepseek-v4.1-flash:cloud"));
+        assert!(model_supports_vision("deepseek-v4.1-flash:cloud"));
         assert!(model_supports_vision("deepseek-vl2"));
+        assert!(!model_supports_vision("gpt-oss:120b"));
         assert!(model_supports_vision("gemini-3.8-flash"));
         assert!(model_supports_vision("claude-sonnet-5.5"));
         assert!(model_supports_vision("kimi-k3.1-pro:cloud"));

@@ -47,6 +47,34 @@ pub fn extract_image_attachments_from_prompt(prompt: &str) -> Vec<String> {
             }
         }
     }
+    // Desktop composer screenshots / pasted images: "[Attached Screenshot: `<path>` (WxH)]"
+    // Attach the real pixels (downscaled for vision) so the model does not have to guess or re-open them.
+    let shot_marker = "[Attached Screenshot: `";
+    for line in prompt.lines() {
+        let mut search_from = 0usize;
+        while let Some(rel) = line[search_from..].find(shot_marker) {
+            let start = search_from + rel + shot_marker.len();
+            let Some(end_rel) = line[start..].find('`') else { break };
+            let path_str = &line[start..start + end_rel];
+            search_from = start + end_rel;
+            let path = std::path::Path::new(path_str.trim());
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(path) {
+                if bytes.is_empty() {
+                    continue;
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("png")
+                    .to_lowercase();
+                let (opt, _mime) = crate::tools::ToolEngine::optimize_image_for_vision(&bytes, &ext);
+                b64_images.push(crate::tools::ToolEngine::base64_encode(&opt));
+            }
+        }
+    }
     b64_images
 }
 
