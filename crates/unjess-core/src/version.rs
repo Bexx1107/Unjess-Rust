@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Canonical semantic version string for Unjess 4.0.
-pub const CURRENT_VERSION: &str = "4.1.6";
+pub const CURRENT_VERSION: &str = "4.1.7";
 
 /// Represents a structured release entry in the Unjess version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,20 @@ pub struct ChangelogEntry {
 pub fn builtin_changelog() -> Vec<ChangelogEntry> {
     vec![
         ChangelogEntry {
+            version: "4.1.7".to_string(),
+            date: "2026-11-10".to_string(),
+            title: "Unjess 4.1.7 — Vision continuity: no more false 'I cannot see images'".to_string(),
+            tag: "LATEST".to_string(),
+            changes: vec![
+                "Images viewed in earlier turns are not kept in context; their saved tool results used to still claim 'you can now see this image', so the model concluded it was blind. They are now rewritten to tell it to call view_image again.".to_string(),
+                "System prompt now states images from earlier turns are not retained and instructs the model to re-open the file instead of claiming it cannot see.".to_string(),
+            ],
+        },
+        ChangelogEntry {
             version: "4.1.6".to_string(),
             date: "2026-11-10".to_string(),
             title: "Unjess 4.1.6 — Session Ledger: fixes mid-session amnesia & hallucinated history".to_string(),
-            tag: "LATEST".to_string(),
+            tag: "STABLE".to_string(),
             changes: vec![
                 "Root cause of 'I never generated anything / I don't know where we are': context compaction kept only the oldest 25 messages as 140-char first lines and listed hundreds of bare tool names, wiping what actually happened. Replaced with a factual Session Ledger.".to_string(),
                 "Ledger keeps every user instruction near-verbatim, per-turn tool counts, files written/edited, shell commands run, and every MCP/unusual tool call (e.g. generate_image) with args, status and result.".to_string(),
@@ -260,9 +270,9 @@ mod tests {
 
     #[test]
     fn test_version_and_changelog() {
-        assert_eq!(CURRENT_VERSION, "4.1.6");
+        assert_eq!(CURRENT_VERSION, "4.1.7");
         let log = builtin_changelog();
         assert!(!log.is_empty());
-        assert_eq!(log[0].version, "4.1.6");
+        assert_eq!(log[0].version, "4.1.7");
     }
 }

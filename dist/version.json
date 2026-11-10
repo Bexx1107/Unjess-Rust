@@ -1,14 +1,14 @@
 {
-    "version":  "4.1.6",
+    "version":  "4.1.7",
     "edition":  "native-rust",
     "architecture":  "windows-x86_64",
     "port":  9758,
-    "sha256":  "973f2faabb18f7aad23e39251a29bd48c2669c56925866379400dfd19c689c5b",
+    "sha256":  "d581ff6b145ac38a7ff2e8dded17268f4c4a7026313102c648e8929e70b56a49",
     "binaries":  {
-                     "Unjess.exe":  "973f2faabb18f7aad23e39251a29bd48c2669c56925866379400dfd19c689c5b",
-                     "unjessd.exe":  "d47efce6e2a0029a96a880532ee19ce10979479e369dd067e7885a1286d8b4fb",
-                     "unjess-cli.exe":  "34784835282663ba4cb1fc768f1ed4cdd967ddd237e4d68bde26138577dc0af8",
-                     "Unjess-Setup.exe":  "771dfa1f2cfd4ff801a8d671b25dbf199b30defc5a29df890e3c43f5567c1e74"
+                     "Unjess.exe":  "d581ff6b145ac38a7ff2e8dded17268f4c4a7026313102c648e8929e70b56a49",
+                     "unjessd.exe":  "6067e58662249d854d77dd711273044f07a203fe424ae6f0571afa16d4f3de38",
+                     "unjess-cli.exe":  "b3678d60457fb3c3db29aea51646face884d42daf779cd6ea1b52b1824722253",
+                     "Unjess-Setup.exe":  "cda962f9a6d706176331373511e495f0c619a749733ebf7577b1fbec4850f485"
                  },
-    "built_at":  "2026-11-10T11:59:09Z"
+    "built_at":  "2026-11-10T12:20:28Z"
 }
