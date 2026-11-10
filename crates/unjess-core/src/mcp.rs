@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Configuration for an MCP server (stdio command or HTTP/SSE URL).
@@ -71,6 +72,22 @@ pub struct McpProbeResult {
     pub server_info: String,
     pub tools: Vec<McpToolInfo>,
     pub error: Option<String>,
+}
+
+/// A live stdio MCP server process kept alive across tool calls.
+struct StdioSession {
+    sig: String,
+    child: Child,
+    stdin: std::process::ChildStdin,
+    rx: std::sync::mpsc::Receiver<String>,
+    next_id: i64,
+    stalled: bool,
+}
+
+/// Global registry of persistent stdio MCP sessions keyed by lowercase server name.
+fn mcp_sessions() -> &'static Mutex<HashMap<String, Arc<Mutex<StdioSession>>>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Arc<Mutex<StdioSession>>>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn kill_child_tree(child: &mut Child) {
@@ -1398,98 +1415,251 @@ impl McpManager {
             return Self::extract_mcp_result_payload(&raw_resp);
         }
 
-        let mut cmd = Self::build_stdio_command(&cfg);
+        Self::call_stdio_persistent(&cfg, tool_name, arguments, timeout_secs)
+    }
+
+    /// Runs a tool call against a long-lived stdio MCP server session. Stateful servers
+    /// (e.g. `chrome-devtools-mcp`, which owns a Chrome instance and its open pages) must
+    /// survive between tool calls, so the child process is spawned once per server and reused
+    /// until its configuration changes, it exits, or a call times out.
+    fn call_stdio_persistent(
+        cfg: &McpServerConfig,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let key = cfg.name.trim().to_lowercase();
+        let mut env_sorted: Vec<(&String, &String)> = cfg.env.iter().collect();
+        env_sorted.sort();
+        let sig = format!(
+            "{}|{:?}|{:?}|{:?}",
+            cfg.command, cfg.args, cfg.cwd, env_sorted
+        );
+
+        for _attempt in 0..2 {
+            let session_arc = {
+                let mut map = mcp_sessions()
+                    .lock()
+                    .map_err(|_| "MCP session registry poisoned".to_string())?;
+                let reuse = map
+                    .get(&key)
+                    .filter(|s| s.lock().map(|g| g.sig == sig).unwrap_or(false))
+                    .cloned();
+                match reuse {
+                    Some(s) => s,
+                    None => {
+                        if let Some(old) = map.remove(&key) {
+                            if let Ok(mut g) = old.lock() {
+                                kill_child_tree(&mut g.child);
+                            }
+                        }
+                        let fresh = Self::spawn_session(cfg, sig.clone(), timeout_secs)?;
+                        let arc = Arc::new(Mutex::new(fresh));
+                        map.insert(key.clone(), arc.clone());
+                        arc
+                    }
+                }
+            };
+
+            let mut guard = session_arc
+                .lock()
+                .map_err(|_| "MCP session poisoned".to_string())?;
+            if let Ok(Some(_)) = guard.child.try_wait() {
+                // Server died between calls; drop it and respawn on the next attempt.
+                drop(guard);
+                if let Ok(mut map) = mcp_sessions().lock() {
+                    map.remove(&key);
+                }
+                continue;
+            }
+
+            let result = Self::run_session_call(&mut guard, tool_name, arguments, timeout_secs);
+            if result.is_err() {
+                let broken = guard.child.try_wait().ok().flatten().is_some()
+                    || guard.stalled;
+                if broken {
+                    kill_child_tree(&mut guard.child);
+                    drop(guard);
+                    if let Ok(mut map) = mcp_sessions().lock() {
+                        map.remove(&key);
+                    }
+                }
+            }
+            return result;
+        }
+        Err(format!(
+            "MCP server '{}' exited repeatedly before answering.",
+            cfg.name
+        ))
+    }
+
+    /// Spawns a stdio MCP server, performs the `initialize` handshake, and returns the live session.
+    fn spawn_session(
+        cfg: &McpServerConfig,
+        sig: String,
+        timeout_secs: u64,
+    ) -> Result<StdioSession, String> {
+        let mut cmd = Self::build_stdio_command(cfg);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed spawning MCP server '{}': {}", cfg.name, e))?;
 
-        let mut stdin_opt = child.stdin.take();
-        if let Some(ref mut stdin) = stdin_opt {
-            let init_msg = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": { "name": "Unjess", "version": "4.0.0" }
-                }
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("MCP server '{}' has no stdin", cfg.name))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("MCP server '{}' has no stdout", cfg.name))?;
+        if let Some(mut stderr) = child.stderr.take() {
+            // Drain stderr so a chatty long-lived server never blocks on a full pipe.
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
             });
-            let initialized_notif = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {}
-            });
-            let call_msg = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": tool_name,
-                    "arguments": arguments
-                }
-            });
-            let _ = writeln!(stdin, "{}", init_msg);
-            let _ = writeln!(stdin, "{}", initialized_notif);
-            let _ = writeln!(stdin, "{}", call_msg);
-            let _ = stdin.flush();
         }
 
-        let mut matched_id2_line = String::new();
-        let mut fallback_line = String::new();
-        if let Some(stdout) = child.stdout.take() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().take(300).flatten() {
-                    if tx.send(line).is_err() {
-                        break;
-                    }
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
                 }
+            }
+        });
+
+        let init_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "Unjess", "version": "4.0.0" }
+            }
+        });
+        let initialized_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        });
+        let handshake = writeln!(stdin, "{}", init_msg)
+            .and_then(|_| stdin.flush())
+            .map_err(|e| e.to_string())
+            .and_then(|_| {
+                Self::wait_for_response(
+                    &rx,
+                    &mut child,
+                    1,
+                    Instant::now() + Duration::from_secs(timeout_secs.clamp(5, 90)),
+                )
+            })
+            .and_then(|_| {
+                writeln!(stdin, "{}", initialized_notif)
+                    .and_then(|_| stdin.flush())
+                    .map_err(|e| e.to_string())
             });
-            let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-            while Instant::now() < deadline {
-                match rx.recv_timeout(Duration::from_millis(250)) {
-                    Ok(line) => {
-                        let trimmed = line.trim();
-                        if !trimmed.starts_with('{') {
-                            continue;
-                        }
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                            if json.get("id").and_then(|v| v.as_i64()) == Some(2) {
-                                matched_id2_line = trimmed.to_string();
-                                break;
-                            }
-                            fallback_line = trimmed.to_string();
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        if let Ok(Some(_)) = child.try_wait() {
-                            break;
-                        }
+        if let Err(e) = handshake {
+            kill_child_tree(&mut child);
+            return Err(format!(
+                "MCP server '{}' failed to initialize: {}",
+                cfg.name, e
+            ));
+        }
+
+        Ok(StdioSession {
+            sig,
+            child,
+            stdin,
+            rx,
+            next_id: 2,
+            stalled: false,
+        })
+    }
+
+    /// Sends one `tools/call` over an established session and returns its extracted payload.
+    fn run_session_call(
+        session: &mut StdioSession,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        // Discard stale frames (late responses, notifications) from earlier calls.
+        while session.rx.try_recv().is_ok() {}
+
+        let id = session.next_id;
+        session.next_id += 1;
+        let call_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": arguments }
+        });
+        writeln!(session.stdin, "{}", call_msg)
+            .and_then(|_| session.stdin.flush())
+            .map_err(|e| {
+                session.stalled = true;
+                format!("MCP write failed: {}", e)
+            })?;
+
+        match Self::wait_for_response(
+            &session.rx,
+            &mut session.child,
+            id,
+            Instant::now() + Duration::from_secs(timeout_secs),
+        ) {
+            Ok(line) => Self::extract_mcp_result_payload(&line),
+            Err(e) => {
+                session.stalled = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Waits for the JSON-RPC response whose `id` equals `want_id`, ignoring other frames.
+    fn wait_for_response(
+        rx: &std::sync::mpsc::Receiver<String>,
+        child: &mut Child,
+        want_id: i64,
+        deadline: Instant,
+    ) -> Result<String, String> {
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if !trimmed.starts_with('{') {
                         continue;
                     }
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        if json.get("id").and_then(|v| v.as_i64()) == Some(want_id)
+                            && (json.get("result").is_some() || json.get("error").is_some())
+                        {
+                            return Ok(trimmed.to_string());
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        return Err(format!("MCP server exited ({})", status));
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("MCP server closed its output".to_string());
                 }
             }
         }
+        Err("MCP request timed out".to_string())
+    }
 
-        drop(stdin_opt);
-        kill_child_tree(&mut child);
-
-        let response_line = if !matched_id2_line.is_empty() {
-            matched_id2_line
-        } else {
-            fallback_line
-        };
-
-        if response_line.is_empty() {
-            Err(format!(
-                "MCP tool '{}' on '{}' returned no JSON-RPC response frame.",
-                tool_name, cfg.name
-            ))
-        } else {
-            Self::extract_mcp_result_payload(&response_line)
+    /// Terminates every persistent stdio MCP session (and their child process trees).
+    pub fn shutdown_sessions() {
+        if let Ok(mut map) = mcp_sessions().lock() {
+            for (_, s) in map.drain() {
+                if let Ok(mut g) = s.lock() {
+                    kill_child_tree(&mut g.child);
+                }
+            }
         }
     }
 
