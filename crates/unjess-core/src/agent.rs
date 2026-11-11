@@ -1434,9 +1434,65 @@ impl HarnessManager {
             msgs = Self::compact_messages(&msgs, 8);
         }
 
+        // Pass 4: hard cap. A single long turn can pile hundreds of tool calls and megabytes of
+        // reasoning text into one message, and the passes above never shrink the protected tail
+        // or any `thinking` text. Shrink progressively until the request fits the budget.
+        let mut chars_now: usize = msgs.iter().map(msg_weight).sum();
+        if chars_now > stage2_threshold {
+            let last_idx = msgs.len().saturating_sub(1);
+            for (i, m) in msgs.iter_mut().enumerate() {
+                if let Some(th) = m.thinking.as_mut() {
+                    Self::shrink_text(th, if i == last_idx { 6000 } else { 1000 }, 400);
+                }
+            }
+            chars_now = msgs.iter().map(msg_weight).sum();
+        }
+        if chars_now > stage2_threshold {
+            for m in msgs.iter_mut() {
+                if m.role == "tool" {
+                    Self::shrink_text(&mut m.content, 1500, 500);
+                }
+                for tc in m.tool_calls.iter_mut() {
+                    Self::shrink_text(&mut tc.result, 1500, 500);
+                }
+            }
+            chars_now = msgs.iter().map(msg_weight).sum();
+        }
+        if chars_now > stage2_threshold {
+            for m in msgs.iter_mut() {
+                if m.tool_calls.len() > 60 {
+                    let dropped = m.tool_calls.len() - 60;
+                    m.tool_calls.drain(..dropped);
+                    m.content.push_str(&format!(
+                        "\n[{} older tool calls in this step were pruned to fit the context window]",
+                        dropped
+                    ));
+                }
+                for tc in m.tool_calls.iter_mut() {
+                    Self::shrink_text(&mut tc.result, 300, 100);
+                }
+                Self::shrink_text(&mut m.content, 12_000, 2_000);
+            }
+        }
+
         msgs
     }
 
+    /// Shortens `s` to its first `head` and last `tail` characters (with a marker) when longer.
+    fn shrink_text(s: &mut String, head: usize, tail: usize) {
+        let total = s.chars().count();
+        if total <= head + tail + 80 {
+            return;
+        }
+        let h: String = s.chars().take(head).collect();
+        let t: String = s.chars().skip(total - tail).collect();
+        *s = format!(
+            "{}\n... [pruned {} chars to fit the context window] ...\n{}",
+            h,
+            total - head - tail,
+            t
+        );
+    }
     /// Returns `true` if `name` is a bookkeeping tool that should be transparent to stuck-loop detection.
     pub fn is_transparent_bookkeeping_tool(name: &str) -> bool {
         matches!(
@@ -4877,5 +4933,44 @@ mod tests {
             compacted.last().unwrap().content,
             "now answer honestly how far is the game from being done"
         );
+    }
+
+    #[test]
+    fn test_single_huge_turn_with_hundreds_of_tool_calls_is_capped() {
+        let mk_user = |c: &str| ChatMessage {
+            role: "user".to_string(),
+            content: c.to_string(),
+            ..ChatMessage::default()
+        };
+        let tool_calls: Vec<ToolCallRecord> = (0..990)
+            .map(|i| ToolCallRecord {
+                id: format!("call_{}", i),
+                name: "run_command".to_string(),
+                arguments: serde_json::json!({ "command": "echo" }),
+                result: "R".repeat(16_000),
+                status: "ok".to_string(),
+                duration_ms: 1,
+            })
+            .collect();
+        let huge = ChatMessage {
+            role: "assistant".to_string(),
+            content: "working".to_string(),
+            thinking: Some("T".repeat(5_000_000)),
+            tool_calls,
+            model: Some("deepseek-v4.1-flash:cloud".to_string()),
+            ..ChatMessage::default()
+        };
+        let msgs = vec![mk_user("start"), huge, mk_user("explain")];
+        let compacted = HarnessManager::compact_messages_for_model(&msgs, "deepseek-v4.1-flash:cloud");
+        let total: usize = compacted
+            .iter()
+            .map(|m| {
+                m.content.len()
+                    + m.thinking.as_ref().map(|t| t.len()).unwrap_or(0)
+                    + m.tool_calls.iter().map(|tc| tc.name.len() + tc.result.len()).sum::<usize>()
+            })
+            .sum();
+        assert!(total < 450_000, "huge single turn still {} chars", total);
+        assert_eq!(compacted.last().unwrap().content, "explain");
     }
 }
