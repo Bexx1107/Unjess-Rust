@@ -1865,8 +1865,50 @@ impl ToolEngine {
 
     /// Finds files in the workspace matching `pattern` (supports full globs `**/*.rs`, `*.toml`, or substring match).
     pub fn find_by_name(&self, pattern: &str) -> Result<Vec<String>, ToolError> {
+        self.find_by_name_in(pattern, None)
+    }
+
+    /// Like [`find_by_name`](Self::find_by_name) but can search outside the workspace root:
+    /// pass `search_dir` (an absolute or workspace-relative folder), or give an absolute path as
+    /// the pattern (e.g. `E:\Media\**\*.png` searches `E:\Media`). Results from external folders are
+    /// returned as absolute forward-slash paths.
+    pub fn find_by_name_in(
+        &self,
+        pattern: &str,
+        search_dir: Option<&str>,
+    ) -> Result<Vec<String>, ToolError> {
+        let trimmed_pat = pattern.trim();
+        let mut dir_arg: Option<String> = search_dir
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != ".");
+        let mut effective_pat = trimmed_pat.to_string();
+
+        // An absolute pattern such as `E:\a\b\45*` means: search `E:\a\b` for `45*`.
+        let looks_abs = Path::new(trimmed_pat).is_absolute()
+            || (trimmed_pat.len() >= 2 && trimmed_pat.as_bytes()[1] == b':');
+        if dir_arg.is_none() && looks_abs {
+            let norm = trimmed_pat.replace('\\', "/");
+            let first_glob = norm.find(|c| matches!(c, '*' | '?' | '{' | '['));
+            let cut = match first_glob {
+                Some(g) => norm[..g].rfind('/'),
+                None => norm.rfind('/'),
+            };
+            if let Some(i) = cut {
+                dir_arg = Some(norm[..=i].to_string());
+                effective_pat = norm[i + 1..].to_string();
+            }
+        }
+
+        if let Some(dir) = dir_arg {
+            let abs_dir = self.workspace.resolve(&dir)?;
+            if !abs_dir.starts_with(self.workspace.root()) {
+                let files = Self::list_files_under(&abs_dir, 5000);
+                return Ok(Self::filter_found(files, &effective_pat));
+            }
+        }
+
         let all_files = self.workspace.list_all_files(5000);
-        let trimmed = pattern.trim();
+        let trimmed = effective_pat.trim();
         if trimmed.is_empty() || trimmed == "*" || trimmed == "**/*" {
             return Ok(all_files.into_iter().take(200).collect());
         }
@@ -1895,6 +1937,64 @@ impl ToolEngine {
         Ok(matched)
     }
 
+    /// Recursively lists files under an arbitrary directory (outside the workspace), skipping
+    /// VCS and build folders. Returns absolute forward-slash paths without the `\\?\` prefix.
+    fn list_files_under(root: &Path, limit: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Ok(md) = entry.metadata() else { continue };
+                if md.is_dir() {
+                    if !matches!(
+                        name.as_str(),
+                        ".git" | "node_modules" | "target" | ".venv" | "__pycache__"
+                    ) {
+                        stack.push(entry.path());
+                    }
+                } else {
+                    let p = entry.path().to_string_lossy().to_string();
+                    let p = p.strip_prefix(r"\\?\").unwrap_or(&p).replace('\\', "/");
+                    out.push(p);
+                    if out.len() >= limit {
+                        out.sort();
+                        return out;
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Applies the glob / substring matching used by `find_by_name` to an explicit file list.
+    fn filter_found(files: Vec<String>, pattern: &str) -> Vec<String> {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() || trimmed == "*" || trimmed == "**/*" {
+            return files.into_iter().take(200).collect();
+        }
+        if let Some(re) = Self::glob_to_regex(trimmed) {
+            return files
+                .into_iter()
+                .filter(|f| {
+                    let name = Path::new(f)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    re.is_match(f) || re.is_match(&name)
+                })
+                .take(200)
+                .collect();
+        }
+        let needle = trimmed.to_lowercase();
+        files
+            .into_iter()
+            .filter(|f| f.to_lowercase().contains(&needle))
+            .take(200)
+            .collect()
+    }
     /// Searches files in the workspace using a regular expression and returns `file:line: content` matches.
     pub fn grep_search(&self, query: &str, rel_path: Option<&str>) -> Result<String, ToolError> {
         self.grep_search_filtered(query, rel_path, None, None)
@@ -3227,7 +3327,11 @@ impl ToolEngine {
             }
             "find_by_name" => {
                 let pattern = get_str("pattern");
-                match self.find_by_name(&pattern) {
+                let search_dir = ["path", "directory", "dir", "search_path"]
+                    .iter()
+                    .map(|k| get_str(k))
+                    .find(|s| !s.trim().is_empty());
+                match self.find_by_name_in(&pattern, search_dir.as_deref()) {
                     Ok(files) => {
                         if files.is_empty() {
                             (
@@ -4434,11 +4538,12 @@ impl ToolEngine {
                 "type": "function",
                 "function": {
                     "name": "find_by_name",
-                    "description": "Find files in the workspace matching a glob (`**/*.rs`, `*.toml`) or filename substring.",
+                    "description": "Find files matching a glob (`**/*.rs`, `*.toml`) or filename substring. Searches the workspace by default; pass `path` (an absolute folder, e.g. E:\\Media) or an absolute pattern to search anywhere on disk.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "pattern": { "type": "string", "description": "Glob or substring pattern" }
+                            "pattern": { "type": "string", "description": "Glob or substring pattern" },
+                            "path": { "type": "string", "description": "Optional folder to search (absolute paths allowed). Defaults to the workspace." }
                         },
                         "required": ["pattern"]
                     }
