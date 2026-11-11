@@ -1300,7 +1300,7 @@ impl HarnessManager {
                 w += th.len();
             }
             for tc in &m.tool_calls {
-                w += tc.name.len() + tc.result.len();
+                w += tc.name.len() + tc.result.len() + tc.arguments.to_string().len();
             }
             w
         };
@@ -1454,6 +1454,7 @@ impl HarnessManager {
                 }
                 for tc in m.tool_calls.iter_mut() {
                     Self::shrink_text(&mut tc.result, 1500, 500);
+                    Self::shrink_arguments(&mut tc.arguments, 1500);
                 }
             }
             chars_now = msgs.iter().map(msg_weight).sum();
@@ -1470,12 +1471,22 @@ impl HarnessManager {
                 }
                 for tc in m.tool_calls.iter_mut() {
                     Self::shrink_text(&mut tc.result, 300, 100);
+                    Self::shrink_arguments(&mut tc.arguments, 400);
                 }
                 Self::shrink_text(&mut m.content, 12_000, 2_000);
             }
         }
 
         msgs
+    }
+
+    /// Replaces oversized tool-call arguments (e.g. a write_file with a whole script) with a short preview.
+    fn shrink_arguments(args: &mut serde_json::Value, max_chars: usize) {
+        let s = args.to_string();
+        if s.chars().count() > max_chars {
+            let preview: String = s.chars().take(max_chars).collect();
+            *args = serde_json::json!({ "_pruned_arguments": preview });
+        }
     }
 
     /// Shortens `s` to its first `head` and last `tail` characters (with a marker) when longer.
@@ -4946,7 +4957,7 @@ mod tests {
             .map(|i| ToolCallRecord {
                 id: format!("call_{}", i),
                 name: "run_command".to_string(),
-                arguments: serde_json::json!({ "command": "echo" }),
+                arguments: serde_json::json!({ "command": "echo", "content": "A".repeat(5_000) }),
                 result: "R".repeat(16_000),
                 status: "ok".to_string(),
                 duration_ms: 1,
@@ -4967,7 +4978,7 @@ mod tests {
             .map(|m| {
                 m.content.len()
                     + m.thinking.as_ref().map(|t| t.len()).unwrap_or(0)
-                    + m.tool_calls.iter().map(|tc| tc.name.len() + tc.result.len()).sum::<usize>()
+                    + m.tool_calls.iter().map(|tc| tc.name.len() + tc.result.len() + tc.arguments.to_string().len()).sum::<usize>()
             })
             .sum();
         assert!(total < 450_000, "huge single turn still {} chars", total);
